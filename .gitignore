@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Native and package builds
+build/
+dist/
+*.pyd
+*.so
+*.dll
+
+# Frontend dependencies and generated assets
+node_modules/
+adaptive_ct/viewer/web/dist/
+
+# Training data, checkpoints, and generated reports
+output/
+outputs/
+checkpoints/
+logs/
+*.ckpt
+*.pt
+*.pth
+*.npy
+*.npz
+
+# Local research material not included in the public source release
+docs/
+tests/
+scripts/
+
+# Publish only the train/viewer dependency closure from the Python package
+adaptive_ct/*
+!adaptive_ct/__init__.py
+!adaptive_ct/backend.py
+!adaptive_ct/bernstein.py
+!adaptive_ct/compression.py
+!adaptive_ct/config.py
+!adaptive_ct/data.py
+!adaptive_ct/geometry.py
+!adaptive_ct/losses.py
+!adaptive_ct/metrics.py
+!adaptive_ct/model.py
+!adaptive_ct/projection_domain.py
+!adaptive_ct/refinement.py
+!adaptive_ct/render.py
+!adaptive_ct/surface.py
+!adaptive_ct/train.py
+!adaptive_ct/volume_loss.py
+!adaptive_ct/volume_metrics.py
+!adaptive_ct/viewer/
+adaptive_ct/viewer/*
+!adaptive_ct/viewer/__init__.py
+!adaptive_ct/viewer/__main__.py
+!adaptive_ct/viewer/server.py
+!adaptive_ct/viewer/README.md
+!adaptive_ct/viewer/web/
+
+# Publish one compact example and one canonical adaptive configuration
+configs/*
+!configs/figure473_48v.yaml
+!configs/research/
+configs/research/*
+!configs/research/figure473_128v_pure_adaptive.yaml
+
+# Local configuration and agent state
+.env
+.agents/
+.claude/
+.codex/
+7.CT
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

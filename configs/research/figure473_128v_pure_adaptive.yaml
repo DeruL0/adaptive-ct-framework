@@ -1,0 +1,109 @@
+# Canonical no-trick research configuration.
+#
+# Adaptivity contract:
+# - every eligible leaf at every refinable level competes in one global queue;
+# - the score is the same scale-aware coefficient-jump indicator everywhere;
+# - selection is constrained only by a global added-byte budget;
+# - no support mask, attenuation threshold, minimum active level, per-level
+#   quota, forced coverage, held-out topology gate, or test-view selection.
+device: cuda
+
+dataset:
+  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_128v_science
+
+geometry:
+  samples_per_ray: 1024
+
+model:
+  representation: bernstein_octree
+  levels: [48, 96, 192, 384]
+  topology: packed_hierarchy
+  balance_2to1: false
+  max_leaf_count: 6000000
+  max_degree: [1, 1, 1]
+  integration_mode: exact
+  cuda_integrator: true
+  initialization: projection_mean
+  init_std: 0.001
+  attenuation_shift: -3.0
+
+training:
+  seed: 20260702
+  iterations: 25000
+  batch_rays: 65536
+  lr: 0.015
+  tv_weight: 0.0
+  log_every: 100
+  eval_every: 1000
+  eval_test_views: 16
+  eval_ray_chunk: 65536
+  compute_eval: true
+  allow_test_during_training: false
+
+  projection_weighting_schedule:
+    1:
+      mode: uniform
+
+  coefficient_continuity:
+    weight: 0.0
+
+  progressive:
+    refinement:
+      selection_split: train
+      halo: 0
+
+    convergence_milestones:
+      - levels: [0, 1, 2]
+        operation: h_jump_rd
+        max_added_bytes: 8000000
+        min_iteration: 1500
+        max_iteration: 3000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+      - levels: [0, 1, 2]
+        operation: h_jump_rd
+        max_added_bytes: 25000000
+        min_iteration: 3000
+        min_iterations_after_previous: 1000
+        max_iteration: 6000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+      - levels: [0, 1, 2]
+        operation: h_jump_rd
+        max_added_bytes: 50000000
+        min_iteration: 6000
+        min_iterations_after_previous: 1500
+        max_iteration: 9000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+    milestones: {}
+
+  adaptive:
+    enabled: false
+
+metrics:
+  compute_projection_metrics: true
+  compute_volume_metrics: false
+  compute_boundary_metrics: false
+
+export:
+  compact_octree:
+    enabled: true
+    quantization: float16
+    topology: auto
+  mact:
+    enabled: false
+  surface:
+    enabled: false
+
+output:
+  dir: output\research_figure473_pure_global_jump_uniform_48root_128v_25k

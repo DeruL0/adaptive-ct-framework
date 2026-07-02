@@ -1,0 +1,66 @@
+device: cuda
+
+dataset:
+  root: D:\Projects\3.3DGS\SAD-GS\data\external_baselines\r2_local\figure473_ctgs96_48v
+
+geometry:
+  samples_per_ray: 96
+
+model:
+  representation: bernstein_octree
+  levels: [24, 48, 96]
+  max_degree: [3, 3, 3]
+  integration_mode: exact
+  cuda_integrator: true
+  initialization: projection_mean
+  init_std: 0.001
+  attenuation_shift: -3.0
+
+training:
+  iterations: 1200
+  batch_rays: 2048
+  lr: 0.015
+  tv_weight: 0.0
+  log_every: 100
+  eval_every: 300
+  eval_test_views: 3
+  eval_ray_chunk: 4096
+  adaptive:
+    enabled: true
+    rounds: 5
+    start_iteration: 250
+    stop_iteration: 900
+    validation_fraction: 0.2
+    variation_threshold: 0.002
+    material_jump_threshold: 0.05
+    p_ratio_threshold: 0.5
+    max_candidates: 8
+    max_reverse_candidates: 4
+    pre_tune_steps: 5
+    pre_tune_batch_rays: 512
+    pre_tune_learning_rate: 0.005
+    tune_steps: 20
+    tune_batch_rays: 512
+    tune_learning_rate: 0.005
+    validation_ray_chunk: 512
+    rate_lambda: 1.0e-7
+    merge_lambda: 1.0e-7
+    weight_epsilon: 1.0e-4
+    seed: 473
+
+metrics:
+  material_threshold: 0.10
+
+output:
+  dir: output\figure473_48v_rd_cvf
+
+export:
+  mact:
+    enabled: true
+    material_clusters: 4
+    variance_retained: 0.99
+  surface:
+    enabled: true
+    threshold: 0.10
+    uncertainty_rays: 64
+    uncertainty_surface_points: 1024
