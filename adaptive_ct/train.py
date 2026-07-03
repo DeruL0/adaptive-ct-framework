@@ -21,6 +21,7 @@ from .geometry import (
     random_training_rays,
 )
 from .backend import bernstein_segment_ray_capacity
+from .bernstein import unique_degree_rows
 from .losses import coefficient_face_continuity_loss, tv3
 from .metrics import projection_metrics
 from .model import build_model
@@ -952,20 +953,17 @@ def _apply_h_jump_rate_distortion(
     model,
     *,
     max_added_bytes: int,
-    h_added_bytes: int = 99,
+    h_added_bytes: int | None = None,
 ) -> tuple[int, dict]:
     """Globally split leaves by a scale-aware face-jump error indicator.
 
-    For piecewise-constant leaves, |K| * sum_F [mu]_F^2 is the canonical
-    scale-normalised jump term of a residual a-posteriori estimator.  All
-    levels compete in one queue; no support mask or level floor is used.
+    |K| * sum_F [mu]_F^2 measures unresolved cross-cell structure for both
+    p0 and p1 leaves. All levels compete in one queue; no support mask or
+    level floor is used.
     """
     diagnostics = coefficient_diagnostics(model)
     level_shapes = _model_level_shapes(model)
-    eligible = (
-        (model.leaf_levels + 1 < len(level_shapes))
-        & torch.all(model.leaf_degrees == 0, dim=1)
-    )
+    eligible = model.leaf_levels + 1 < len(level_shapes)
     candidate_ids = torch.nonzero(eligible, as_tuple=False).reshape(-1)
     if candidate_ids.numel() == 0:
         return 0, {
@@ -985,17 +983,27 @@ def _apply_h_jump_rate_distortion(
     indicator = cell_volume * torch.sum(jumps.square(), dim=1)
     valid = torch.isfinite(indicator) & (indicator > 0.0)
     valid_positions = torch.nonzero(valid, as_tuple=False).reshape(-1)
-    byte_budget_count = max(0, int(max_added_bytes) // max(int(h_added_bytes), 1))
+    coefficient_counts = model.coefficient_counts()[candidate_ids].to(torch.long)
+    # packed-v3 delta: parent leaf -> internal node plus eight child leaves.
+    # Node slot=8, degree tag=3, float16 coefficient=2 bytes.
+    dynamic_added_bytes = 85 + 14 * coefficient_counts
+    if h_added_bytes is not None:
+        dynamic_added_bytes = torch.full_like(dynamic_added_bytes, int(h_added_bytes))
+    rates = indicator / dynamic_added_bytes.to(indicator.dtype)
     leaf_budget_count = (
         max(0, (int(model.max_leaf_count) - int(model.leaf_levels.numel())) // 7)
         if model.max_leaf_count is not None
         else int(candidate_ids.numel())
     )
-    count = min(int(valid_positions.numel()), byte_budget_count, leaf_budget_count)
+    ranked_positions = valid_positions[
+        torch.argsort(rates[valid_positions], descending=True)
+    ]
+    ranked_positions = ranked_positions[:leaf_budget_count]
+    cumulative_bytes = torch.cumsum(dynamic_added_bytes[ranked_positions], dim=0)
+    affordable = cumulative_bytes <= int(max_added_bytes)
+    count = int(torch.sum(affordable).item())
     if count > 0:
-        selected_positions = valid_positions[
-            torch.topk(indicator[valid_positions], count, sorted=False).indices
-        ]
+        selected_positions = ranked_positions[:count]
         selected = candidate_ids[selected_positions]
         selected_indicator = float(indicator[selected_positions].sum().item())
         selected_levels = model.leaf_levels[selected]
@@ -1013,11 +1021,15 @@ def _apply_h_jump_rate_distortion(
         "positive_indicator_count": int(valid_positions.numel()),
         "h_selected": count,
         "selected_by_parent_level": selected_by_level,
-        "predicted_added_bytes": count * int(h_added_bytes),
+        "predicted_added_bytes": (
+            int(dynamic_added_bytes[selected_positions].sum().item()) if count else 0
+        ),
         "selected_indicator_sum": selected_indicator,
         "indicator_mean": float(finite.mean().item()) if finite.numel() else 0.0,
         "indicator_max": float(finite.max().item()) if finite.numel() else 0.0,
-        "h_added_bytes_per_action": int(h_added_bytes),
+        "h_added_bytes_per_action": (
+            int(h_added_bytes) if h_added_bytes is not None else "degree-dependent"
+        ),
         "selection": "global volume-scaled face-jump indicator per raw float16 packed byte",
     }
 
@@ -1433,7 +1445,7 @@ def _apply_gradient_rate_distortion_p_refinement(
     scores = torch.zeros((trial_count,), dtype=torch.float32, device=gradient.device)
     added_counts = torch.zeros((trial_count,), dtype=torch.long, device=gradient.device)
     trial_degrees = model.leaf_degrees[trial_leaf_ids]
-    for old_degree_tensor in torch.unique(old_degrees, dim=0):
+    for old_degree_tensor in unique_degree_rows(old_degrees):
         group = torch.all(old_degrees == old_degree_tensor, dim=1)
         positions = torch.nonzero(group, as_tuple=False).reshape(-1)
         if positions.numel() == 0:
@@ -1837,6 +1849,21 @@ def run_training(config_path: str | Path) -> dict:
             del fdk_volume, coarse
         elif initialization != "random":
             raise ValueError("Bernstein initialization must be 'projection_mean', 'fdk_volume', or 'random'.")
+        initial_leaf_degree = config["model"].get("initial_leaf_degree")
+        if initial_leaf_degree is not None:
+            target_degree = tuple(int(value) for value in initial_leaf_degree)
+            if target_degree != (1, 1, 1):
+                raise ValueError(
+                    "model.initial_leaf_degree currently supports only [1, 1, 1]."
+                )
+            if any(int(value) < 1 for value in model.max_degree):
+                raise ValueError(
+                    "model.max_degree must allow [1, 1, 1] when initial_leaf_degree is enabled."
+                )
+            model.elevate_leaves_isotropic_batch(
+                torch.arange(model.leaf_levels.shape[0], device=device),
+                target_degree,
+            )
     materialize_ray_points = not (
         hasattr(model, "prefer_compact_ray_batch") and model.prefer_compact_ray_batch()
     )
@@ -2182,7 +2209,9 @@ def run_training(config_path: str | Path) -> dict:
                 active, jump_summary = _apply_h_jump_rate_distortion(
                     model,
                     max_added_bytes=int(spec.get("max_added_bytes", 1_000_000)),
-                    h_added_bytes=int(spec.get("h_added_bytes", 99)),
+                    h_added_bytes=(
+                        int(spec["h_added_bytes"]) if "h_added_bytes" in spec else None
+                    ),
                 )
                 growth_summary = {
                     "operation": "h_jump_rate_distortion",

@@ -420,12 +420,45 @@ def _leaf_geometry_payload(model, *, max_leaves: int | None = None, min_mu: floa
     }
 
 
+def _leaf_corner_values(model, mu_np: np.ndarray) -> np.ndarray | None:
+    """Per-leaf 8-corner mu values in (i,j,k) order (k fastest), i.e. the same
+    corner ordering as `bernstein._all_coords(2)`.
+
+    Returns None when every leaf is exactly constant (degree (0,0,0), or the
+    model has no degree concept at all): in that case the flat per-leaf mean
+    already renders correctly as a single-color box and there is no reason to
+    pay 8x the bandwidth. Only leaves whose degree is exactly (1,1,1) get real
+    corner values -- pipeline v5's p0/p1 leaves are the only non-constant
+    case today -- pulled directly from their stored Bernstein coefficients
+    (a degree-(1,1,1) block's 8 coefficients *are* its corner values, no
+    fitting needed). Any other, currently unused, degree combination falls
+    back to the flat mean for that leaf rather than guessing.
+    """
+    leaf_degrees = getattr(model, "leaf_degrees", None)
+    if leaf_degrees is None:
+        return None
+    degrees_np = leaf_degrees.detach().cpu().numpy()
+    is_p1 = np.all(degrees_np == 1, axis=1)
+    if not np.any(is_p1):
+        return None
+    corners = np.repeat(mu_np[:, None], 8, axis=1).astype(np.float32)
+    p1_ids = np.nonzero(is_p1)[0]
+    physical = model.coefficients().detach().cpu().numpy().astype(np.float32)
+    offsets_np = model.coefficient_offsets.detach().cpu().numpy()
+    starts = offsets_np[p1_ids]
+    corners[p1_ids] = physical[starts[:, None] + np.arange(8)[None, :]]
+    return corners
+
+
 def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float = 0.0) -> bytes:
     """Compact GPU-ready leaf stream.
 
     Coordinates stay uint16 and are converted to positions/sizes in the vertex
     shader. Compared with the JSON endpoint this removes base64, float position
-    and size arrays, and all server-side box construction.
+    and size arrays, and all server-side box construction. When any leaf is a
+    non-constant (p1) Bernstein block, its 8 corner values ride along too, so
+    the renderer can interpolate the real function instead of flat-shading a
+    single box (pipeline v5 step 9: "viewer must evaluate p1, not block-fill it").
     """
     raw_levels = getattr(model, "level_shapes", getattr(model, "level_resolutions", []))
     resolutions = [
@@ -442,6 +475,7 @@ def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float
     levels_np = leaf_levels.detach().cpu().numpy().astype(np.uint8, copy=False)
     coords_np = leaf_coords.detach().cpu().numpy().astype(np.uint16, copy=False)
     mu_np = model._leaf_mu().detach().cpu().numpy().astype(np.float32, copy=False)
+    corners_np = _leaf_corner_values(model, mu_np)
     total = int(levels_np.shape[0])
     idx = np.flatnonzero(mu_np >= float(min_mu))
     if idx.size == 0:
@@ -465,6 +499,15 @@ def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float
     mu_offset = len(coords_bytes) + coords_padding
     mu_bytes = selected_mu.tobytes()
     levels_offset = mu_offset + len(mu_bytes)
+    body = coords_bytes + (b"\0" * coords_padding) + mu_bytes + selected_levels.tobytes()
+
+    corners_offset = None
+    if corners_np is not None:
+        levels_padding = (-len(selected_levels.tobytes())) % 4
+        corners_offset = levels_offset + len(selected_levels.tobytes()) + levels_padding
+        selected_corners = np.ascontiguousarray(corners_np[idx])
+        body += (b"\0" * levels_padding) + selected_corners.tobytes()
+
     header = {
         "kind": "leaves",
         "encoding": "actleaf1",
@@ -486,10 +529,11 @@ def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float
         "coords_offset": 0,
         "mu_offset": mu_offset,
         "levels_offset": levels_offset,
+        "has_corners": corners_offset is not None,
+        "corners_offset": corners_offset,
     }
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
     header_bytes += b" " * ((-len(header_bytes)) % 4)
-    body = coords_bytes + (b"\0" * coords_padding) + mu_bytes + selected_levels.tobytes()
     return b"ACTLEAF1" + struct.pack("<I", len(header_bytes)) + header_bytes + body
 
 
@@ -966,6 +1010,10 @@ class ViewerState:
             "angle_rad": float(single.angles[0].detach().cpu().item()),
             "source_path": str(single.paths[0]),
             "elapsed_ms": elapsed_ms,
+            "device": str(self.device),
+            "native_cuda_integrator": bool(
+                hasattr(self.model, "prefer_compact_ray_batch") and self.model.prefer_compact_ray_batch()
+            ),
             "metrics": _array_stats(pred, target),
             "images": {
                 "prediction": _encode_gray_png(pred, vmin=vmin, vmax=vmax),
@@ -1050,6 +1098,7 @@ class ViewerState:
             "elapsed_ms": (
                 None if self._decoded_volume_time_sec is None else float(self._decoded_volume_time_sec) * 1000.0
             ),
+            "device": str(self.device),
             "metrics": _array_stats(pred, target),
             "images": {
                 "prediction": _encode_gray_png(pred, vmin=vmin, vmax=vmax),

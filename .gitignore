@@ -42,6 +42,8 @@ adaptive_ct/*
 !adaptive_ct/compression.py
 !adaptive_ct/config.py
 !adaptive_ct/data.py
+!adaptive_ct/functional_compression.py
+!adaptive_ct/industrial_detail_pipeline.py
 !adaptive_ct/geometry.py
 !adaptive_ct/losses.py
 !adaptive_ct/metrics.py
@@ -67,6 +69,9 @@ configs/*
 !configs/research/
 configs/research/*
 !configs/research/figure473_128v_pure_adaptive.yaml
+!configs/research/industrial_detail_v5_h_reference.yaml
+!configs/research/industrial_detail_v5_20mb.yaml
+!configs/research/industrial_detail_v5_20mb_final.yaml
 
 # Local configuration and agent state
 .env

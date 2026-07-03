@@ -32,6 +32,7 @@ views.
   attribution.
 - Parallel-beam projector and R2 geometry loader.
 - Projection-domain training and global adaptive refinement.
+- Detail-preserving bottom-up subtree compression with keep/p0/p1 actions.
 - Compact packed-hierarchy export and loading.
 - Legacy dynamic leaf-voxel representation used by compatible checkpoints.
 - Python HTTP backend and Vite + TypeScript + Three.js viewer.
@@ -47,6 +48,8 @@ adaptive_ct/
   backend.py            Native CUDA bindings
   geometry.py           Parallel-beam ray construction
   projection_domain.py  Residual attribution and adaptive decisions
+  functional_compression.py  Projection-aware keep/p0/p1 subtree compression
+  industrial_detail_pipeline.py  Auditable reference-to-compact entry point
   compression.py        Compact model export and loading
   train.py              Training, refinement, evaluation, and export
   viewer/               Python server and Three.js frontend
@@ -57,6 +60,9 @@ native/
 configs/
   figure473_48v.yaml
   research/figure473_128v_pure_adaptive.yaml
+  research/industrial_detail_v5_h_reference.yaml
+  research/industrial_detail_v5_20mb.yaml
+  research/industrial_detail_v5_20mb_final.yaml
 setup.py
 ```
 
@@ -162,6 +168,36 @@ compact_octree.npz
 
 The checkpoint contains training state and framework metadata.
 `compact_octree.npz` is the deployment-oriented representation.
+
+## Industrial Detail Pipeline
+
+The industrial-detail entry point reconstructs its own h-only reference from
+the configured sparse projections, then performs projection-aware bottom-up
+subtree compression. Each internal subtree is either kept, replaced by a p0
+constant leaf, or replaced by a p1 trilinear leaf under one packed-byte budget.
+It does not accept an externally supplied reference checkpoint.
+
+Validate the complete pipeline contract without training:
+
+```powershell
+python -m adaptive_ct.industrial_detail_pipeline `
+  --config configs\research\industrial_detail_v5_20mb.yaml `
+  --validate-only
+```
+
+Run reconstruction, functional compression, fixed-topology refinement, and
+compact export:
+
+```powershell
+python -m adaptive_ct.industrial_detail_pipeline `
+  --config configs\research\industrial_detail_v5_20mb.yaml
+```
+
+The pipeline writes its h-only reference to the reference config's output
+directory and the final checkpoint, compact hierarchy, compression report, and
+pipeline report to the pipeline config's output directory. Use
+`industrial_detail_v5_20mb_final.yaml` to load the final checkpoint in the
+viewer.
 
 ## Viewer
 

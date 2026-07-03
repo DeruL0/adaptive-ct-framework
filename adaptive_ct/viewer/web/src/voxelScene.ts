@@ -33,6 +33,12 @@ const VERTEX_SHADER = `
   attribute vec3 instanceCoord;
   attribute float instanceMu;
   attribute float instanceLevel;
+  #ifdef HAS_CORNERS
+  // Corner order matches bernstein._all_coords(2): (i,j,k) with k fastest.
+  // low = i=0 side (000,001,010,011), high = i=1 side (100,101,110,111).
+  attribute vec4 instanceCornersLow;
+  attribute vec4 instanceCornersHigh;
+  #endif
 
   uniform int uColorMode;
   uniform float uMinMu;
@@ -70,11 +76,38 @@ const VERTEX_SHADER = `
     vec3 scaledSize = instanceSize * uKeep * shown;
     vec3 localPosition = position * scaledSize + instanceOffset;
 
+    // A p1 (trilinear) leaf is not a flat block: evaluate its own corner
+    // values at this vertex instead of reusing the leaf-wide mean, so the
+    // box's shading actually shows the stored gradient (pipeline v5 step 9).
+    float effectiveMu = instanceMu;
+    #ifdef HAS_CORNERS
+    {
+      // position is the box's own local axis; the renderer swaps CT y/z
+      // for a Y-up scene (see instanceOffset/instanceSize above), so local
+      // y carries CT z and local z carries CT y.
+      float u = position.x + 0.5;
+      float v = position.z + 0.5;
+      float w = position.y + 0.5;
+      float wu0 = 1.0 - u;
+      float wv0 = 1.0 - v;
+      float ww0 = 1.0 - w;
+      effectiveMu =
+        wu0 * wv0 * ww0 * instanceCornersLow.x +
+        wu0 * wv0 * w   * instanceCornersLow.y +
+        wu0 * v   * ww0 * instanceCornersLow.z +
+        wu0 * v   * w   * instanceCornersLow.w +
+        u   * wv0 * ww0 * instanceCornersHigh.x +
+        u   * wv0 * w   * instanceCornersHigh.y +
+        u   * v   * ww0 * instanceCornersHigh.z +
+        u   * v   * w   * instanceCornersHigh.w;
+    }
+    #endif
+
     float geometricSize = pow(max(instanceSize.x * instanceSize.y * instanceSize.z, 1e-20), 1.0 / 3.0);
     if (uColorMode == 0) {
       vColor = uLevelColors[levelIndex];
     } else if (uColorMode == 1) {
-      vColor = ramp((instanceMu - uMuMin) / uMuSpan);
+      vColor = ramp((effectiveMu - uMuMin) / uMuSpan);
     } else {
       vColor = ramp(1.0 - (geometricSize - uSizeMin) / uSizeSpan);
     }
@@ -186,6 +219,12 @@ export class VoxelScene {
     this.mesh = null;
     this.instanceGeometry = null;
 
+    const hasCorners = data.hasCorners && !!data.cornersLow && !!data.cornersHigh;
+    if (this.material.defines?.HAS_CORNERS !== (hasCorners ? 1 : undefined)) {
+      this.material.defines = hasCorners ? { HAS_CORNERS: 1 } : {};
+      this.material.needsUpdate = true;
+    }
+
     if (data.count > 0) {
       const geometry = new InstancedBufferGeometry();
       geometry.index = this.baseGeometry.index;
@@ -194,6 +233,10 @@ export class VoxelScene {
       geometry.setAttribute("instanceCoord", new InstancedBufferAttribute(data.coords, 3, false));
       geometry.setAttribute("instanceMu", new InstancedBufferAttribute(data.mu, 1));
       geometry.setAttribute("instanceLevel", new InstancedBufferAttribute(data.levels, 1, false));
+      if (hasCorners) {
+        geometry.setAttribute("instanceCornersLow", new InstancedBufferAttribute(data.cornersLow!, 4));
+        geometry.setAttribute("instanceCornersHigh", new InstancedBufferAttribute(data.cornersHigh!, 4));
+      }
       geometry.instanceCount = data.count;
       this.instanceGeometry = geometry;
       this.mesh = new Mesh(geometry, this.material);

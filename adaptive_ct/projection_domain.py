@@ -8,6 +8,7 @@ from typing import Iterable, Sequence
 
 import torch
 
+from .bernstein import unique_degree_rows
 from .data import ProjectionSplit
 from .geometry import (
     ProjectionGradientBatch,
@@ -268,7 +269,7 @@ def coefficient_diagnostics(model) -> CoefficientDiagnostics:
     ratio = torch.zeros_like(variation)
     face_means = torch.zeros((leaf_count, 3, 2), dtype=torch.float32, device=device)
 
-    for degree_tensor in torch.unique(model.leaf_degrees, dim=0):
+    for degree_tensor in unique_degree_rows(model.leaf_degrees):
         degree = tuple(int(value) for value in degree_tensor.tolist())
         mask = torch.all(model.leaf_degrees == degree_tensor, dim=1)
         leaf_ids = torch.nonzero(mask, as_tuple=False).reshape(-1)

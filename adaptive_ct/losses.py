@@ -18,7 +18,7 @@ def _evaluate_leaf_polynomials(
     coefficients: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evaluate explicitly selected leaf polynomials at world-space points."""
-    from .bernstein import bernstein_basis
+    from .bernstein import bernstein_basis, unique_degree_rows
 
     original_shape = points.shape[:-1]
     flat_points = points.reshape(-1, 3)
@@ -27,7 +27,7 @@ def _evaluate_leaf_polynomials(
     values = flat_points.new_zeros((flat_points.shape[0],), dtype=torch.float32)
     degrees = model.leaf_degrees[flat_leaf_ids]
     coefficients = model.coefficients() if coefficients is None else coefficients
-    for degree_tensor in torch.unique(degrees, dim=0):
+    for degree_tensor in unique_degree_rows(degrees):
         degree = tuple(int(value) for value in degree_tensor.tolist())
         mask = torch.all(degrees == degree_tensor, dim=1)
         point_ids = torch.nonzero(mask, as_tuple=False).reshape(-1)

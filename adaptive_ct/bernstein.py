@@ -67,6 +67,28 @@ def _inverse_softplus(value: torch.Tensor) -> torch.Tensor:
     return value + torch.log(-torch.expm1(-value))
 
 
+def unique_degree_rows(degrees: torch.Tensor) -> torch.Tensor:
+    """Fast replacement for `torch.unique(degrees, dim=0)` on (N, 3) small
+    nonnegative-integer degree tuples.
+
+    PyTorch's dim=0 unique is a general row-wise comparison and is
+    dramatically slower on CPU than the plain 1D unique -- for a few hundred
+    thousand rows the difference is seconds vs. milliseconds. Since a Bernstein
+    degree is a handful of small integers per axis, encode each row into one
+    integer key, run the well-optimized 1D unique, and decode back.
+    """
+    if degrees.shape[0] == 0:
+        return degrees
+    base = max(int(degrees.max().item()) + 1, 2)
+    keys = (degrees[:, 0] * base + degrees[:, 1]) * base + degrees[:, 2]
+    unique_keys = torch.unique(keys)
+    d0 = torch.div(unique_keys, base * base, rounding_mode="floor")
+    remainder = unique_keys - d0 * base * base
+    d1 = torch.div(remainder, base, rounding_mode="floor")
+    d2 = remainder - d1 * base
+    return torch.stack([d0, d1, d2], dim=1)
+
+
 def bernstein_basis(degree: int, coordinate: torch.Tensor) -> torch.Tensor:
     """Evaluate all Bernstein basis functions of one degree on [0, 1]."""
     degree = int(degree)
@@ -425,7 +447,13 @@ class BernsteinOctree(nn.Module):
         valid_point_ids = torch.nonzero(valid, as_tuple=False).reshape(-1)
         valid_leaf_ids = leaf_ids[valid]
         point_degrees = self.leaf_degrees[valid_leaf_ids]
-        for degree_tensor in torch.unique(point_degrees, dim=0):
+        # softplus(coefficient_logits) is a whole-model transform; compute it
+        # once per call instead of once per distinct degree group, otherwise a
+        # batch spanning both p0 and p1 leaves (any post-compression model)
+        # redoes it multiple times per chunk, and a full-volume/slice decode
+        # multiplies that by thousands of chunks.
+        physical_coefficients = self.coefficients()
+        for degree_tensor in unique_degree_rows(point_degrees):
             degree = tuple(int(value) for value in degree_tensor.tolist())
             degree_mask = torch.all(point_degrees == degree_tensor, dim=1)
             point_ids = valid_point_ids[degree_mask]
@@ -444,7 +472,7 @@ class BernsteinOctree(nn.Module):
             weights = torch.einsum("ni,nj,nk->nijk", bx, by, bz).reshape(point_ids.shape[0], -1)
             offsets = torch.arange(weights.shape[1], device=flat_points.device, dtype=torch.long)
             coefficient_ids = self.coefficient_offsets[group_leaf_ids, None] + offsets[None, :]
-            coefficients = self.coefficients()[coefficient_ids]
+            coefficients = physical_coefficients[coefficient_ids]
             values[point_ids] = torch.sum(coefficients * weights, dim=1)
         return values.reshape(original_shape), leaf_ids.reshape(original_shape)
 
@@ -533,7 +561,7 @@ class BernsteinOctree(nn.Module):
         ray_ids, leaf_ids, intervals = self._parallel_ray_segments(ray_batch)
         segment_integrals = intervals.new_zeros((intervals.shape[0],))
         segment_degrees = self.leaf_degrees[leaf_ids]
-        for degree_tensor in torch.unique(segment_degrees, dim=0):
+        for degree_tensor in unique_degree_rows(segment_degrees):
             degree_mask = torch.all(segment_degrees == degree_tensor, dim=1)
             segment_ids = torch.nonzero(degree_mask, as_tuple=False).reshape(-1)
             degree = tuple(int(value) for value in degree_tensor.tolist())
@@ -663,16 +691,31 @@ class BernsteinOctree(nn.Module):
         else:
             shape = tuple(int(value) for value in resolution)
         device = self.coefficient_logits.device
-        axes = [torch.arange(value, dtype=torch.float32, device=device) for value in shape]
-        xx, yy, zz = torch.meshgrid(*axes, indexing="ij")
-        coords = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
         scale = torch.tensor(shape, dtype=torch.float32, device=device)
-        points = -1.0 + (coords + 0.5) * 2.0 / scale
         if chunk is None:
+            axes = [torch.arange(value, dtype=torch.float32, device=device) for value in shape]
+            xx, yy, zz = torch.meshgrid(*axes, indexing="ij")
+            coords = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
+            points = -1.0 + (coords + 0.5) * 2.0 / scale
             return self.forward_mu(points).reshape(shape)
+
+        # Do not materialize a resolution^3 coordinate mesh before chunking.
+        # At 384^3, xx/yy/zz + stacked coords + points can require several
+        # GiB even though each actual query batch is small.  Decode linear
+        # indices into xyz coordinates inside each batch instead.
+        nx, ny, nz = shape
+        total = int(nx) * int(ny) * int(nz)
         values = []
-        for start in range(0, points.shape[0], int(chunk)):
-            values.append(self.forward_mu(points[start : start + int(chunk)]))
+        for start in range(0, total, int(chunk)):
+            stop = min(start + int(chunk), total)
+            linear = torch.arange(start, stop, dtype=torch.long, device=device)
+            x = torch.div(linear, int(ny) * int(nz), rounding_mode="floor")
+            remainder = linear - x * int(ny) * int(nz)
+            y = torch.div(remainder, int(nz), rounding_mode="floor")
+            z = remainder - y * int(nz)
+            coords = torch.stack([x, y, z], dim=1).to(dtype=torch.float32)
+            points = -1.0 + (coords + 0.5) * 2.0 / scale
+            values.append(self.forward_mu(points))
         return torch.cat(values, dim=0).reshape(shape)
 
     def decoded_l0(self) -> torch.Tensor:
@@ -836,10 +879,41 @@ class BernsteinOctree(nn.Module):
         new_levels = (levels[:, None] + 1).expand(-1, 8).reshape(-1)
         new_degrees = self.leaf_degrees[leaf_ids_tensor][:, None, :].expand(-1, 8, -1).reshape(-1, 3).clone()
 
-        if torch.all(self.leaf_degrees[leaf_ids_tensor] == 0):
+        selected_degrees = self.leaf_degrees[leaf_ids_tensor]
+        if torch.all(selected_degrees == 0):
             physical = self.coefficients().detach()
             parent_coefficients = physical[self.coefficient_offsets[leaf_ids_tensor]]
             new_blocks: Sequence[torch.Tensor] | torch.Tensor = parent_coefficients.repeat_interleave(8)
+        elif torch.all(selected_degrees == 1):
+            # Vectorized de Casteljau subdivision for trilinear Bernstein
+            # leaves.  The old per-leaf Python loop is prohibitively slow for
+            # the hundred-thousand-leaf h-refinement rounds used in CT.
+            physical = self.coefficients().detach()
+            coefficient_indices = (
+                self.coefficient_offsets[leaf_ids_tensor, None]
+                + torch.arange(8, device=self.coefficient_logits.device)[None, :]
+            )
+            parents = physical[coefficient_indices].reshape(-1, 2, 2, 2)
+            weights = parents.new_tensor(
+                [[1.0, 0.0], [0.5, 0.5], [0.0, 1.0]]
+            )
+            lattice = torch.einsum(
+                "ai,bj,ck,nijk->nabc",
+                weights,
+                weights,
+                weights,
+                parents,
+            )
+            child_blocks = [
+                lattice[
+                    :,
+                    int(offset[0]) : int(offset[0]) + 2,
+                    int(offset[1]) : int(offset[1]) + 2,
+                    int(offset[2]) : int(offset[2]) + 2,
+                ]
+                for offset in child_offsets.tolist()
+            ]
+            new_blocks = torch.stack(child_blocks, dim=1).reshape(-1, 8)
         else:
             blocks: list[torch.Tensor] = []
             for leaf_id in leaf_ids_tensor.tolist():

@@ -138,14 +138,19 @@ button:disabled { cursor: wait !important; opacity: 0.58; }
   font-size: 21px;
 }
 .source-field { display: grid; gap: 7px; color: var(--muted); font-size: 12px; }
-.source-field input {
+.source-field input,
+.source-field select {
   width: 100%;
   padding: 9px 10px;
   border: 1px solid var(--border);
   border-radius: 7px;
   background: rgba(7, 11, 16, 0.9);
+  color: inherit;
+  font: inherit;
 }
-.source-field input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+.source-field select { cursor: pointer; }
+.source-field input:focus,
+.source-field select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
 .source-note { margin: 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .source-actions { display: flex; justify-content: flex-end; gap: 9px; }
 .source-actions button {

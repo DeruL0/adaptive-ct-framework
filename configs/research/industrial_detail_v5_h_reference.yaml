@@ -1,0 +1,13 @@
+extends: figure473_128v_pure_adaptive.yaml
+
+# Internal h-only stage reconstructed directly from sparse projections.
+output:
+  dir: output\industrial_detail_v5_20mb\reference_h
+
+export:
+  compact_octree:
+    enabled: false
+  mact:
+    enabled: false
+  surface:
+    enabled: false

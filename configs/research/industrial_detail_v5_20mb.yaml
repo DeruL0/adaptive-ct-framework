@@ -1,0 +1,24 @@
+schema: industrial_ct_detail_functional_field_v5
+device: cuda
+
+# No checkpoint field is permitted: the reference is always rebuilt first.
+reference:
+  config: industrial_detail_v5_h_reference.yaml
+
+compression:
+  # Selection uses deterministic raw packed bytes. The final report records
+  # the actual compact file size, which is the formal deployment rate.
+  raw_packed_budget_bytes: 81750000
+  samples_per_axis: 4
+  max_workspace_mb: 2048
+  finetune_iterations: 15000
+  finetune_batch_rays: 65536
+  finetune_lr: 0.015
+  eval_ray_chunk: 65536
+  score_ray_chunk: 8192
+  score_views: 0
+  score_rays_per_view: 32768
+  quantization: float16
+
+output:
+  dir: output\industrial_detail_v5_20mb\final

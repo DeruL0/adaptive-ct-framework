@@ -1,0 +1,5 @@
+extends: industrial_detail_v5_h_reference.yaml
+
+# Viewer/evaluation config for the final fixed-topology functional tree.
+output:
+  dir: output\industrial_detail_v5_20mb\final

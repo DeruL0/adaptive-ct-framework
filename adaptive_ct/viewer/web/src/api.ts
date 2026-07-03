@@ -169,6 +169,12 @@ export interface LeavesPayload {
   coords: Uint16Array;
   mu: Float32Array;
   levels: Uint8Array;
+  /** True when any leaf is a non-constant (p1) Bernstein block; only then
+   * are `cornersLow`/`cornersHigh` present, so p1 leaves can be shaded by
+   * their real corner values instead of a single flat block color. */
+  hasCorners: boolean;
+  cornersLow?: Float32Array;
+  cornersHigh?: Float32Array;
 }
 
 export interface ImageTriple {
@@ -190,6 +196,8 @@ export interface ProjectionPayload {
   view: number;
   angle_rad: number;
   elapsed_ms: number | null;
+  device: string;
+  native_cuda_integrator: boolean;
   metrics: Metrics;
   images: ImageTriple;
 }
@@ -199,6 +207,7 @@ export interface SlicePayload {
   axis: string;
   index: number;
   elapsed_ms: number | null;
+  device: string;
   metrics: Metrics;
   images: ImageTriple;
 }
@@ -267,6 +276,20 @@ export async function getLeaves(maxLeaves: number | null, minMu: number): Promis
   const coordsOffset = payloadOffset + Number(header.coords_offset);
   const muOffset = payloadOffset + Number(header.mu_offset);
   const levelsOffset = payloadOffset + Number(header.levels_offset);
+  const hasCorners = Boolean(header.has_corners);
+  let cornersLow: Float32Array | undefined;
+  let cornersHigh: Float32Array | undefined;
+  if (hasCorners) {
+    const cornersOffset = payloadOffset + Number(header.corners_offset);
+    const interleaved = new Float32Array(buffer, cornersOffset, count * 8);
+    cornersLow = new Float32Array(count * 4);
+    cornersHigh = new Float32Array(count * 4);
+    for (let leaf = 0; leaf < count; leaf += 1) {
+      const base = leaf * 8;
+      cornersLow.set(interleaved.subarray(base, base + 4), leaf * 4);
+      cornersHigh.set(interleaved.subarray(base + 4, base + 8), leaf * 4);
+    }
+  }
   return {
     kind: "leaves",
     count,
@@ -281,6 +304,9 @@ export async function getLeaves(maxLeaves: number | null, minMu: number): Promis
     coords: new Uint16Array(buffer, coordsOffset, count * 3),
     mu: new Float32Array(buffer, muOffset, count),
     levels: new Uint8Array(buffer, levelsOffset, count),
+    hasCorners,
+    cornersLow,
+    cornersHigh,
   };
 }
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .bernstein import unique_degree_rows
 from .projection_domain import coefficient_diagnostics
 
 
@@ -69,7 +70,7 @@ def build_mact_artifact(
     groups = []
     compressed_bytes = int(material_centres.numel() * material_centres.element_size())
 
-    unique_degrees = torch.unique(model.leaf_degrees, dim=0)
+    unique_degrees = unique_degree_rows(model.leaf_degrees)
     for degree_tensor in unique_degrees:
         degree = tuple(int(value) for value in degree_tensor.tolist())
         degree_mask = torch.all(model.leaf_degrees == degree_tensor, dim=1)

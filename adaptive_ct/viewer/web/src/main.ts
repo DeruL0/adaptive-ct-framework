@@ -107,13 +107,11 @@ APP.innerHTML = `
         </div>
         <label class="source-field">
           <span>Config (.yaml)</span>
-          <input id="configPath" list="configFiles" autocomplete="off">
-          <datalist id="configFiles"></datalist>
+          <select id="configPath"></select>
         </label>
         <label class="source-field">
           <span>Model (.pt / .npz)</span>
-          <input id="checkpointPath" list="checkpointFiles" autocomplete="off" placeholder="Blank = checkpoint from config output">
-          <datalist id="checkpointFiles"></datalist>
+          <select id="checkpointPath"></select>
         </label>
         <p class="source-note" id="sourceWorkspace"></p>
         <p class="error-text" id="sourceError" hidden></p>
@@ -167,33 +165,42 @@ function fmtBytes(value: number | null | undefined): string {
 
 function populateSourceLists(sources: SourcesPayload, meta: StatePayload, resetInputs = false): void {
   state.sources = sources;
-  const fill = (id: string, files: SourcesPayload["configs"]): void => {
-    const list = $(id) as HTMLDataListElement;
-    list.replaceChildren();
+  const fill = (
+    id: string,
+    files: SourcesPayload["configs"],
+    current: string,
+    placeholder: string | null,
+  ): void => {
+    const select = $(id) as HTMLSelectElement;
+    const previous = select.value;
+    select.replaceChildren();
+    if (placeholder !== null) {
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = placeholder;
+      select.appendChild(empty);
+    }
     files.forEach((file) => {
       const option = document.createElement("option");
       option.value = file.path;
-      option.label = `${file.relative_path} · ${fmtBytes(file.size_bytes)}`;
-      list.appendChild(option);
+      option.textContent = `${file.relative_path} · ${fmtBytes(file.size_bytes)}`;
+      select.appendChild(option);
     });
+    const known = new Set(files.map((file) => file.path));
+    const target = resetInputs ? current : previous || current;
+    select.value = known.has(target) ? target : select.options[0]?.value ?? "";
   };
-  fill("configFiles", sources.configs);
-  fill("checkpointFiles", sources.checkpoints);
+  fill("configPath", sources.configs, meta.paths.config, null);
+  fill("checkpointPath", sources.checkpoints, meta.paths.checkpoint || "", "Blank = checkpoint from config output");
   $("sourceWorkspace").textContent =
     `${sources.workspace} · ${sources.configs.length} configs · ${sources.checkpoints.length} models`;
-  if (resetInputs || !(($("configPath") as HTMLInputElement).value)) {
-    ($("configPath") as HTMLInputElement).value = meta.paths.config;
-  }
-  if (resetInputs || !(($("checkpointPath") as HTMLInputElement).value)) {
-    ($("checkpointPath") as HTMLInputElement).value = meta.paths.checkpoint || "";
-  }
 }
 
 function setSourceDialog(open: boolean): void {
   $("sourceBackdrop").hidden = !open;
   if (open) {
     $("sourceError").hidden = true;
-    ($("configPath") as HTMLInputElement).focus();
+    ($("configPath") as HTMLSelectElement).focus();
   }
 }
 
@@ -218,8 +225,8 @@ function bindSourcePicker(meta: StatePayload, sources: SourcesPayload): void {
   });
   $("loadSource").addEventListener("click", async () => {
     const button = $("loadSource") as HTMLButtonElement;
-    const config = ($("configPath") as HTMLInputElement).value.trim();
-    const checkpoint = ($("checkpointPath") as HTMLInputElement).value.trim();
+    const config = ($("configPath") as HTMLSelectElement).value.trim();
+    const checkpoint = ($("checkpointPath") as HTMLSelectElement).value.trim();
     $("sourceError").hidden = true;
     button.disabled = true;
     button.textContent = "Loading…";
@@ -535,17 +542,35 @@ async function loadLeaves(): Promise<void> {
 }
 
 // ----------------------------------------------------------- 2D image modes
-function showImages(payload: { images: { prediction: string; target: string; error: string }; metrics: { psnr: number; ssim: number; mae: number }; elapsed_ms?: number | null }, predTag: string, gtTag: string): void {
+function showImages(
+  payload: {
+    images: { prediction: string; target: string; error: string };
+    metrics: { psnr: number; ssim: number; mae: number };
+    elapsed_ms?: number | null;
+    device?: string;
+    native_cuda_integrator?: boolean;
+  },
+  predTag: string,
+  gtTag: string,
+): void {
   ($("imgPred") as HTMLImageElement).src = payload.images.prediction;
   ($("imgGt") as HTMLImageElement).src = payload.images.target;
   ($("imgErr") as HTMLImageElement).src = payload.images.error;
   $("imgPredTag").textContent = predTag;
   $("imgGtTag").textContent = gtTag;
+  const deviceLabel = payload.device
+    ? payload.native_cuda_integrator
+      ? `${payload.device} (native)`
+      : payload.device === "cuda"
+        ? `${payload.device} (torch fallback, slow)`
+        : payload.device
+    : null;
   setMetrics([
     ["PSNR", `${fmt(payload.metrics.psnr, 2)} dB`],
     ["SSIM", fmt(payload.metrics.ssim, 4)],
     ["MAE", fmt(payload.metrics.mae, 5)],
     ["Render", payload.elapsed_ms ? `${fmt(payload.elapsed_ms, 1)} ms` : "cached"],
+    ...(deviceLabel ? ([["Device", deviceLabel]] as Array<[string, string]>) : []),
   ]);
 }
 
