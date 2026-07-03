@@ -221,6 +221,23 @@ class BernsteinOctree(nn.Module):
         self.register_buffer("leaf_degrees", torch.zeros((leaf_count, 3), dtype=torch.long), persistent=True)
         self.register_buffer("coefficient_offsets", torch.arange(leaf_count + 1, dtype=torch.long), persistent=True)
         self.register_buffer("coefficient_leaf_ids", torch.arange(leaf_count, dtype=torch.long), persistent=True)
+        # Optional constrained-nodal parameterisation.  In the default
+        # discontinuous Bernstein representation these tensors are empty and
+        # coefficient_logits stores one parameter per leaf-local coefficient.
+        # In nodal mode coefficient_logits stores only independent master
+        # vertices, while every leaf-local p1 corner is reconstructed by the
+        # sparse convex map below.  Keeping the map at the coefficient layer
+        # lets the existing exact CPU and CUDA projectors remain unchanged.
+        self.register_buffer(
+            "coefficient_constraint_ids",
+            torch.empty((0, 0), dtype=torch.long),
+            persistent=True,
+        )
+        self.register_buffer(
+            "coefficient_constraint_weights",
+            torch.empty((0, 0), dtype=torch.float32),
+            persistent=True,
+        )
         self.register_buffer("node_child_base", torch.empty((0,), dtype=torch.int32), persistent=False)
         self.register_buffer("node_leaf_id", torch.empty((0,), dtype=torch.int32), persistent=False)
         for level in range(len(self.level_shapes)):
@@ -239,8 +256,34 @@ class BernsteinOctree(nn.Module):
     def _level_leaf_lookup(self, level: int) -> tuple[torch.Tensor, torch.Tensor]:
         return getattr(self, self._lookup_linear_name(level)), getattr(self, self._lookup_leaf_name(level))
 
-    def coefficients(self) -> torch.Tensor:
+    @property
+    def constrained_nodal(self) -> bool:
+        return bool(self.coefficient_constraint_ids.numel() > 0)
+
+    def master_coefficients(self) -> torch.Tensor:
         return F.softplus(self.coefficient_logits + self.attenuation_shift)
+
+    def coefficients(self) -> torch.Tensor:
+        masters = self.master_coefficients()
+        if not self.constrained_nodal:
+            return masters
+        ids = self.coefficient_constraint_ids
+        weights = self.coefficient_constraint_weights.to(dtype=masters.dtype)
+        safe_ids = ids.clamp_min(0)
+        values = masters[safe_ids]
+        values = torch.where(ids >= 0, values, torch.zeros_like(values))
+        return torch.sum(values * weights, dim=1)
+
+    def local_coefficient_logits(self) -> torch.Tensor:
+        """Leaf-local logits consumed by the existing Bernstein projector.
+
+        The inverse softplus is differentiable, so native-kernel gradients on
+        leaf-local coefficients propagate through the constraint matrix and
+        accumulate on shared master vertices.
+        """
+        if not self.constrained_nodal:
+            return self.coefficient_logits
+        return self._coefficients_to_logits(self.coefficients())
 
     def _coefficients_to_logits(self, coefficients: torch.Tensor) -> torch.Tensor:
         return _inverse_softplus(coefficients.clamp_min(1e-12)) - self.attenuation_shift
@@ -623,7 +666,7 @@ class BernsteinOctree(nn.Module):
 
     def _cuda_integrator_arguments(self, ray_batch) -> dict:
         return {
-            "coefficient_logits": self.coefficient_logits,
+            "coefficient_logits": self.local_coefficient_logits(),
             "leaf_degrees": self.leaf_degrees,
             "coefficient_offsets": self.coefficient_offsets,
             "node_child_base": self.node_child_base,
@@ -1168,6 +1211,8 @@ class BernsteinOctree(nn.Module):
                 self.leaf_degrees,
                 self.coefficient_offsets,
                 self.coefficient_leaf_ids,
+                self.coefficient_constraint_ids,
+                self.coefficient_constraint_weights,
                 self.node_child_base,
                 self.node_leaf_id,
             )
@@ -1204,8 +1249,28 @@ class BernsteinOctree(nn.Module):
         self.coefficient_logits = nn.Parameter(torch.empty_like(state_dict["coefficient_logits"], device=device))
         for name in required.difference({"coefficient_logits"}):
             setattr(self, name, torch.empty_like(state_dict[name], device=device))
+        for name in ("coefficient_constraint_ids", "coefficient_constraint_weights"):
+            if name in state_dict:
+                setattr(self, name, torch.empty_like(state_dict[name], device=device))
 
     def load_state_dict(self, state_dict, strict: bool = True):
+        constraint_names = (
+            "coefficient_constraint_ids",
+            "coefficient_constraint_weights",
+        )
+        present = [name in state_dict for name in constraint_names]
+        if any(present) and not all(present):
+            missing = [name for name, exists in zip(constraint_names, present) if not exists]
+            raise ValueError(f"Bernstein checkpoint has incomplete coefficient constraints: {missing}.")
+        if not any(present):
+            # Compact v1-v3 and older checkpoints predate constrained nodal
+            # coefficients. Treat them as the original discontinuous model.
+            metadata = getattr(state_dict, "_metadata", None)
+            state_dict = state_dict.copy()
+            if metadata is not None:
+                state_dict._metadata = metadata
+            state_dict[constraint_names[0]] = self.coefficient_constraint_ids
+            state_dict[constraint_names[1]] = self.coefficient_constraint_weights
         result = super().load_state_dict(state_dict, strict=strict)
         self._rebuild_packed_topology()
         return result
