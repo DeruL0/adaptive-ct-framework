@@ -42,10 +42,3 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     return data
 
 
-def get_nested(config: Dict[str, Any], key: str, default=None):
-    cur: Any = config
-    for part in key.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return default
-        cur = cur[part]
-    return cur

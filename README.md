@@ -57,8 +57,7 @@ The currently verified Windows environment is:
 - Visual Studio C++ build tools
 - Node.js 24.13 and npm 11.6 for the viewer
 
-Core Python dependencies are PyTorch, NumPy, PyYAML, and Pillow. Selected
-evaluation utilities additionally use SciPy and Matplotlib.
+Core Python dependencies are PyTorch, NumPy, PyYAML, and Pillow.
 
 ## Installation
 
@@ -69,7 +68,7 @@ local CUDA toolkit:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip setuptools wheel ninja
-python -m pip install numpy pyyaml pillow scipy matplotlib
+python -m pip install numpy pyyaml pillow
 ```
 
 Build the native extension:

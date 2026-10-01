@@ -4,9 +4,7 @@ extends: stage7_dorfler_p1_256v.yaml
 training:
   progressive:
     convergence_milestones:
-      - enabled: true
-        operation: dorfler_h_split
-        repeat_until_stopped: true
+      - operation: dorfler_h_split
         min_iteration: 1000
         min_iterations_after_previous: 400
         window: 8

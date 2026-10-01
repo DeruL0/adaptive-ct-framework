@@ -23,10 +23,6 @@ else:  # pragma: no cover
     _NATIVE_IMPORT_ERROR = None
 
 
-def has_native() -> bool:
-    return _NATIVE is not None
-
-
 def has_bernstein_native() -> bool:
     return _NATIVE is not None and all(
         hasattr(_NATIVE, name)

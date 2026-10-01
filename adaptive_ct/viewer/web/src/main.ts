@@ -318,12 +318,7 @@ function renderInspector(meta: StatePayload, artifacts: ArtifactsPayload | null 
   const proj = report.projection_test;
   const mat = report.material_volume;
   const boundary = report.boundary_sharpness;
-  const mact = artifacts?.mact;
   const compact = artifacts?.compact_octree;
-  const surface = artifacts?.surface;
-  const mactSummary = mact?.summary;
-  const surfaceStd = surface?.surface_std;
-  const coeffStd = surface?.coefficient_std;
   const rayIntegration = report.ray_integration || {};
   const volumeLoss = report.training_objective?.volume_loss as { enabled?: boolean } | undefined;
   const denseLoaded = report.training_objective?.dense_volume_loaded_during_training;
@@ -363,17 +358,6 @@ function renderInspector(meta: StatePayload, artifacts: ArtifactsPayload | null 
       </div>
     </section>
     <section class="section">
-      <h2>MACT Export <span class="meta">${mact?.exists ? "loaded" : "missing"}</span></h2>
-      <dl class="kv">
-        <div><dt>File</dt><dd>${mact?.path || "-"}</dd></div>
-        <div><dt>Compression</dt><dd>${mactSummary ? `${fmt(mactSummary.compression_ratio, 3)}× · ${fmtBytes(mactSummary.original_coefficient_bytes)} → ${fmtBytes(mactSummary.compressed_payload_bytes)}` : "-"}</dd></div>
-        <div><dt>Groups</dt><dd>${mactSummary ? `${mactSummary.template_groups} template groups · ${mactSummary.material_clusters} material clusters` : "-"}</dd></div>
-        <div><dt>Material histogram</dt><dd>${mact?.material_histogram?.join(" / ") || "-"}</dd></div>
-        <div><dt>Orientation histogram</dt><dd>${mact?.orientation_histogram?.join(" / ") || "-"}</dd></div>
-      </dl>
-      ${mact?.error ? `<p class="error-text">${mact.error}</p>` : ""}
-    </section>
-    <section class="section">
       <h2>Compact Octree <span class="meta">${compact?.exists ? "loaded" : "missing"}</span></h2>
       <dl class="kv">
         <div><dt>File</dt><dd>${compact?.path || "-"}</dd></div>
@@ -382,16 +366,6 @@ function renderInspector(meta: StatePayload, artifacts: ArtifactsPayload | null 
         <div><dt>Payload</dt><dd>${compact ? `${(compact.leaf_count || 0).toLocaleString()} leaves · ${(compact.coefficient_count || 0).toLocaleString()} coeffs` : "-"}</dd></div>
       </dl>
       ${compact?.error ? `<p class="error-text">${compact.error}</p>` : ""}
-    </section>
-    <section class="section">
-      <h2>Surface Uncertainty <span class="meta">${surface?.exists ? "loaded" : "missing"}</span></h2>
-      <dl class="kv">
-        <div><dt>File</dt><dd>${surface?.path || "-"}</dd></div>
-        <div><dt>Surface points</dt><dd>${surface?.surface_point_count?.toLocaleString() || "-"} @ threshold ${fmt(surface?.threshold, 3)}</dd></div>
-        <div><dt>Surface std</dt><dd>${surfaceStd ? `mean ${fmt(surfaceStd.mean, 4)} · p95 ${fmt(surfaceStd.p95, 4)} · n=${surfaceStd.count.toLocaleString()}` : "-"}</dd></div>
-        <div><dt>Coefficient std</dt><dd>${coeffStd ? `mean ${fmt(coeffStd.mean, 4)} · p95 ${fmt(coeffStd.p95, 4)} · n=${coeffStd.count.toLocaleString()}` : "-"}</dd></div>
-      </dl>
-      ${surface?.error ? `<p class="error-text">${surface.error}</p>` : ""}
     </section>
     <section class="section">
       <h2>Checkpoint <span class="meta">${meta.checkpoint_loaded ? "loaded" : "not loaded"}</span></h2>

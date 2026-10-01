@@ -16,11 +16,10 @@ def build_model(config: Dict) -> BernsteinOctree | LatentP1Octree:
         cuda_integrator=bool(model_cfg.get("cuda_integrator", True)),
         integration_mode=str(model_cfg.get("integration_mode", "exact")),
         topology=str(model_cfg.get("topology", "packed_hierarchy")),
-        balance_2to1=bool(model_cfg.get("balance_2to1", False)),
         max_leaf_count=model_cfg.get("max_leaf_count"),
     )
-    if representation in {"latent_p1_octree", "latent_p1", "compact_neural_voxel_field"}:
+    if representation in {"latent_p1_octree", "latent_p1"}:
         return LatentP1Octree(latent_dim=int(model_cfg.get("latent_dim", 4)), **common)
-    if representation in {"bernstein_octree", "rd_cvf", "bernstein"}:
+    if representation in {"bernstein_octree", "bernstein"}:
         return BernsteinOctree(max_degree=model_cfg.get("max_degree", 3), **common)
     raise ValueError(f"Unsupported model representation {representation!r}.")

@@ -37,7 +37,7 @@ from .projection_domain import split_projection_views, weighted_projection_loss
 from .render import render_split
 from .volume_metrics import boundary_sharpness_metrics, material_volume_metrics
 
-_DORFLER_OPERATIONS = {"dorfler_h_split", "dorfler_split"}
+_OPERATION = "dorfler_h_split"
 
 
 def _make_optimizer(model, lr: float):
@@ -213,11 +213,8 @@ def _validate_config(config: dict) -> None:
     for key in ("volume_loss", "projection_gradient_loss", "coefficient_continuity"):
         if float((train_cfg.get(key, {}) or {}).get("weight", 0.0)) != 0.0:
             errors.append(f"training.{key}.weight must be 0")
-    milestones = [
-        item for item in (progressive.get("convergence_milestones", []) or [])
-        if bool((item or {}).get("enabled", True))
-    ]
-    if len(milestones) != 1 or str(milestones[0].get("operation", "")).lower() not in _DORFLER_OPERATIONS:
+    milestones = [item for item in (progressive.get("convergence_milestones", []) or []) if item]
+    if len(milestones) != 1 or str(milestones[0].get("operation", "")).lower() != _OPERATION:
         errors.append("this framework needs exactly one convergence milestone with operation dorfler_h_split")
     else:
         spec = milestones[0]
@@ -236,9 +233,9 @@ def _validate_config(config: dict) -> None:
 def _active_milestone(config: dict) -> dict:
     progressive = (config.get("training", {}) or {}).get("progressive", {}) or {}
     for item in progressive.get("convergence_milestones", []) or []:
-        if bool((item or {}).get("enabled", True)):
+        if item:
             return dict(item)
-    raise ValueError("config has no enabled convergence milestone.")
+    raise ValueError("config has no convergence milestone.")
 
 
 def _split_dev_views(dataset, dataset_cfg: dict, seed: int):

@@ -63,38 +63,11 @@ export interface ModelStats {
   max_degree?: [number, number, number];
 }
 
-export interface TensorStats {
-  count: number;
-  min: number | null;
-  max: number | null;
-  mean: number | null;
-  p95: number | null;
-}
-
 export interface ArtifactsPayload {
   kind: "rd_cvf_artifacts";
   output: string;
   checkpoint: { exists: boolean; path: string | null; size_bytes: number };
   report: { exists: boolean; path: string | null; size_bytes: number };
-  mact: {
-    exists: boolean;
-    path: string;
-    size_bytes: number;
-    error: string | null;
-    representation?: string;
-    summary?: {
-      leaf_count: number;
-      material_clusters: number;
-      template_groups: number;
-      original_coefficient_bytes: number;
-      compressed_payload_bytes: number;
-      compression_ratio: number;
-    };
-    material_centres?: number[];
-    material_histogram?: number[];
-    orientation_histogram?: number[];
-    top_groups?: Array<{ degree: number[]; material_id: number; orientation: number; leaf_count: number; rank: number }>;
-  };
   compact_octree: {
     exists: boolean;
     path: string;
@@ -104,16 +77,6 @@ export interface ArtifactsPayload {
     leaf_count?: number;
     coefficient_count?: number;
     arrays?: Record<string, { shape: number[]; dtype: string; bytes: number }>;
-  };
-  surface: {
-    exists: boolean;
-    path: string;
-    size_bytes: number;
-    error: string | null;
-    threshold?: number;
-    surface_point_count?: number;
-    coefficient_std?: TensorStats;
-    surface_std?: TensorStats;
   };
 }
 

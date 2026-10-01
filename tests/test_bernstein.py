@@ -28,7 +28,6 @@ class BernsteinOctreeTests(unittest.TestCase):
         leaf_ids = model.resolve_leaf_ids(points)
         self.assertEqual(int(model.leaf_levels[leaf_ids[0]]), 2)
         self.assertEqual(int(model.leaf_levels[leaf_ids[1]]), 0)
-        self.assertEqual(tuple(model.decoded_l0().shape), (2, 3, 4))
 
     def test_basis_is_nonnegative_partition_of_unity(self):
         x = torch.linspace(0.0, 1.0, 31)
@@ -165,19 +164,6 @@ class BernsteinOctreeTests(unittest.TestCase):
         sampled = model.integrate_ray_batch(sampled_batch).detach()
         self.assertTrue(torch.allclose(exact, sampled, atol=2e-4, rtol=2e-4))
 
-    def test_sibling_merge_recovers_an_unchanged_split_field(self):
-        model = BernsteinOctree(levels=[1, 2], max_degree=2, attenuation_shift=0.0)
-        model.elevate_degree(0, axis=0)
-        with torch.no_grad():
-            model.coefficient_logits.copy_(model._coefficients_to_logits(torch.tensor([0.1, 0.9])))
-        points = torch.rand((512, 3)) * 1.998 - 0.999
-        before = model.forward_mu(points).detach()
-        change = model.split_leaf(0)
-        child_ids = [model.find_leaf(key) for key in change.new_leaf_keys]
-        model.merge_siblings(child_ids)
-        after = model.forward_mu(points).detach()
-        self.assertTrue(torch.allclose(before, after, atol=1e-5, rtol=1e-5))
-
     def test_checkpoint_rebuilds_packed_topology(self):
         model = BernsteinOctree(levels=[2, 4], max_degree=2, attenuation_shift=0.0)
         model.elevate_degree(0, 1)
@@ -203,22 +189,6 @@ class BernsteinOctreeTests(unittest.TestCase):
         self.assertEqual(int(model.leaf_levels[leaf_ids[0]]), 3)
         self.assertEqual(int(model.leaf_levels[leaf_ids[1]]), 0)
         self.assertEqual(model.stats().l3_active, 8)
-
-    def test_balance_2to1_splits_face_adjacent_coarse_neighbor(self):
-        model = BernsteinOctree(
-            levels=[2, 4, 8],
-            max_degree=1,
-            attenuation_shift=0.0,
-            balance_2to1=True,
-            max_leaf_count=256,
-        )
-        model.split_leaf(model.find_leaf((0, 0, 0, 0)))
-        model.split_leaf(model.find_leaf((1, 1, 0, 0)))
-        self.assertIsNotNone(model.find_leaf((0, 1, 0, 0)))
-        summary = model.balance_2to1()
-        self.assertTrue(summary["complete"])
-        self.assertGreater(summary["split_parents"], 0)
-        self.assertIsNone(model.find_leaf((0, 1, 0, 0)))
 
 
 if __name__ == "__main__":

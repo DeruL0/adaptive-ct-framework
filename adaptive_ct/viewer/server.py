@@ -315,74 +315,6 @@ def _histogram(values: torch.Tensor | np.ndarray | None, *, bins: int | None = N
     return [int(v) for v in torch.bincount(tensor.clamp_min(0), minlength=int(bins))[: int(bins)].tolist()]
 
 
-def _summarize_mact_artifact(path: Path) -> dict[str, Any]:
-    payload = _load_torch_if_exists(path)
-    result: dict[str, Any] = {
-        "exists": path.exists(),
-        "path": path,
-        "size_bytes": path.stat().st_size if path.exists() else 0,
-        "error": None,
-    }
-    if payload is None:
-        return result
-    try:
-        groups = list(payload.get("groups", []))
-        top_groups = []
-        for group in sorted(groups, key=lambda item: int(torch.as_tensor(item.get("leaf_ids", [])).numel()), reverse=True)[:8]:
-            leaf_ids = torch.as_tensor(group.get("leaf_ids", []))
-            basis = torch.as_tensor(group.get("basis", []))
-            top_groups.append(
-                {
-                    "degree": tuple(int(v) for v in group.get("degree", ())),
-                    "material_id": int(group.get("material_id", 0)),
-                    "orientation": int(group.get("orientation", 0)),
-                    "leaf_count": int(leaf_ids.numel()),
-                    "rank": int(basis.shape[0]) if basis.ndim >= 1 else 0,
-                }
-            )
-        material_centres = torch.as_tensor(payload.get("material_centres", []), dtype=torch.float32)
-        result.update(
-            {
-                "representation": payload.get("representation"),
-                "summary": payload.get("summary", {}),
-                "material_centres": [float(v) for v in material_centres.tolist()],
-                "material_histogram": _histogram(payload.get("material_assignments"), bins=int(material_centres.numel())),
-                "orientation_histogram": _histogram(payload.get("orientation_assignments"), bins=3),
-                "top_groups": top_groups,
-            }
-        )
-    except Exception as exc:  # pragma: no cover - diagnostic path for user-provided artifacts.
-        result["error"] = repr(exc)
-    return result
-
-
-def _summarize_surface_artifact(path: Path) -> dict[str, Any]:
-    payload = _load_torch_if_exists(path)
-    result: dict[str, Any] = {
-        "exists": path.exists(),
-        "path": path,
-        "size_bytes": path.stat().st_size if path.exists() else 0,
-        "error": None,
-    }
-    if payload is None:
-        return result
-    try:
-        surface_points = payload.get("surface_points")
-        coefficient_std = payload.get("coefficient_std")
-        surface_std = payload.get("surface_std")
-        result.update(
-            {
-                "threshold": payload.get("threshold"),
-                "surface_point_count": int(torch.as_tensor(surface_points).shape[0]) if surface_points is not None else 0,
-                "coefficient_std": _tensor_stats(coefficient_std),
-                "surface_std": _tensor_stats(surface_std),
-            }
-        )
-    except Exception as exc:  # pragma: no cover - diagnostic path for user-provided artifacts.
-        result["error"] = repr(exc)
-    return result
-
-
 def _summarize_compact_octree_artifact(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {
         "exists": path.exists(),
@@ -450,9 +382,7 @@ def _artifact_payload(output_dir: Path, *, checkpoint_path: Path | None, report_
             "path": report_path,
             "size_bytes": report_path.stat().st_size if report_path is not None and report_path.exists() else 0,
         },
-        "mact": _summarize_mact_artifact(output_dir / "mact.pt"),
         "compact_octree": _summarize_compact_octree_artifact(compact_path),
-        "surface": _summarize_surface_artifact(output_dir / "surface_uncertainty.pt"),
     }
 
 
@@ -633,18 +563,7 @@ def _leaf_corner_values(
     p1_rows = torch.as_tensor(p1_rows_np, dtype=torch.long, device=device)
     p1_leaf_ids = leaf_ids[p1_rows]
     local_rows = model.coefficient_offsets[p1_leaf_ids, None] + torch.arange(8, device=device)[None, :]
-    if bool(getattr(model, "constrained_nodal", False)):
-        constraint_ids = model.coefficient_constraint_ids[local_rows]
-        constraint_weights = model.coefficient_constraint_weights[local_rows]
-        valid = constraint_ids >= 0
-        masters = model.master_coefficients()
-        values = (
-            masters[constraint_ids.clamp_min(0)]
-            * constraint_weights.to(dtype=masters.dtype)
-            * valid.to(dtype=masters.dtype)
-        ).sum(dim=-1)
-    else:
-        values = model.coefficients()[local_rows]
+    values = model.coefficients()[local_rows]
     corners[p1_rows_np] = values.detach().float().cpu().numpy()
     return corners
 

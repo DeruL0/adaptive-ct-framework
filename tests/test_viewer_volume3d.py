@@ -219,60 +219,16 @@ class ViewerVolume3DTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _volume_projection_payload_from_arrays(projection, projection, source="bad", angle_rad=0.0)
 
-    def test_artifact_payload_summarizes_rd_cvf_exports(self):
+    def test_artifact_payload_reports_checkpoint_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkpoint = root / "checkpoint.pt"
             report = root / "training_report.json"
             checkpoint.write_bytes(b"checkpoint")
             report.write_text("{}", encoding="utf-8")
-            torch.save(
-                {
-                    "representation": "mact_bernstein_templates",
-                    "material_centres": torch.tensor([0.1, 0.3]),
-                    "material_assignments": torch.tensor([0, 1, 1]),
-                    "orientation_assignments": torch.tensor([0, 2, 2]),
-                    "groups": [
-                        {
-                            "degree": (0, 0, 0),
-                            "material_id": 1,
-                            "orientation": 2,
-                            "leaf_ids": torch.tensor([1, 2]),
-                            "mean": torch.zeros(1),
-                            "basis": torch.empty((0, 1)),
-                            "weights": torch.empty((2, 0)),
-                        }
-                    ],
-                    "summary": {
-                        "leaf_count": 3,
-                        "material_clusters": 2,
-                        "template_groups": 1,
-                        "original_coefficient_bytes": 12,
-                        "compressed_payload_bytes": 24,
-                        "compression_ratio": 0.5,
-                    },
-                },
-                root / "mact.pt",
-            )
-            torch.save(
-                {
-                    "threshold": 0.2,
-                    "surface_points": torch.zeros((4, 3)),
-                    "coefficient_std": torch.tensor([1.0, 2.0, 3.0]),
-                    "surface_std": torch.tensor([0.5, 1.5]),
-                },
-                root / "surface_uncertainty.pt",
-            )
-
             payload = _artifact_payload(root, checkpoint_path=checkpoint, report_path=report)
-            self.assertEqual(payload["kind"], "rd_cvf_artifacts")
             self.assertTrue(payload["checkpoint"]["exists"])
             self.assertTrue(payload["report"]["exists"])
-            self.assertEqual(payload["mact"]["material_histogram"], [1, 2])
-            self.assertEqual(payload["mact"]["orientation_histogram"], [1, 0, 2])
-            self.assertEqual(payload["mact"]["top_groups"][0]["leaf_count"], 2)
-            self.assertEqual(payload["surface"]["surface_point_count"], 4)
-            self.assertEqual(payload["surface"]["coefficient_std"]["count"], 3)
 
 
 if __name__ == "__main__":

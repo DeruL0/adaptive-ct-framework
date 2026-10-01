@@ -25,7 +25,6 @@ class LatentP1Octree(BernsteinOctree):
         cuda_integrator: bool = True,
         integration_mode: str = "exact",
         topology: str = "packed_hierarchy",
-        balance_2to1: bool = False,
         max_leaf_count: int | None = None,
     ):
         super().__init__(
@@ -36,7 +35,6 @@ class LatentP1Octree(BernsteinOctree):
             cuda_integrator=cuda_integrator,
             integration_mode=integration_mode,
             topology=topology,
-            balance_2to1=balance_2to1,
             max_leaf_count=max_leaf_count,
         )
         self.latent_dim = int(latent_dim)
@@ -62,98 +60,6 @@ class LatentP1Octree(BernsteinOctree):
     def coefficients(self) -> torch.Tensor:
         return F.softplus(self.local_coefficient_logits() + self.attenuation_shift)
 
-    def master_coefficients(self) -> torch.Tensor:
-        return self.coefficients()
-
-    @torch.no_grad()
-    def initialize_constant_mu(self, value: float) -> None:
-        target = torch.full((self.leaf_latents.shape[0], 8), float(value), device=self.leaf_latents.device)
-        target_logits = self._coefficients_to_logits(target).mean(dim=0)
-        current_logits = self.decoder(self.leaf_latents).mean(dim=0)
-        self.decoder.bias.add_(target_logits - current_logits)
-
-    @torch.no_grad()
-    def _child_latents_from_parent(self, leaf_ids: torch.Tensor) -> torch.Tensor:
-        """Approximate each parent P1 field on its eight child cells."""
-        parent_coefficients = self.coefficients().reshape(-1, 8)[leaf_ids].reshape(-1, 2, 2, 2)
-        child_offsets = _all_coords(2, device=self.leaf_latents.device).to(dtype=parent_coefficients.dtype)
-        child_corners = child_offsets
-        parent_local = (child_offsets[:, None, :] + child_corners[None, :, :]) * 0.5
-        basis_x = torch.stack((1.0 - parent_local[..., 0], parent_local[..., 0]), dim=-1)
-        basis_y = torch.stack((1.0 - parent_local[..., 1], parent_local[..., 1]), dim=-1)
-        basis_z = torch.stack((1.0 - parent_local[..., 2], parent_local[..., 2]), dim=-1)
-        target_coefficients = torch.einsum(
-            "cpi,cpj,cpk,nijk->ncp",
-            basis_x,
-            basis_y,
-            basis_z,
-            parent_coefficients,
-        ).reshape(-1, 8)
-        target_logits = self._coefficients_to_logits(target_coefficients)
-        decoder_pinv = torch.linalg.pinv(self.decoder.weight)
-        return (target_logits - self.decoder.bias) @ decoder_pinv.T
-
-    @torch.no_grad()
-    def split_leaves_batch(self, leaf_ids: torch.Tensor | Sequence[int]) -> TopologyChange:
-        leaf_ids_tensor = torch.unique(
-            torch.as_tensor(leaf_ids, dtype=torch.long, device=self.leaf_latents.device),
-            sorted=True,
-        )
-        leaf_ids_tensor = leaf_ids_tensor[(leaf_ids_tensor >= 0) & (leaf_ids_tensor < self.leaf_levels.shape[0])]
-        if self.max_leaf_count is not None:
-            available = max(0, (int(self.max_leaf_count) - int(self.leaf_levels.shape[0])) // 7)
-            leaf_ids_tensor = leaf_ids_tensor[:available]
-        old_count = int(self.stats().parameter_count)
-        if leaf_ids_tensor.numel() == 0:
-            return TopologyChange("h_split_batch", tuple(), tuple(), old_count, old_count)
-        levels = self.leaf_levels[leaf_ids_tensor]
-        if torch.any(levels + 1 >= len(self.level_shapes)):
-            raise ValueError("At least one selected leaf is already at maximum octree depth.")
-
-        old_keys = [self.leaf_key(int(leaf_id)) for leaf_id in leaf_ids_tensor.tolist()]
-        offsets = _all_coords(2, device=self.leaf_latents.device)
-        new_coords = (self.leaf_coords[leaf_ids_tensor][:, None, :] * 2 + offsets[None, :, :]).reshape(-1, 3)
-        new_levels = (levels[:, None] + 1).expand(-1, 8).reshape(-1)
-        new_latents = self._child_latents_from_parent(leaf_ids_tensor)
-
-        keep = torch.ones(self.leaf_levels.shape[0], dtype=torch.bool, device=self.leaf_latents.device)
-        keep[leaf_ids_tensor] = False
-        self.leaf_levels = torch.cat([self.leaf_levels[keep], new_levels], dim=0).contiguous()
-        self.leaf_coords = torch.cat([self.leaf_coords[keep], new_coords], dim=0).contiguous()
-        self.leaf_latents = nn.Parameter(torch.cat([self.leaf_latents.detach()[keep], new_latents], dim=0).contiguous())
-        self._set_all_p1_metadata(int(self.leaf_levels.numel()), self.leaf_latents.device)
-        self._rebuild_packed_topology()
-        new_keys = [self.leaf_key(index) for index in range(int(self.leaf_levels.numel()) - int(new_levels.numel()), int(self.leaf_levels.numel()))]
-        return TopologyChange("h_split_batch", tuple(old_keys), tuple(new_keys), old_count, int(self.stats().parameter_count))
-
-    @torch.no_grad()
-    def split_leaf(self, leaf_id: int) -> TopologyChange:
-        return self.split_leaves_batch([int(leaf_id)])
-
-    @torch.no_grad()
-    def merge_siblings(self, child_ids: Sequence[int]) -> TopologyChange:
-        ids = torch.unique(torch.as_tensor(list(child_ids), dtype=torch.long, device=self.leaf_latents.device), sorted=True)
-        if ids.numel() != 8:
-            raise ValueError("An octree merge requires exactly eight sibling leaves.")
-        levels = self.leaf_levels[ids]
-        if torch.any(levels != levels[0]) or int(levels[0].item()) <= 0:
-            raise ValueError("Merge candidates must share one non-root level.")
-        parent_coords = torch.div(self.leaf_coords[ids], 2, rounding_mode="floor")
-        if torch.unique(parent_coords, dim=0).shape[0] != 1:
-            raise ValueError("Merge candidates are not siblings.")
-
-        old_count = int(self.stats().parameter_count)
-        old_keys = [self.leaf_key(int(leaf_id)) for leaf_id in ids.tolist()]
-        keep = torch.ones(self.leaf_levels.shape[0], dtype=torch.bool, device=self.leaf_latents.device)
-        keep[ids] = False
-        self.leaf_levels = torch.cat([self.leaf_levels[keep], (levels[0] - 1).reshape(1)], dim=0).contiguous()
-        self.leaf_coords = torch.cat([self.leaf_coords[keep], parent_coords[:1]], dim=0).contiguous()
-        self.leaf_latents = nn.Parameter(
-            torch.cat([self.leaf_latents.detach()[keep], self.leaf_latents.detach()[ids].mean(dim=0, keepdim=True)], dim=0).contiguous()
-        )
-        self._set_all_p1_metadata(int(self.leaf_levels.numel()), self.leaf_latents.device)
-        self._rebuild_packed_topology()
-        return TopologyChange("h_merge", tuple(old_keys), (self.leaf_key(int(self.leaf_levels.numel()) - 1),), old_count, int(self.stats().parameter_count))
 
     @classmethod
     def from_bernstein(cls, model: BernsteinOctree, latent_dim: int = 4) -> "LatentP1Octree":
@@ -166,8 +72,6 @@ class LatentP1Octree(BernsteinOctree):
         latent_dim = int(latent_dim)
         if not 1 <= latent_dim <= 8:
             raise ValueError("latent_dim must be in [1, 8].")
-        if model.constrained_nodal:
-            raise ValueError("Constrained nodal models are not supported.")
         leaf_count = int(model.leaf_levels.shape[0])
         device = model.leaf_levels.device
         if not bool(torch.all(model.leaf_degrees == 1)):
@@ -188,7 +92,6 @@ class LatentP1Octree(BernsteinOctree):
             cuda_integrator=bool(model.cuda_integrator),
             integration_mode=str(model.integration_mode),
             topology="packed_hierarchy",
-            balance_2to1=False,
             max_leaf_count=model.max_leaf_count,
         ).to(device=device)
         state = {
