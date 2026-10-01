@@ -36,7 +36,6 @@ training:
   iterations: 60000
   batch_rays: 65536
   lr: 0.015
-  tv_weight: 0.0
   log_every: 200
   eval_every: 10000
   eval_test_views: 4
@@ -53,15 +52,6 @@ training:
     air_quantile: 0.10
     min_variance: 1.0e-8
 
-  coefficient_continuity:
-    weight: 0.0
-
-  projection_gradient_loss:
-    weight: 0.0
-
-  volume_loss:
-    weight: 0.0
-
   fixed_decision_rays:
     enabled: true
     use_for_plateau: true
@@ -71,7 +61,6 @@ training:
     chunk_rays: 65536
 
   progressive:
-    milestones: {}
     convergence_milestones:
       - enabled: true
         operation: dorfler_h_split
@@ -103,9 +92,6 @@ training:
           latent_dim: 4
           quantization: float16
 
-  adaptive:
-    enabled: false
-
 metrics:
   compute_projection_metrics: true
   compute_volume_metrics: false
@@ -123,10 +109,6 @@ export:
     artifact_name: ANVO.npz
     quantization: float16
     topology: packed_hierarchy
-  mact:
-    enabled: false
-  surface:
-    enabled: false
 
 output:
   dir: output\stage7_dorfler_p1_256v

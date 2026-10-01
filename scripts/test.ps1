@@ -1,3 +1,2 @@
 $ErrorActionPreference = "Stop"
-& 'D:\Projects\3.3DGS\SAD-GS\.venv\Scripts\python.exe' -m unittest discover -s tests
-
+py -3.10 -m unittest discover -s tests

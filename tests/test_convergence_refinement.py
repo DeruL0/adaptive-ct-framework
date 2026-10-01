@@ -1,6 +1,6 @@
 import unittest
 
-from adaptive_ct.train import _convergence_window_summary, _dynamic_refinement_status
+from adaptive_ct.train import _convergence_window_summary
 
 
 class ConvergenceRefinementTests(unittest.TestCase):
@@ -30,35 +30,6 @@ class ConvergenceRefinementTests(unittest.TestCase):
         )
         self.assertFalse(summary["ready"])
         self.assertIsNone(summary["relative_improvement"])
-
-    def test_dynamic_refinement_stops_after_low_acceptance(self):
-        running = _dynamic_refinement_status(
-            tested=100,
-            accepted_gains=[2.0] * 20,
-            round_index=3,
-            min_rounds=4,
-            max_rounds=24,
-            stop_acceptance_ratio=0.03,
-            current_bytes=1024,
-            byte_budget=8192,
-            min_added_bytes=128,
-        )
-        stopped = _dynamic_refinement_status(
-            tested=100,
-            accepted_gains=[2.0, 4.0],
-            round_index=4,
-            min_rounds=4,
-            max_rounds=24,
-            stop_acceptance_ratio=0.03,
-            current_bytes=1024,
-            byte_budget=8192,
-            min_added_bytes=128,
-        )
-
-        self.assertFalse(running["stop"])
-        self.assertTrue(stopped["stop"])
-        self.assertAlmostEqual(stopped["acceptance_ratio"], 0.02)
-        self.assertAlmostEqual(stopped["mean_accepted_validation_gain"], 3.0)
 
 
 if __name__ == "__main__":

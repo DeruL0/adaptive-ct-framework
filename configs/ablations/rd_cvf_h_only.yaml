@@ -1,9 +1,0 @@
-extends: ..\figure473_48v.yaml
-
-training:
-  adaptive:
-    allow_p: false
-    allow_h: true
-
-output:
-  dir: output\ablations\rd_cvf_h_only

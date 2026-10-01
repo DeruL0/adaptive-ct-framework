@@ -1,9 +1,0 @@
-extends: ..\figure473_48v.yaml
-
-training:
-  adaptive:
-    selection_mode: fixed_gain
-    fixed_gain_threshold: 1.0e-6
-
-output:
-  dir: output\ablations\rd_cvf_fixed_gain

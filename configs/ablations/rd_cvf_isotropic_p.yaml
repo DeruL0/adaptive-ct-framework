@@ -1,8 +1,0 @@
-extends: ..\figure473_48v.yaml
-
-training:
-  adaptive:
-    isotropic_p: true
-
-output:
-  dir: output\ablations\rd_cvf_isotropic_p

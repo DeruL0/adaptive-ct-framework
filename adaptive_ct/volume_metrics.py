@@ -6,7 +6,36 @@ import torch
 
 from .backend import project_dense_parallel
 from .metrics import mae, projection_metrics, psnr
-from .refinement import decoded_volume, gradient_magnitude
+
+
+@torch.no_grad()
+def decoded_volume(model, resolution: int | tuple[int, int, int], *, chunk: int = 65536) -> torch.Tensor:
+    if hasattr(model, "decoded_at_resolution"):
+        return model.decoded_at_resolution(resolution, chunk=chunk).detach()
+    if isinstance(resolution, int):
+        shape = (int(resolution), int(resolution), int(resolution))
+    else:
+        shape = tuple(int(v) for v in resolution)
+    device = next(model.parameters()).device
+    axes = [torch.arange(n, dtype=torch.float32, device=device) for n in shape]
+    xx, yy, zz = torch.meshgrid(*axes, indexing="ij")
+    coords = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
+    scale = torch.tensor(shape, dtype=torch.float32, device=device)
+    points = -1.0 + (coords + 0.5) * 2.0 / scale
+    values = []
+    for start in range(0, points.shape[0], int(chunk)):
+        values.append(model.forward_mu(points[start : start + int(chunk)]).detach())
+    return torch.cat(values, dim=0).reshape(shape)
+
+
+def gradient_magnitude(volume: torch.Tensor) -> torch.Tensor:
+    gx = torch.zeros_like(volume)
+    gy = torch.zeros_like(volume)
+    gz = torch.zeros_like(volume)
+    gx[1:-1, :, :] = 0.5 * (volume[2:, :, :] - volume[:-2, :, :])
+    gy[:, 1:-1, :] = 0.5 * (volume[:, 2:, :] - volume[:, :-2, :])
+    gz[:, :, 1:-1] = 0.5 * (volume[:, :, 2:] - volume[:, :, :-2])
+    return torch.sqrt(gx * gx + gy * gy + gz * gz)
 
 
 @torch.no_grad()

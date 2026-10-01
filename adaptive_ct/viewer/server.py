@@ -1716,7 +1716,7 @@ def serve(*, config: Path, checkpoint: Path | None, host: str, port: int, open_b
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Serve the adaptive CT local viewer.")
-    parser.add_argument("--config", default="configs/figure473_48v.yaml")
+    parser.add_argument("--config", default="configs/research/stage7_dorfler_p1_256v.yaml")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)

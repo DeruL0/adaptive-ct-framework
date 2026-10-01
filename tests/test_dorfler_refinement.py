@@ -17,7 +17,20 @@ from adaptive_ct.dorfler_refinement import (
 )
 from adaptive_ct.geometry import detector_grid, make_parallel_ray_points
 from adaptive_ct.latent_p1 import LatentP1Octree
-from adaptive_ct.train import _clone_sparse_state, _compact_raw_payload_bytes, _restore_sparse_state
+from adaptive_ct.train import _clone_sparse_state, _restore_sparse_state
+
+
+def _compact_raw_payload_bytes(model, quantization: str = "float16") -> int:
+    """Reference byte count of the compact packed-hierarchy export (no metadata)."""
+    bytes_per_float = 4 if quantization == "float32" else 2
+    total = int(model.node_child_base.numel()) * 8
+    total += int(model.leaf_levels.shape[0]) * 3 + 4 + len(model.level_shapes) * 6 + 3 + 4
+    if hasattr(model, "leaf_latents"):
+        total += int(model.leaf_latents.numel() + model.decoder.weight.numel() + model.decoder.bias.numel()) * bytes_per_float
+    else:
+        total += int(model.coefficients().numel()) * bytes_per_float
+    return total
+
 
 DETECTOR = 8
 WEIGHT = {"mode": "uniform"}

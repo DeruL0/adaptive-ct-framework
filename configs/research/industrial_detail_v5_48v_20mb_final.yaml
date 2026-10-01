@@ -1,4 +1,0 @@
-extends: industrial_detail_v5_48v_h_reference.yaml
-
-output:
-  dir: output\industrial_detail_v5_48v_20mb\final

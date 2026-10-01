@@ -22,11 +22,9 @@ from adaptive_ct.viewer.server import (
 
 
 class ViewerVolume3DTests(unittest.TestCase):
-    def test_leaf_structure_payload_reports_dynamic_voxel_sizes(self):
-        model = build_model({"model": {"representation": "dynamic_leaf_voxel", "levels": [2, 4, 8], "init_std": 0.0}})
-        score = torch.zeros((4, 4, 4), dtype=torch.float32)
-        score[0, 0, 0] = 1.0
-        model.activate_level_from_score(1, score, active_fraction=1.0 / score.numel(), halo=0)
+    def test_leaf_structure_payload_reports_leaf_sizes(self):
+        model = build_model({"model": {"representation": "bernstein_octree", "max_degree": 0, "levels": [2, 4, 8], "init_std": 0.0, "cuda_integrator": False}})
+        model.split_leaves_batch(torch.tensor([0]))
         payload = _leaf_structure_payload(model)
         self.assertEqual(payload["leaf_cells"], 15)
         self.assertEqual([level["count"] for level in payload["levels"]], [7, 8, 0])
@@ -35,10 +33,8 @@ class ViewerVolume3DTests(unittest.TestCase):
         self.assertEqual(payload["size_range"], {"min": 0.5, "max": 1.0})
 
     def test_leaf_geometry_payload_exports_boxes_with_sizes(self):
-        model = build_model({"model": {"representation": "dynamic_leaf_voxel", "levels": [2, 4, 8], "init_std": 0.0}})
-        score = torch.zeros((4, 4, 4), dtype=torch.float32)
-        score[0, 0, 0] = 1.0
-        model.activate_level_from_score(1, score, active_fraction=1.0 / score.numel(), halo=0)
+        model = build_model({"model": {"representation": "bernstein_octree", "max_degree": 0, "levels": [2, 4, 8], "init_std": 0.0, "cuda_integrator": False}})
+        model.split_leaves_batch(torch.tensor([0]))
         payload = _leaf_geometry_payload(model)
         self.assertEqual(payload["kind"], "leaves")
         self.assertEqual(payload["total"], 15)
@@ -61,7 +57,7 @@ class ViewerVolume3DTests(unittest.TestCase):
         self.assertTrue(np.all(np.abs(positions) <= 1.0 + 1e-5))
 
     def test_leaf_geometry_payload_respects_budget(self):
-        model = build_model({"model": {"representation": "dynamic_leaf_voxel", "levels": [4], "init_std": 0.0}})
+        model = build_model({"model": {"representation": "bernstein_octree", "max_degree": 0, "levels": [4], "init_std": 0.0, "cuda_integrator": False}})
         payload = _leaf_geometry_payload(model, max_leaves=10)
         self.assertEqual(payload["total"], 64)
         self.assertEqual(payload["count"], 10)
@@ -69,7 +65,7 @@ class ViewerVolume3DTests(unittest.TestCase):
         self.assertEqual(positions.size, 30)
 
     def test_leaf_geometry_binary_is_compact_and_decodable(self):
-        model = build_model({"model": {"representation": "dynamic_leaf_voxel", "levels": [4], "init_std": 0.0}})
+        model = build_model({"model": {"representation": "bernstein_octree", "max_degree": 0, "levels": [4], "init_std": 0.0, "cuda_integrator": False}})
         encoded = _leaf_geometry_binary(model)
         self.assertEqual(encoded[:8], b"ACTLEAF1")
         header_size = struct.unpack("<I", encoded[8:12])[0]

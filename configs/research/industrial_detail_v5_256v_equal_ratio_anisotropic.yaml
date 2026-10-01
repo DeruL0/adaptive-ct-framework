@@ -1,8 +1,0 @@
-extends: industrial_detail_v5_96v_equal_ratio_anisotropic.yaml
-
-# Controlled view-count ablation: only the projection dataset changes.
-dataset:
-  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_256v_science
-
-output:
-  dir: output\industrial_detail_v5_256v_equal_ratio_anisotropic

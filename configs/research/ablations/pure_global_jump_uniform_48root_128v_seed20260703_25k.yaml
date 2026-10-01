@@ -1,9 +1,0 @@
-# Reproducibility replicate of the canonical no-trick configuration.
-# Only the random seed and output path differ.
-extends: ../figure473_128v_pure_adaptive.yaml
-
-training:
-  seed: 20260703
-
-output:
-  dir: output\research_figure473_pure_global_jump_uniform_48root_128v_seed20260703_25k

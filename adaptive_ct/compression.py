@@ -8,17 +8,6 @@ import numpy as np
 import torch
 
 from .bernstein import unique_degree_rows
-from .projection_domain import coefficient_diagnostics
-
-
-@dataclass(frozen=True)
-class MACTSummary:
-    leaf_count: int
-    material_clusters: int
-    template_groups: int
-    original_coefficient_bytes: int
-    compressed_payload_bytes: int
-    compression_ratio: float
 
 
 @dataclass(frozen=True)
@@ -31,118 +20,6 @@ class CompactOctreeSummary:
     checkpoint_bytes: int | None
     model_bytes: int
     file_ratio_vs_model_bytes: float
-
-
-def _kmeans_1d(values: torch.Tensor, cluster_count: int, iterations: int = 25) -> tuple[torch.Tensor, torch.Tensor]:
-    cluster_count = max(1, min(int(cluster_count), int(values.numel())))
-    if cluster_count == 1:
-        return torch.zeros_like(values, dtype=torch.long), values.mean()[None]
-    quantiles = torch.linspace(0.0, 1.0, cluster_count, device=values.device)
-    centres = torch.quantile(values, quantiles).clone()
-    assignments = torch.zeros_like(values, dtype=torch.long)
-    for _ in range(int(iterations)):
-        assignments = torch.argmin(torch.abs(values[:, None] - centres[None, :]), dim=1)
-        updated = centres.clone()
-        for cluster_id in range(cluster_count):
-            selected = values[assignments == cluster_id]
-            if selected.numel() > 0:
-                updated[cluster_id] = selected.mean()
-        if torch.allclose(updated, centres):
-            break
-        centres = updated
-    return assignments, centres
-
-
-@torch.no_grad()
-def build_mact_artifact(
-    model,
-    *,
-    material_clusters: int = 4,
-    variance_retained: float = 0.99,
-    max_rank: int | None = None,
-) -> tuple[dict, MACTSummary]:
-    """Build coefficient-only material/orientation templates and PCA weights."""
-    diagnostics = coefficient_diagnostics(model)
-    coefficients = model.coefficients().detach()
-    dc = coefficients[model.coefficient_offsets[:-1]]
-    materials, material_centres = _kmeans_1d(dc, material_clusters)
-    orientations = diagnostics.principal_axis
-    groups = []
-    compressed_bytes = int(material_centres.numel() * material_centres.element_size())
-
-    unique_degrees = unique_degree_rows(model.leaf_degrees)
-    for degree_tensor in unique_degrees:
-        degree = tuple(int(value) for value in degree_tensor.tolist())
-        degree_mask = torch.all(model.leaf_degrees == degree_tensor, dim=1)
-        coefficient_count = 1
-        for value in degree:
-            coefficient_count *= value + 1
-        for material_id in range(int(material_centres.numel())):
-            for orientation in range(3):
-                mask = degree_mask & (materials == material_id) & (orientations == orientation)
-                leaf_ids = torch.nonzero(mask, as_tuple=False).reshape(-1)
-                if leaf_ids.numel() == 0:
-                    continue
-                local_ids = torch.arange(coefficient_count, device=coefficients.device)
-                coefficient_ids = model.coefficient_offsets[leaf_ids, None] + local_ids[None, :]
-                matrix = coefficients[coefficient_ids]
-                mean = matrix.mean(dim=0)
-                centred = matrix - mean
-                if matrix.shape[0] <= 1 or coefficient_count <= 1:
-                    basis = matrix.new_empty((0, coefficient_count))
-                    weights = matrix.new_empty((matrix.shape[0], 0))
-                else:
-                    _, singular_values, vh = torch.linalg.svd(centred, full_matrices=False)
-                    energy = torch.square(singular_values)
-                    if float(energy.sum().item()) <= 0.0:
-                        rank = 0
-                    else:
-                        cumulative = torch.cumsum(energy, dim=0) / energy.sum()
-                        rank = int(torch.searchsorted(cumulative, torch.tensor(float(variance_retained), device=cumulative.device)).item()) + 1
-                    if max_rank is not None:
-                        rank = min(rank, int(max_rank))
-                    rank = min(rank, int(vh.shape[0]))
-                    basis = vh[:rank]
-                    weights = centred @ basis.T
-                group = {
-                    "degree": degree,
-                    "material_id": material_id,
-                    "orientation": orientation,
-                    "leaf_ids": leaf_ids.detach().cpu(),
-                    "mean": mean.detach().cpu(),
-                    "basis": basis.detach().cpu(),
-                    "weights": weights.detach().cpu(),
-                }
-                groups.append(group)
-                compressed_bytes += sum(
-                    int(tensor.numel() * tensor.element_size())
-                    for tensor in (group["leaf_ids"], group["mean"], group["basis"], group["weights"])
-                )
-
-    original_bytes = int(coefficients.numel() * coefficients.element_size())
-    summary = MACTSummary(
-        leaf_count=int(model.leaf_levels.shape[0]),
-        material_clusters=int(material_centres.numel()),
-        template_groups=len(groups),
-        original_coefficient_bytes=original_bytes,
-        compressed_payload_bytes=compressed_bytes,
-        compression_ratio=float(original_bytes / max(compressed_bytes, 1)),
-    )
-    artifact = {
-        "representation": "mact_bernstein_templates",
-        "material_centres": material_centres.detach().cpu(),
-        "material_assignments": materials.detach().cpu(),
-        "orientation_assignments": orientations.detach().cpu(),
-        "groups": groups,
-        "summary": summary.__dict__,
-    }
-    return artifact, summary
-
-
-def export_mact_artifact(model, path: str | Path, **kwargs) -> MACTSummary:
-    artifact, summary = build_mact_artifact(model, **kwargs)
-    torch.save(artifact, Path(path))
-    return summary
 
 
 def _shape3_np(value) -> tuple[int, int, int]:

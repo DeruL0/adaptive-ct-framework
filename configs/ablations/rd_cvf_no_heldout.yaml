@@ -1,8 +1,0 @@
-extends: ..\figure473_48v.yaml
-
-training:
-  adaptive:
-    held_out_validation: false
-
-output:
-  dir: output\ablations\rd_cvf_no_heldout
