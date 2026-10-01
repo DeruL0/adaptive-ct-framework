@@ -31,19 +31,18 @@ diagram, module responsibilities, and the training protocol.
 
 ```text
 adaptive_ct/
-  train.py              Entry point: training loop, evaluation, export, report
-  dorfler_refinement.py Estimator, marking, byte model, rollback controller, codec
-  bernstein.py          Packed Bernstein octree and exact ray integration
-  latent_p1.py          Latent-P1 octree (PCA codec model)
-  compression.py        Compact packed export and loading
-  decision_rays.py      Fixed ray sets (plateau ruler, rollback verdict)
-  projection_domain.py  Projection weights, weighted loss, view split
-  geometry.py data.py config.py model.py render.py metrics.py volume_metrics.py backend.py
-  viewer/               Python server and Three.js frontend
-native/                 CUDA extension sources
-configs/research/       stage7_dorfler_* configurations
-docs/architecture.md    Code framework
-tests/                  Unit and end-to-end tests
+  core/            config, ray geometry, loss, native CUDA backend (projector)
+  data/            dataset, train/dev view split, fixed ray sets
+  representation/  Bernstein octree, latent-P1 octree, model factory, state snapshot
+  codec/           byte model, fp16 quantization, fine-tuning, compact artifact
+  refinement/      residual estimator, Dörfler marking, refinement controller
+  evaluation/      metrics, rendering, ground-truth volume evaluation
+  training/        training loop, plateau detection, export, config checks
+  viewer/          Python server and Three.js frontend
+native/            CUDA extension sources
+configs/stage7/    p1, p0, p0_longft, p1_nogate configurations
+docs/              architecture.md
+tests/             mirrors adaptive_ct/ (core, data, representation, codec, refinement, training, viewer)
 ```
 
 ## Requirements
@@ -124,16 +123,16 @@ An optional `proj_val` list may define a validation split. Update
 ## Training
 
 ```powershell
-py -3.10 -m adaptive_ct.train --config configsesearch\stage7_dorfler_p1_256v.yaml
+py -3.10 -m adaptive_ct.training --config configs\stage7\p1.yaml
 ```
 
-Controls: `stage7_dorfler_p0_256v.yaml` (P0 leaves), `stage7_dorfler_p0_longft_256v.yaml`
-(compute-matched P0), `stage7_dorfler_p1_nogate_256v.yaml` (no rollback).
-Edit `dataset.root` and `output.dir` first. A run writes `checkpoint.pt`
-(trained octree), `checkpoint_codec.pt` (deployed codec model), `ANVO.npz`
-(compact export), `training_report.json`, and slice previews.
+Controls: `p0.yaml` (P0 leaves), `p0_longft.yaml` (compute-matched P0),
+`p1_nogate.yaml` (no rollback). Edit `dataset.root` and `output.dir` first. A run
+writes `checkpoint.pt` (trained octree), `checkpoint_codec.pt` (deployed codec
+model), `ANVO.npz` (compact export), `training_report.json`, and slice previews.
 
-Run the tests with `py -3.10 -m unittest discover -s tests`.
+Run the tests with `scripts	est.ps1` or
+`py -3.10 -m unittest discover -s tests -t .`.
 
 ## Viewer
 
@@ -150,8 +149,8 @@ Start the viewer:
 
 ```powershell
 python -m adaptive_ct.viewer `
-  --config configs\figure473_48v.yaml `
-  --checkpoint output\figure473_48v\checkpoint.pt `
+  --config configs\stage7\p1.yaml `
+  --checkpoint output\stage7_dorfler_p1_256v\checkpoint.pt `
   --host 127.0.0.1 `
   --port 8765 `
   --open
@@ -165,7 +164,7 @@ For frontend development:
 
 ```powershell
 # Terminal 1
-python -m adaptive_ct.viewer --config configs\figure473_48v.yaml
+python -m adaptive_ct.viewer --config configs\stage7\p1.yaml
 
 # Terminal 2
 cd adaptive_ct\viewer\web

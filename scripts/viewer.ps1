@@ -1,5 +1,5 @@
 param(
-    [string]$Config = "configs\figure473_48v.yaml",
+    [string]$Config = "configs\stage7\p1.yaml",
     [string]$Checkpoint = "",
     [string]$HostName = "127.0.0.1",
     [int]$Port = 8765,
@@ -7,8 +7,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Python = "D:\Projects\3.3DGS\SAD-GS\.venv\Scripts\python.exe"
-$ArgsList = @("-m", "adaptive_ct.viewer", "--config", $Config, "--host", $HostName, "--port", "$Port")
+$Python = "py"
+$ArgsList = @("-3.10", "-m", "adaptive_ct.viewer", "--config", $Config, "--host", $HostName, "--port", "$Port")
 if ($Checkpoint -ne "") {
     $ArgsList += @("--checkpoint", $Checkpoint)
 }

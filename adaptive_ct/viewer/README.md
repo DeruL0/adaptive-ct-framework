@@ -28,8 +28,8 @@ npm.cmd run build
 cd ..\..\..
 
 python -m adaptive_ct.viewer `
-  --config configs\figure473_48v.yaml `
-  --checkpoint output\figure473_48v\checkpoint.pt `
+  --config configs\stage7\p1.yaml `
+  --checkpoint output\stage7_dorfler_p1_256v\checkpoint.pt `
   --open
 ```
 
@@ -63,7 +63,7 @@ compare against.
 ```powershell
 # Terminal 1: backend and /api on port 8765
 python -m adaptive_ct.viewer `
-  --config configs\figure473_48v.yaml `
+  --config configs\stage7\p1.yaml `
   --host 127.0.0.1 `
   --port 8765
 

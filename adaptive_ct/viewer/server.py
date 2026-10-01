@@ -23,13 +23,13 @@ import numpy as np
 import torch
 from PIL import Image
 
-from adaptive_ct.backend import project_dense_parallel
-from adaptive_ct.compression import load_compact_octree_state_dict
-from adaptive_ct.config import load_config
-from adaptive_ct.data import ProjectionSplit, load_r2_dataset
-from adaptive_ct.metrics import mae, projection_metrics, psnr
-from adaptive_ct.model import build_model
-from adaptive_ct.render import render_split
+from adaptive_ct.core.projector import project_dense_parallel
+from adaptive_ct.codec.artifact import load_compact_octree_state_dict
+from adaptive_ct.core.config import load_config
+from adaptive_ct.data.dataset import ProjectionSplit, load_r2_dataset
+from adaptive_ct.evaluation.metrics import mae, projection_metrics, psnr
+from adaptive_ct.representation.factory import build_model
+from adaptive_ct.evaluation.render import render_split
 
 
 def _resolve_default_checkpoint(config: dict[str, Any]) -> Path:
@@ -1635,7 +1635,7 @@ def serve(*, config: Path, checkpoint: Path | None, host: str, port: int, open_b
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Serve the adaptive CT local viewer.")
-    parser.add_argument("--config", default="configs/research/stage7_dorfler_p1_256v.yaml")
+    parser.add_argument("--config", default="configs/stage7/p1.yaml")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
