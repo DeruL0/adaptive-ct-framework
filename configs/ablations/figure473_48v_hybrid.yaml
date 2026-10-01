@@ -1,0 +1,47 @@
+device: cuda
+
+dataset:
+  root: D:\Projects\3.3DGS\SAD-GS\data\external_baselines\r2_local\figure473_ctgs96_48v
+
+geometry:
+  samples_per_ray: 96
+
+model:
+  representation: dynamic_leaf_voxel
+  levels: [24, 48, 96]
+  init_std: 0.001
+  attenuation_shift: -3.0
+
+training:
+  iterations: 1200
+  batch_rays: 8192
+  lr: 0.015
+  tv_weight: 0.00001
+  log_every: 100
+  eval_every: 300
+  eval_test_views: 3
+  eval_ray_chunk: 4096
+  progressive:
+    refinement:
+      strategy: hybrid
+      halo: 1
+      residual_split: train
+      residual_views: 12
+      alpha: 1.0
+      beta: 1.0
+      gamma: 0.25
+    milestones:
+      250:
+        level: 1
+        active_fraction: 0.10
+        strategy: gradient
+      650:
+        level: 2
+        active_fraction: 0.03
+        strategy: hybrid
+
+metrics:
+  material_threshold: 0.10
+
+output:
+  dir: output\figure473_48v_hybrid

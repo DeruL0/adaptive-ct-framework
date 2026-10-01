@@ -1,0 +1,47 @@
+# Root-cause ablation A: change only the early weighting and L1/L2 trigger.
+# No support mask, Haar gain score, coarsening, or new regularizer is enabled.
+extends: figure473_dicom_orig_accuracy_wpl3_blend50_l3_10_128v.yaml
+
+training:
+  projection_weighting_schedule:
+    1:
+      mode: uniform
+      epsilon: 1.0e-4
+      min_weight: null
+      max_weight: null
+
+  progressive:
+    milestones:
+      80:
+        enabled: false
+      180:
+        enabled: false
+
+    convergence_milestones:
+      - level: 1
+        operation: h_split
+        strategy: coefficient
+        active_fraction: 0.03
+        halo: 0
+        min_iteration: 1500
+        max_iteration: 3000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+      - level: 2
+        operation: h_split
+        strategy: coefficient
+        active_fraction: 0.35
+        halo: 0
+        min_iteration: 3000
+        min_iterations_after_previous: 1000
+        max_iteration: 6000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_wpl3_blend50_l3_10_128v_a_uniform_converged

@@ -1,0 +1,4 @@
+extends: figure473_dicom_orig_accuracy_wpl3_blend50.yaml
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_wpl3_blend50_physrd

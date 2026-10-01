@@ -1,0 +1,14 @@
+# Matched WPL3 counterpart of the balanced Sobolev WP run. This re-tests L3
+# only after the objective supplies an explicit projection-structure signal.
+extends: figure473_dicom_orig_accuracy_wp_sobolev_balanced.yaml
+
+training:
+  progressive:
+    milestones:
+      9000:
+        enabled: true
+      10500:
+        levels: [2, 3]
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_wpl3_sobolev_balanced

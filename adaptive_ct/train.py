@@ -5,15 +5,20 @@ import json
 import math
 import time
 from collections import deque
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from .config import load_config
 from .compression import export_compact_octree_artifact, export_mact_artifact
 from .data import load_r2_dataset
+from .decision_rays import FixedDecisionRaySet, fixed_rss
+from .dorfler_refinement import DorflerController, finetune_model, quantize_roundtrip_
+from .latent_p1 import LatentP1Octree
 from .geometry import (
     detector_grid,
     make_parallel_ray_points,
@@ -43,6 +48,374 @@ from .volume_metrics import boundary_sharpness_metrics, material_volume_metrics
 
 def _make_optimizer(model, lr: float):
     return torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
+
+
+def _projection_domain_representation(name: str) -> bool:
+    return name in {"bernstein_octree", "bernstein", "rd_cvf", "latent_p1_octree", "latent_p1", "compact_neural_voxel_field"}
+
+
+@torch.no_grad()
+def _initialize_constant_mu(model, value: torch.Tensor) -> None:
+    if hasattr(model, "initialize_constant_mu"):
+        model.initialize_constant_mu(float(value.item()))
+        return
+    values = torch.full_like(model.coefficient_logits, float(value.item()))
+    model.coefficient_logits.copy_(model._coefficients_to_logits(values))
+
+
+@torch.no_grad()
+def _export_center_slice_png(
+    model,
+    output_path: Path,
+    volume_shape: tuple[int, int, int],
+    *,
+    axis: int = 2,
+    chunk: int = 524288,
+) -> dict:
+    shape = tuple(int(value) for value in volume_shape)
+    axis = int(axis)
+    index = shape[axis] // 2
+    dims = [dim for dim in range(3) if dim != axis]
+    device = next(model.parameters()).device
+    scale = torch.tensor(shape, dtype=torch.float32, device=device)
+    grids = torch.meshgrid(
+        torch.arange(shape[dims[0]], dtype=torch.float32, device=device),
+        torch.arange(shape[dims[1]], dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    coords = torch.zeros((grids[0].numel(), 3), dtype=torch.float32, device=device)
+    coords[:, dims[0]] = grids[0].reshape(-1)
+    coords[:, dims[1]] = grids[1].reshape(-1)
+    coords[:, axis] = float(index)
+    points = -1.0 + (coords + 0.5) * 2.0 / scale
+    values = []
+    for start in range(0, points.shape[0], int(chunk)):
+        values.append(model.forward_mu(points[start : start + int(chunk)]).detach().float().cpu())
+    image = torch.cat(values, dim=0).reshape(shape[dims[0]], shape[dims[1]]).numpy().T
+    lo, hi = np.percentile(image, [1.0, 99.0])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(np.nanmin(image)), float(np.nanmax(image))
+    if hi <= lo:
+        hi = lo + 1.0
+    pixels = np.clip((image - lo) / (hi - lo), 0.0, 1.0)
+    Image.fromarray((pixels * 255.0).astype(np.uint8), mode="L").save(output_path)
+    return {
+        "path": str(output_path.resolve()),
+        "axis": axis,
+        "index": index,
+        "shape": list(image.shape),
+        "display_percentiles": [float(lo), float(hi)],
+        "source": "model_prediction_only",
+    }
+
+
+def _finest_model_shape(model, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    shapes = getattr(model, "level_shapes", None)
+    if shapes:
+        return tuple(int(value) for value in shapes[-1])
+    resolutions = getattr(model, "level_resolutions", None)
+    if resolutions:
+        return (int(resolutions[-1]),) * 3
+    return tuple(int(value) for value in fallback)
+
+
+def _degree3(value) -> tuple[int, ...]:
+    if isinstance(value, int):
+        return (int(value),) * 3
+    if value is None:
+        return ()
+    return tuple(int(item) for item in value)
+
+
+def _structural_round_milestones(progressive: dict) -> dict[int, dict]:
+    rounds_cfg = progressive.get("structural_rounds", {}) or {}
+    if not bool(rounds_cfg.get("enabled", False)):
+        return {}
+    rounds = int(rounds_cfg.get("rounds", 0))
+    if rounds < 1:
+        raise ValueError("training.progressive.structural_rounds.rounds must be positive.")
+    start = int(rounds_cfg.get("start_iteration", rounds_cfg.get("start", 1)))
+    interval = int(rounds_cfg.get("interval", rounds_cfg.get("every", 1000)))
+    if interval < 1:
+        raise ValueError("training.progressive.structural_rounds.interval must be positive.")
+    level_schedule = rounds_cfg.get("level_schedule", rounds_cfg.get("levels"))
+    level_schedule = [int(value) for value in (level_schedule or [])]
+    skip = {"enabled", "rounds", "start_iteration", "start", "interval", "every", "level_schedule", "levels"}
+    template = {key: value for key, value in rounds_cfg.items() if key not in skip}
+    milestones: dict[int, dict] = {}
+    for index in range(rounds):
+        spec = dict(template)
+        if level_schedule:
+            spec["level"] = level_schedule[min(index, len(level_schedule) - 1)]
+        spec.setdefault("operation", "h_split")
+        spec["structural_round_index"] = index + 1
+        spec["structural_rounds"] = rounds
+        milestones[start + index * interval] = spec
+    return milestones
+
+
+def _validate_first_paper_scope(config: dict) -> None:
+    model = config.get("model", {}) or {}
+    training = config.get("training", {}) or {}
+    export = config.get("export", {}) or {}
+    errors: list[str] = []
+    if str(model.get("representation", "")).lower() != "latent_p1_octree":
+        errors.append("model.representation must be latent_p1_octree")
+    if str(model.get("topology", "")).lower() != "packed_hierarchy":
+        errors.append("model.topology must be packed_hierarchy")
+    if "max_degree" in model or "initial_leaf_degree" in model:
+        errors.append("first-paper latent P1 fixes the local field degree; remove max_degree/initial_leaf_degree")
+    if str(model.get("initialization", "projection_mean")).lower() == "fdk_volume":
+        errors.append("model.initialization must not use a reconstructed volume")
+    for key in ("tv_weight",):
+        if float(training.get(key, 0.0) or 0.0) != 0.0:
+            errors.append(f"training.{key} must be 0")
+    for dotted in (
+        ("volume_loss", "weight"),
+        ("projection_gradient_loss", "weight"),
+        ("coefficient_continuity", "weight"),
+    ):
+        value = (training.get(dotted[0], {}) or {}).get(dotted[1], 0.0)
+        if float(value or 0.0) != 0.0:
+            errors.append(f"training.{dotted[0]}.{dotted[1]} must be 0")
+    adaptive = training.get("adaptive", {}) or {}
+    if bool(adaptive.get("allow_p", False)):
+        errors.append("training.adaptive.allow_p must be false")
+    if bool(adaptive.get("enabled", False)) and not bool(adaptive.get("held_out_validation", True)):
+        errors.append("training.adaptive.held_out_validation must stay true")
+    progressive = training.get("progressive", {}) or {}
+    milestones = list((progressive.get("convergence_milestones", []) or []))
+    milestones.extend((progressive.get("milestones", {}) or {}).values())
+    for index, milestone in enumerate(milestones):
+        operation = str((milestone or {}).get("operation", (milestone or {}).get("action", "h_split"))).lower()
+        if operation.startswith("p") or operation in {"degree", "degree_elevate", "hp", "hp_compete", "hp_rate_distortion"}:
+            errors.append(f"progressive milestone {index} uses forbidden degree adaptation: {operation}")
+    for key in ("mact", "surface"):
+        if bool((export.get(key, {}) or {}).get("enabled", False)):
+            errors.append(f"export.{key}.enabled must be false")
+    if errors:
+        raise ValueError("Invalid first-paper projection-only config:\n- " + "\n- ".join(errors))
+
+
+def _validate_stage0_direct_p1_scope(config: dict) -> None:
+    model = config.get("model", {}) or {}
+    training = config.get("training", {}) or {}
+    metrics = config.get("metrics", {}) or {}
+    export = config.get("export", {}) or {}
+    errors: list[str] = []
+    if str(model.get("representation", "")).lower() != "bernstein_octree":
+        errors.append("model.representation must be bernstein_octree")
+    if str(model.get("topology", "")).lower() != "packed_hierarchy":
+        errors.append("model.topology must be packed_hierarchy")
+    if str(model.get("integration_mode", "")).lower() != "exact":
+        errors.append("model.integration_mode must be exact")
+    if _degree3(model.get("max_degree")) != (1, 1, 1):
+        errors.append("model.max_degree must be [1, 1, 1]")
+    if _degree3(model.get("initial_leaf_degree")) != (1, 1, 1):
+        errors.append("model.initial_leaf_degree must be [1, 1, 1]")
+    for key in ("latent_dim", "decoder_hidden", "hash_encoding", "fourier_features"):
+        if key in model:
+            errors.append(f"stage0 direct P1 must not set model.{key}")
+    if str(model.get("initialization", "projection_mean")).lower() == "fdk_volume":
+        errors.append("model.initialization must not use a reconstructed volume")
+    if float(training.get("tv_weight", 0.0) or 0.0) != 0.0:
+        errors.append("training.tv_weight must be 0")
+    for dotted in (
+        ("volume_loss", "weight"),
+        ("projection_gradient_loss", "weight"),
+        ("coefficient_continuity", "weight"),
+    ):
+        value = (training.get(dotted[0], {}) or {}).get(dotted[1], 0.0)
+        if float(value or 0.0) != 0.0:
+            errors.append(f"training.{dotted[0]}.{dotted[1]} must be 0")
+    adaptive = training.get("adaptive", {}) or {}
+    if bool(adaptive.get("enabled", True)):
+        errors.append("training.adaptive.enabled must be false")
+    progressive = training.get("progressive", {}) or {}
+    active_convergence = [
+        value for value in (progressive.get("convergence_milestones", []) or [])
+        if bool((value or {}).get("enabled", True))
+    ]
+    active_milestones = [
+        value for value in (progressive.get("milestones", {}) or {}).values()
+        if bool((value or {}).get("enabled", True))
+    ]
+    if active_convergence or active_milestones:
+        errors.append("stage0 direct P1 keeps topology fixed; remove progressive milestones")
+    if bool(training.get("allow_test_during_training", True)):
+        errors.append("training.allow_test_during_training must be false")
+    if bool(metrics.get("compute_volume_metrics", False)) or bool(metrics.get("compute_boundary_metrics", False)):
+        errors.append("stage0 direct P1 must not read GT volume metrics")
+    for key in ("mact", "surface"):
+        if bool((export.get(key, {}) or {}).get("enabled", False)):
+            errors.append(f"export.{key}.enabled must be false")
+    if errors:
+        raise ValueError("Invalid stage0 direct-P1 baseline config:\n- " + "\n- ".join(errors))
+
+
+def _validate_stage1_equal_topology_scope(config: dict) -> None:
+    model = config.get("model", {}) or {}
+    training = config.get("training", {}) or {}
+    metrics = config.get("metrics", {}) or {}
+    export = config.get("export", {}) or {}
+    errors: list[str] = []
+    if str(model.get("representation", "")).lower() != "latent_p1_octree":
+        errors.append("model.representation must be latent_p1_octree")
+    if str(model.get("topology", "")).lower() != "packed_hierarchy":
+        errors.append("model.topology must be packed_hierarchy")
+    if str(model.get("integration_mode", "")).lower() != "exact":
+        errors.append("model.integration_mode must be exact")
+    if int(model.get("latent_dim", 0) or 0) != 4:
+        errors.append("model.latent_dim must be 4 for the first neural gate")
+    for key in ("decoder_hidden", "max_degree", "initial_leaf_degree", "hash_encoding", "fourier_features"):
+        if key in model:
+            errors.append(f"stage1 equal-topology latent P1 must not set model.{key}")
+    if str(model.get("initialization", "projection_mean")).lower() == "fdk_volume":
+        errors.append("model.initialization must not use a reconstructed volume")
+    if float(training.get("tv_weight", 0.0) or 0.0) != 0.0:
+        errors.append("training.tv_weight must be 0")
+    for dotted in (
+        ("volume_loss", "weight"),
+        ("projection_gradient_loss", "weight"),
+        ("coefficient_continuity", "weight"),
+    ):
+        value = (training.get(dotted[0], {}) or {}).get(dotted[1], 0.0)
+        if float(value or 0.0) != 0.0:
+            errors.append(f"training.{dotted[0]}.{dotted[1]} must be 0")
+    if bool((training.get("adaptive", {}) or {}).get("enabled", True)):
+        errors.append("training.adaptive.enabled must be false for equal-topology comparison")
+    progressive = training.get("progressive", {}) or {}
+    if (progressive.get("convergence_milestones", []) or []) or (progressive.get("milestones", {}) or {}):
+        errors.append("stage1 equal-topology keeps topology fixed; remove progressive milestones")
+    if bool(training.get("allow_test_during_training", True)):
+        errors.append("training.allow_test_during_training must be false")
+    if bool(metrics.get("compute_volume_metrics", False)) or bool(metrics.get("compute_boundary_metrics", False)):
+        errors.append("stage1 equal-topology must not read GT volume metrics")
+    for key in ("mact", "surface"):
+        if bool((export.get(key, {}) or {}).get("enabled", False)):
+            errors.append(f"export.{key}.enabled must be false")
+    if errors:
+        raise ValueError("Invalid stage1 equal-topology latent-P1 config:\n- " + "\n- ".join(errors))
+
+
+def _validate_stage3_crossfit_split_scope(config: dict) -> None:
+    model = config.get("model", {}) or {}
+    training = config.get("training", {}) or {}
+    metrics = config.get("metrics", {}) or {}
+    errors: list[str] = []
+    if str(model.get("representation", "")).lower() != "latent_p1_octree":
+        errors.append("model.representation must be latent_p1_octree")
+    if str(model.get("topology", "")).lower() != "packed_hierarchy":
+        errors.append("model.topology must be packed_hierarchy")
+    if str(model.get("integration_mode", "")).lower() != "exact":
+        errors.append("model.integration_mode must be exact")
+    if "decoder_hidden" in model or "hash_encoding" in model or "fourier_features" in model:
+        errors.append("stage3 uses only the shared linear latent decoder")
+    if str(model.get("initialization", "projection_mean")).lower() == "fdk_volume":
+        errors.append("model.initialization must not use a reconstructed volume")
+    if float(training.get("tv_weight", 0.0) or 0.0) != 0.0:
+        errors.append("training.tv_weight must be 0")
+    for dotted in (
+        ("volume_loss", "weight"),
+        ("projection_gradient_loss", "weight"),
+        ("coefficient_continuity", "weight"),
+    ):
+        value = (training.get(dotted[0], {}) or {}).get(dotted[1], 0.0)
+        if float(value or 0.0) != 0.0:
+            errors.append(f"training.{dotted[0]}.{dotted[1]} must be 0")
+    if bool(training.get("allow_test_during_training", True)):
+        errors.append("training.allow_test_during_training must be false")
+    if bool(metrics.get("compute_volume_metrics", False)) or bool(metrics.get("compute_boundary_metrics", False)):
+        errors.append("stage3 topology selection must not read GT volume metrics")
+    progressive = training.get("progressive", {}) or {}
+    milestones = list(progressive.get("convergence_milestones", []) or [])
+    milestones.extend((progressive.get("milestones", {}) or {}).values())
+    milestones.extend(_structural_round_milestones(progressive).values())
+    active = [item or {} for item in milestones if bool((item or {}).get("enabled", True))]
+    if not active:
+        errors.append("stage3 needs at least one h_split milestone")
+    for index, item in enumerate(active):
+        operation = str(item.get("operation", item.get("action", "h_split"))).lower()
+        if operation not in {"h_split", "h", "split", "global_h_split", "global_split"}:
+            errors.append(f"milestone {index} must be h_split only, got {operation!r}")
+        strategy = str(item.get("strategy", "")).lower()
+        if strategy not in {"residual", "projection_residual", "projected_residual", "heldout", "held_out"}:
+            errors.append(f"milestone {index} must use residual cheap proposal")
+        if not bool((item.get("crossfit_acceptance", {}) or {}).get("enabled", False)):
+            errors.append(f"milestone {index} must enable crossfit_acceptance")
+    if errors:
+        raise ValueError("Invalid stage3 cross-fit split config:\n- " + "\n- ".join(errors))
+
+
+def _validate_stage4_structural_split_scope(config: dict) -> None:
+    _validate_stage3_crossfit_split_scope(config)
+    progressive = ((config.get("training", {}) or {}).get("progressive", {}) or {})
+    fixed_rounds = bool((progressive.get("structural_rounds", {}) or {}).get("enabled", False))
+    dynamic_rounds = any(
+        bool((item or {}).get("enabled", True))
+        for item in (progressive.get("convergence_milestones", []) or [])
+    )
+    if not fixed_rounds and not dynamic_rounds:
+        raise ValueError(
+            "Invalid stage4 structural split config:\n- enable fixed structural rounds or convergence-triggered refinement"
+        )
+
+
+def _validate_stage5_merge_scope(config: dict) -> None:
+    model = config.get("model", {}) or {}
+    training = config.get("training", {}) or {}
+    metrics = config.get("metrics", {}) or {}
+    errors: list[str] = []
+    if str(model.get("representation", "")).lower() != "latent_p1_octree":
+        errors.append("model.representation must be latent_p1_octree")
+    if str(model.get("topology", "")).lower() != "packed_hierarchy":
+        errors.append("model.topology must be packed_hierarchy")
+    if str(model.get("integration_mode", "")).lower() != "exact":
+        errors.append("model.integration_mode must be exact")
+    if "decoder_hidden" in model or "hash_encoding" in model or "fourier_features" in model:
+        errors.append("stage5 uses only the shared linear latent decoder")
+    if str(model.get("initialization", "projection_mean")).lower() == "fdk_volume":
+        errors.append("model.initialization must not use a reconstructed volume")
+    if float(training.get("tv_weight", 0.0) or 0.0) != 0.0:
+        errors.append("training.tv_weight must be 0")
+    for dotted in (
+        ("volume_loss", "weight"),
+        ("projection_gradient_loss", "weight"),
+        ("coefficient_continuity", "weight"),
+    ):
+        value = (training.get(dotted[0], {}) or {}).get(dotted[1], 0.0)
+        if float(value or 0.0) != 0.0:
+            errors.append(f"training.{dotted[0]}.{dotted[1]} must be 0")
+    if bool(training.get("allow_test_during_training", True)):
+        errors.append("training.allow_test_during_training must be false")
+    if bool(metrics.get("compute_volume_metrics", False)) or bool(metrics.get("compute_boundary_metrics", False)):
+        errors.append("stage5 topology selection must not read GT volume metrics")
+    progressive = training.get("progressive", {}) or {}
+    milestones = list(progressive.get("convergence_milestones", []) or [])
+    milestones.extend((progressive.get("milestones", {}) or {}).values())
+    milestones.extend(_structural_round_milestones(progressive).values())
+    active = [item or {} for item in milestones if bool((item or {}).get("enabled", True))]
+    if not active:
+        errors.append("stage5 needs h_split/h_merge structural milestones")
+    merge_seen = False
+    for index, item in enumerate(active):
+        operation = str(item.get("operation", item.get("action", "h_split"))).lower()
+        if operation not in {"h_split", "h", "split", "global_h_split", "global_split", "h_merge", "merge"}:
+            errors.append(f"milestone {index} must be h_split or h_merge only, got {operation!r}")
+        if operation in {"h_merge", "merge"}:
+            merge_seen = True
+            if not bool((item.get("crossfit_acceptance", {}) or item.get("acceptance", {}) or {}).get("enabled", False)):
+                errors.append(f"merge milestone {index} must enable crossfit_acceptance")
+            continue
+        strategy = str(item.get("strategy", "")).lower()
+        if strategy not in {"residual", "projection_residual", "projected_residual", "heldout", "held_out"}:
+            errors.append(f"split milestone {index} must use residual cheap proposal")
+        if not bool((item.get("crossfit_acceptance", {}) or {}).get("enabled", False)):
+            errors.append(f"split milestone {index} must enable crossfit_acceptance")
+    if not merge_seen:
+        errors.append("stage5 needs at least one h_merge milestone")
+    if errors:
+        raise ValueError("Invalid stage5 merge config:\n- " + "\n- ".join(errors))
 
 
 def _convergence_window_summary(
@@ -76,6 +449,48 @@ def _convergence_window_summary(
         "start_ema": float(start),
         "end_ema": float(end),
         "relative_improvement": float(relative_improvement),
+    }
+
+
+def _dynamic_refinement_status(
+    *,
+    tested: int,
+    accepted_gains: list[float],
+    round_index: int,
+    min_rounds: int,
+    max_rounds: int,
+    stop_acceptance_ratio: float,
+    current_bytes: int,
+    byte_budget: int | None,
+    min_added_bytes: int,
+) -> dict:
+    accepted = len(accepted_gains)
+    acceptance_ratio = accepted / max(int(tested), 1)
+    mean_gain = sum(accepted_gains) / accepted if accepted else 0.0
+    budget_exhausted = (
+        byte_budget is not None
+        and int(current_bytes) + max(1, int(min_added_bytes)) > int(byte_budget)
+    )
+    reasons = []
+    if int(tested) == 0:
+        reasons.append("no tested candidates")
+    if int(round_index) >= int(min_rounds) and acceptance_ratio < float(stop_acceptance_ratio):
+        reasons.append("acceptance ratio below threshold")
+    if budget_exhausted:
+        reasons.append("byte budget exhausted")
+    if int(round_index) >= int(max_rounds):
+        reasons.append("safety round limit reached")
+    return {
+        "round": int(round_index),
+        "tested": int(tested),
+        "accepted": accepted,
+        "acceptance_ratio": float(acceptance_ratio),
+        "mean_accepted_validation_gain": float(mean_gain),
+        "stop_acceptance_ratio": float(stop_acceptance_ratio),
+        "current_bytes": int(current_bytes),
+        "byte_budget": int(byte_budget) if byte_budget is not None else None,
+        "stop": bool(reasons),
+        "stop_reasons": reasons,
     }
 
 
@@ -1049,6 +1464,7 @@ def _bernstein_projection_residual_leaf_score(
     weight_kwargs: dict,
     gradient_weight: float = 0.0,
     max_buffer_mb: float | None = None,
+    score_mode: str = "attributed_energy",
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     """Projection-domain residual attribution score for p-refinement.
 
@@ -1066,6 +1482,11 @@ def _bernstein_projection_residual_leaf_score(
             bernstein_segment_ray_capacity(levels_for_capacity, float(max_buffer_mb)),
         )
     leaf_count = int(model.leaf_levels.shape[0])
+    normalized_score_mode = str(score_mode).lower()
+    squared_density_mode = normalized_score_mode in {
+        "residual_squared_density",
+        "squared_density",
+    }
     energy = torch.zeros((leaf_count,), dtype=torch.float32, device=device)
     exposure = torch.zeros_like(energy)
     rows_all, cols_all = detector_grid(detector_h, detector_w, device)
@@ -1111,21 +1532,43 @@ def _bernstein_projection_residual_leaf_score(
                     hasattr(model, "prefer_compact_ray_batch") and model.prefer_compact_ray_batch()
                 ),
             )
-            ray_ids, leaf_ids, contributions = model.ray_cell_contributions(ray_batch)
-            prediction = contributions.new_zeros((ray_batch.num_rays,))
-            prediction.scatter_add_(0, ray_ids, contributions)
+            prediction = model.integrate_ray_batch(ray_batch)
             residual = prediction - targets
             weights = projection_weights(targets, **weight_kwargs)
             if gradient_values is not None:
                 weights = weights * (1.0 + float(gradient_weight) * gradient_values[rows, cols])
                 weights = weights / weights.mean().clamp_min(float(weight_kwargs.get("epsilon", 1e-4)))
-            ray_energy = weights * torch.square(residual)
-            abs_contrib = torch.abs(contributions)
-            ray_exposure = contributions.new_zeros((ray_batch.num_rays,))
-            ray_exposure.scatter_add_(0, ray_ids, abs_contrib)
-            attributed = ray_energy[ray_ids] * abs_contrib / ray_exposure[ray_ids].clamp_min(1e-8)
-            energy.scatter_add_(0, leaf_ids, attributed)
-            exposure.scatter_add_(0, leaf_ids, abs_contrib)
+            if normalized_score_mode in {
+                "residual_exposure",
+                "exposure",
+                "hk",
+                "h_k",
+                "residual_density",
+                "density",
+                "hk_density",
+                "h_k_density",
+                "residual_sqrt_exposure",
+                "sqrt_exposure",
+                "sqrt_density",
+                "residual_squared_density",
+                "squared_density",
+            } and hasattr(model, "_parallel_ray_segments"):
+                ray_ids, leaf_ids, intervals = model._parallel_ray_segments(ray_batch)
+                segment_lengths = intervals[:, 1] - intervals[:, 0]
+                ray_energy = weights * (
+                    torch.square(residual) if squared_density_mode else torch.abs(residual)
+                )
+                energy.scatter_add_(0, leaf_ids, ray_energy[ray_ids] * segment_lengths)
+                exposure.scatter_add_(0, leaf_ids, segment_lengths)
+            else:
+                ray_ids, leaf_ids, contributions = model.ray_cell_contributions(ray_batch)
+                ray_energy = weights * torch.square(residual)
+                abs_contrib = torch.abs(contributions)
+                ray_exposure = contributions.new_zeros((ray_batch.num_rays,))
+                ray_exposure.scatter_add_(0, ray_ids, abs_contrib)
+                attributed = ray_energy[ray_ids] * abs_contrib / ray_exposure[ray_ids].clamp_min(1e-8)
+                energy.scatter_add_(0, leaf_ids, attributed)
+                exposure.scatter_add_(0, leaf_ids, abs_contrib)
             total_rays += int(targets.numel())
 
     target_levels = [int(level)] if isinstance(level, int) else [int(value) for value in level]
@@ -1135,21 +1578,33 @@ def _bernstein_projection_residual_leaf_score(
         return leaf_ids, torch.empty((0,), dtype=torch.float32, device=device), {
             "projected_residual_mean": 0.0,
             "projected_residual_max": 0.0,
+            "residual_level_leaf_count": 0,
+            "residual_covered_count": 0,
+            "residual_positive_count": 0,
             "residual_views": view_count,
             "residual_rays": total_rays,
         }
-    raw = energy[leaf_ids] / exposure[leaf_ids].clamp_min(1e-8)
+    if normalized_score_mode in {"residual_exposure", "exposure", "hk", "h_k"}:
+        raw = energy[leaf_ids]
+    elif normalized_score_mode in {"residual_sqrt_exposure", "sqrt_exposure", "sqrt_density"}:
+        raw = energy[leaf_ids] / torch.sqrt(exposure[leaf_ids].clamp_min(1e-8))
+    else:
+        raw = energy[leaf_ids] / exposure[leaf_ids].clamp_min(1e-8)
     supported = exposure[leaf_ids] > 0
     scores = torch.where(supported, raw, torch.zeros_like(raw))
     finite_scores = scores[torch.isfinite(scores)]
     summary = {
         "projected_residual_mean": float(finite_scores.mean().item()) if finite_scores.numel() else 0.0,
         "projected_residual_max": float(finite_scores.max().item()) if finite_scores.numel() else 0.0,
+        "residual_level_leaf_count": int(leaf_ids.numel()),
+        "residual_covered_count": int(torch.sum(supported).item()),
+        "residual_positive_count": int(torch.sum(torch.isfinite(scores) & (scores > 0)).item()),
         "residual_views": view_count,
         "residual_rays": total_rays,
         "residual_ray_chunk": int(ray_chunk),
         "residual_requested_ray_chunk": requested_ray_chunk,
         "residual_max_buffer_mb": float(max_buffer_mb) if max_buffer_mb is not None else None,
+        "residual_score_mode": str(score_mode),
     }
     return leaf_ids, scores.detach().float(), summary
 
@@ -1223,6 +1678,64 @@ def _select_residual_h_candidates(
         "selection_cap": cap,
         "top_fraction_count": top_count,
         "threshold_union_count": int(torch.sum(selected_mask).item()),
+        "material_threshold": float(min_mu_threshold) if min_mu_threshold is not None else None,
+        "material_threshold_count": int(torch.sum(material_mask).item()),
+    }
+
+
+def _select_global_residual_h_candidates(
+    model,
+    leaf_ids: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    max_candidates: int,
+    reserve_leaf_count: int = 0,
+    min_mu_threshold: float | None = None,
+) -> tuple[torch.Tensor, dict]:
+    if leaf_ids.numel() == 0:
+        return leaf_ids, {
+            "global_candidate_cap": 0,
+            "global_shortlisted_by_level": {},
+            "proposal_accuracy_score_mean": 0.0,
+            "proposal_accuracy_score_max": 0.0,
+        }
+    finite = torch.isfinite(scores)
+    accuracy_scores = torch.where(
+        finite,
+        scores,
+        torch.full_like(scores, -float("inf")),
+    )
+    selected_mask = finite & (accuracy_scores > 0)
+    material_mask = torch.zeros_like(selected_mask)
+    leaf_mu = None
+    if min_mu_threshold is not None:
+        leaf_mu = model._leaf_mu()[leaf_ids].detach().float()
+        material_mask = torch.isfinite(leaf_mu) & (leaf_mu >= float(min_mu_threshold))
+        selected_mask |= material_mask
+    positions = torch.nonzero(selected_mask, as_tuple=False).reshape(-1)
+    cap = max(0, int(max_candidates))
+    if model.max_leaf_count is not None:
+        cap = min(
+            cap,
+            max(0, (int(model.max_leaf_count) - int(model.leaf_levels.shape[0]) - max(0, int(reserve_leaf_count))) // 7),
+        )
+    if positions.numel() > cap:
+        order = torch.topk(accuracy_scores[positions], cap).indices if cap > 0 else torch.empty((0,), dtype=torch.long, device=positions.device)
+        positions = positions[order]
+    elif positions.numel():
+        positions = positions[torch.argsort(accuracy_scores[positions], descending=True)]
+    selected = leaf_ids[positions]
+    selected_levels = model.leaf_levels[selected].detach().cpu().tolist() if selected.numel() else []
+    shortlisted_by_level: dict[str, int] = {}
+    for value in selected_levels:
+        key = str(int(value))
+        shortlisted_by_level[key] = shortlisted_by_level.get(key, 0) + 1
+    finite_selected = accuracy_scores[positions][torch.isfinite(accuracy_scores[positions])] if positions.numel() else accuracy_scores[:0]
+    return selected, {
+        "global_candidate_cap": cap,
+        "global_shortlisted_by_level": shortlisted_by_level,
+        "proposal_accuracy_score_mean": float(finite_selected.mean().item()) if finite_selected.numel() else 0.0,
+        "proposal_accuracy_score_max": float(finite_selected.max().item()) if finite_selected.numel() else 0.0,
         "material_threshold": float(min_mu_threshold) if min_mu_threshold is not None else None,
         "material_threshold_count": int(torch.sum(material_mask).item()),
     }
@@ -1591,6 +2104,709 @@ def _sampled_projection_loss(
     return total / max(total_rays, 1)
 
 
+@torch.no_grad()
+def _estimate_projection_noise_variance(split, config: dict) -> dict:
+    flat = split.projections.detach().float().abs().cpu().numpy().reshape(-1)
+    max_samples = int(config.get("max_samples", 1048576))
+    if flat.size > max_samples:
+        ids = np.linspace(0, flat.size - 1, max_samples).round().astype(np.int64)
+        flat = flat[ids]
+    quantile = float(config.get("air_quantile", 0.10))
+    cutoff = float(np.quantile(flat, min(1.0, max(0.0, quantile))))
+    air = flat[flat <= cutoff]
+    if air.size < 2:
+        air = flat
+    variance = max(float(np.var(air)), float(config.get("min_variance", 1.0e-8)))
+    return {
+        "enabled": True,
+        "source": "low_attenuation_training_detector_pixels",
+        "air_quantile": quantile,
+        "air_cutoff": cutoff,
+        "sample_count": int(air.size),
+        "variance": variance,
+        "frozen": True,
+    }
+
+
+def _compact_raw_payload_bytes(model, *, quantization: str = "float16") -> int:
+    bytes_per_float = 4 if str(quantization).lower() == "float32" else 2
+    leaf_count = int(model.leaf_levels.shape[0])
+    node_count = int(getattr(model, "node_child_base", model.leaf_levels).numel())
+    level_shape_count = len(getattr(model, "level_shapes", getattr(model, "level_resolutions", [])))
+    total = node_count * 4 * 2  # node_child_base + node_leaf_id, int32
+    total += leaf_count * 3  # leaf_degrees, uint8
+    total += 4  # leaf_count, uint32
+    total += max(level_shape_count, 1) * 3 * 2  # level_shapes, uint16
+    if getattr(model, "representation", "") == "latent_p1_octree":
+        total += 3 + 4  # max_degree uint8 + attenuation_shift float32
+        total += int(model.leaf_latents.numel()) * bytes_per_float
+        total += int(model.decoder.weight.numel() + model.decoder.bias.numel()) * bytes_per_float
+        return int(total)
+    total += 3 + 4
+    total += int(model.coefficients().numel()) * bytes_per_float
+    return int(total)
+
+
+def _sample_fit_decision_rays(
+    split,
+    *,
+    ray_count: int,
+    fit_fraction: float,
+    detector_h: int,
+    detector_w: int,
+    samples_per_ray: int,
+    seed: int,
+    chunk_rays: int,
+    materialize_points: bool,
+) -> tuple[FixedDecisionRaySet, FixedDecisionRaySet]:
+    device = split.projections.device
+    total = int(split.angles.numel()) * int(detector_h) * int(detector_w)
+    count = min(max(2, int(ray_count)), total)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    ids = torch.randperm(total, generator=generator)[:count].to(device=device)
+    fit_count = max(1, min(count - 1, int(round(count * float(fit_fraction)))))
+    pixels = int(detector_h) * int(detector_w)
+
+    def build(selected: torch.Tensor) -> FixedDecisionRaySet:
+        view_ids = torch.div(selected, pixels, rounding_mode="floor")
+        rem = selected - view_ids * pixels
+        rows = torch.div(rem, int(detector_w), rounding_mode="floor")
+        cols = rem - rows * int(detector_w)
+        return FixedDecisionRaySet(
+            split=split,
+            view_ids=view_ids,
+            rows=rows,
+            cols=cols,
+            detector_h=int(detector_h),
+            detector_w=int(detector_w),
+            samples_per_ray=int(samples_per_ray),
+            chunk_rays=max(1, int(chunk_rays)),
+            materialize_points=bool(materialize_points),
+        )
+
+    return build(ids[:fit_count]), build(ids[fit_count:])
+
+
+def _fixed_ray_batch(rays: FixedDecisionRaySet, indices: torch.Tensor):
+    view_ids = rays.view_ids[indices]
+    rows = rays.rows[indices]
+    cols = rays.cols[indices]
+    targets = rays.split.projections[view_ids, rows, cols]
+    return make_parallel_ray_points(
+        rays.split.angles[view_ids],
+        rows,
+        cols,
+        detector_h=rays.detector_h,
+        detector_w=rays.detector_w,
+        samples_per_ray=rays.samples_per_ray,
+        targets=targets,
+        materialize_points=rays.materialize_points,
+    )
+
+
+@torch.no_grad()
+def _rays_intersecting_leaf_keys(model, rays: FixedDecisionRaySet, leaf_keys) -> FixedDecisionRaySet:
+    leaf_ids = [model.find_leaf(key) for key in leaf_keys]
+    leaf_ids = [int(leaf_id) for leaf_id in leaf_ids if leaf_id is not None]
+    if not leaf_ids:
+        return FixedDecisionRaySet(
+            split=rays.split,
+            view_ids=rays.view_ids[:0],
+            rows=rays.rows[:0],
+            cols=rays.cols[:0],
+            detector_h=rays.detector_h,
+            detector_w=rays.detector_w,
+            samples_per_ray=rays.samples_per_ray,
+            chunk_rays=rays.chunk_rays,
+            materialize_points=rays.materialize_points,
+        )
+    wanted = torch.tensor(leaf_ids, dtype=torch.long, device=rays.view_ids.device)
+    selected_chunks = []
+    for start in range(0, rays.observation_count, rays.chunk_rays):
+        stop = min(start + rays.chunk_rays, rays.observation_count)
+        indices = torch.arange(start, stop, dtype=torch.long, device=rays.view_ids.device)
+        ray_batch = _fixed_ray_batch(rays, indices)
+        ray_ids, hit_leaf_ids, _ = model.ray_cell_contributions(ray_batch)
+        hit = torch.isin(hit_leaf_ids, wanted)
+        if torch.any(hit):
+            selected_chunks.append(indices[torch.unique(ray_ids[hit])])
+    selected = torch.cat(selected_chunks) if selected_chunks else rays.view_ids[:0]
+    return FixedDecisionRaySet(
+        split=rays.split,
+        view_ids=rays.view_ids[selected],
+        rows=rays.rows[selected],
+        cols=rays.cols[selected],
+        detector_h=rays.detector_h,
+        detector_w=rays.detector_w,
+        samples_per_ray=rays.samples_per_ray,
+        chunk_rays=rays.chunk_rays,
+        materialize_points=rays.materialize_points,
+    )
+
+
+@torch.no_grad()
+def _fixed_ray_distortion(
+    model,
+    rays: FixedDecisionRaySet,
+    *,
+    weight_kwargs: dict,
+    noise_variance: float,
+) -> dict:
+    weighted_rss = 0.0
+    rss = 0.0
+    count = 0
+    for start in range(0, rays.observation_count, rays.chunk_rays):
+        stop = min(start + rays.chunk_rays, rays.observation_count)
+        indices = torch.arange(start, stop, dtype=torch.long, device=rays.view_ids.device)
+        ray_batch = _fixed_ray_batch(rays, indices)
+        residual = model.integrate_ray_batch(ray_batch) - ray_batch.target
+        weights = projection_weights(ray_batch.target, **weight_kwargs)
+        weighted_rss += float(torch.sum(weights * torch.square(residual)).item())
+        rss += float(torch.sum(torch.square(residual)).item())
+        count += int(residual.numel())
+    variance = max(float(noise_variance), 1.0e-12)
+    return {
+        "ray_count": count,
+        "rss": rss,
+        "weighted_rss": weighted_rss,
+        "noise_normalized_rss": weighted_rss / variance,
+        "distortion": weighted_rss / max(count, 1) / variance,
+    }
+
+
+def _tune_affected_on_fixed_rays(
+    model,
+    rays: FixedDecisionRaySet,
+    affected_leaf_keys,
+    *,
+    steps: int,
+    batch_rays: int,
+    learning_rate: float,
+    weight_kwargs: dict,
+) -> None:
+    affected_leaf_ids = [model.find_leaf(key) for key in affected_leaf_keys]
+    affected_leaf_ids = [int(leaf_id) for leaf_id in affected_leaf_ids if leaf_id is not None]
+    if int(steps) <= 0 or not affected_leaf_ids or rays.observation_count <= 0:
+        return
+    batch_count = max(1, min(int(batch_rays), rays.observation_count))
+    if getattr(model, "representation", "") == "latent_p1_octree":
+        trainable_mask = torch.zeros((model.leaf_latents.shape[0],), dtype=torch.bool, device=model.leaf_latents.device)
+        trainable_mask[torch.tensor(affected_leaf_ids, dtype=torch.long, device=model.leaf_latents.device)] = True
+        old_requires_grad = [param.requires_grad for param in model.decoder.parameters()]
+        for param in model.decoder.parameters():
+            param.requires_grad_(False)
+        optimizer = torch.optim.Adam([model.leaf_latents], lr=float(learning_rate))
+        try:
+            for step in range(int(steps)):
+                start = (step * batch_count) % rays.observation_count
+                indices = (torch.arange(batch_count, device=rays.view_ids.device) + start) % rays.observation_count
+                ray_batch = _fixed_ray_batch(rays, indices)
+                loss = weighted_projection_loss(model.integrate_ray_batch(ray_batch), ray_batch.target, **weight_kwargs)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if model.leaf_latents.grad is not None:
+                    model.leaf_latents.grad[~trainable_mask] = 0.0
+                optimizer.step()
+        finally:
+            for param, requires_grad in zip(model.decoder.parameters(), old_requires_grad):
+                param.requires_grad_(requires_grad)
+        return
+
+    ids = torch.tensor(affected_leaf_ids, dtype=torch.long, device=model.coefficient_logits.device)
+    trainable_mask = torch.isin(model.coefficient_leaf_ids, ids)
+    optimizer = torch.optim.Adam([model.coefficient_logits], lr=float(learning_rate))
+    for step in range(int(steps)):
+        start = (step * batch_count) % rays.observation_count
+        indices = (torch.arange(batch_count, device=rays.view_ids.device) + start) % rays.observation_count
+        ray_batch = _fixed_ray_batch(rays, indices)
+        loss = weighted_projection_loss(model.integrate_ray_batch(ray_batch), ray_batch.target, **weight_kwargs)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if model.coefficient_logits.grad is not None:
+            model.coefficient_logits.grad[~trainable_mask] = 0.0
+        optimizer.step()
+
+
+def _apply_h_split_with_crossfit_gate(
+    model,
+    selected: torch.Tensor,
+    *,
+    dataset,
+    detector_h: int,
+    detector_w: int,
+    samples_per_ray: int,
+    spec: dict,
+    adaptive_cfg: dict,
+    train_cfg: dict,
+    iteration: int,
+    materialize_ray_points: bool,
+    noise_variance: float,
+) -> tuple[int, dict]:
+    gate_cfg = spec.get("crossfit_acceptance") or spec.get("acceptance") or {}
+    max_candidates = int(gate_cfg.get("max_candidates", selected.numel()))
+    candidate_keys = [model.leaf_key(int(leaf_id)) for leaf_id in selected[:max_candidates].detach().cpu().tolist()]
+    if not candidate_keys:
+        return 0, {"crossfit_enabled": True, "candidate_count": 0, "accepted_count": 0}
+    fit_rays, decision_rays = _sample_fit_decision_rays(
+        dataset.train,
+        ray_count=int(gate_cfg.get("ray_count", 8192)),
+        fit_fraction=float(gate_cfg.get("fit_fraction", 0.8)),
+        detector_h=detector_h,
+        detector_w=detector_w,
+        samples_per_ray=samples_per_ray,
+        seed=int(gate_cfg.get("seed", iteration)),
+        chunk_rays=int(gate_cfg.get("ray_chunk", train_cfg.get("eval_ray_chunk", 4096))),
+        materialize_points=materialize_ray_points,
+    )
+    weight_kwargs = _projection_weight_kwargs(
+        train_cfg,
+        adaptive_cfg,
+        gate_cfg.get("projection_weighting"),
+        iteration=iteration,
+    )
+    min_gain = float(gate_cfg.get("min_gain", 0.0))
+    quantization = str(gate_cfg.get("compact_quantization", (train_cfg.get("compact_quantization") or "float16")))
+    acceptance_mode = str(gate_cfg.get("acceptance_mode", "sequential")).lower()
+    byte_budget = gate_cfg.get("byte_budget", gate_cfg.get("max_total_bytes", spec.get("byte_budget")))
+    evaluations = []
+    accepted = 0
+    if acceptance_mode in {"ranked_batch", "ranked", "batch"}:
+        base_state = _clone_sparse_state(model)
+        base_bytes = _compact_raw_payload_bytes(model, quantization=quantization)
+        for key in candidate_keys:
+            _restore_sparse_state(model, base_state)
+            leaf_id = model.find_leaf(key)
+            if leaf_id is None:
+                continue
+            candidate_fit_rays = _rays_intersecting_leaf_keys(model, fit_rays, [key])
+            candidate_decision_rays = _rays_intersecting_leaf_keys(model, decision_rays, [key])
+            if candidate_decision_rays.observation_count == 0:
+                evaluations.append(
+                    {
+                        "leaf_key": list(key),
+                        "candidate_active": 0,
+                        "fit_ray_count_for_leaf": int(candidate_fit_rays.observation_count),
+                        "decision_ray_count_for_leaf": 0,
+                        "decision_before": {"ray_count": 0},
+                        "decision_after": {"ray_count": 0},
+                        "decision_gain_noise_normalized_rss": 0.0,
+                        "rate_delta_bytes": 0,
+                        "passed_gate": False,
+                        "accepted": False,
+                        "reason": "rejected: no decision rays intersect candidate",
+                    }
+                )
+                continue
+            before = _fixed_ray_distortion(
+                model,
+                candidate_decision_rays,
+                weight_kwargs=weight_kwargs,
+                noise_variance=noise_variance,
+            )
+            change = model.split_leaves_batch([leaf_id])
+            candidate_active = int(len(change.new_leaf_keys))
+            if candidate_active:
+                _tune_affected_on_fixed_rays(
+                    model,
+                    candidate_fit_rays,
+                    change.new_leaf_keys,
+                    steps=int(gate_cfg.get("tune_steps", 30)),
+                    batch_rays=int(gate_cfg.get("tune_batch_rays", 2048)),
+                    learning_rate=float(gate_cfg.get("tune_learning_rate", train_cfg.get("lr", 1.0e-2))),
+                    weight_kwargs=weight_kwargs,
+                )
+            after = _fixed_ray_distortion(
+                model,
+                candidate_decision_rays,
+                weight_kwargs=weight_kwargs,
+                noise_variance=noise_variance,
+            )
+            after_bytes = _compact_raw_payload_bytes(model, quantization=quantization)
+            rate_delta = after_bytes - base_bytes
+            gain = float(before["noise_normalized_rss"] - after["noise_normalized_rss"])
+            passed = candidate_active > 0 and rate_delta > 0 and gain > min_gain
+            evaluations.append(
+                {
+                    "leaf_key": list(key),
+                    "candidate_active": candidate_active,
+                    "fit_ray_count_for_leaf": int(candidate_fit_rays.observation_count),
+                    "decision_ray_count_for_leaf": int(candidate_decision_rays.observation_count),
+                    "decision_before": before,
+                    "decision_after": after,
+                    "decision_gain_noise_normalized_rss": gain,
+                    "rate_delta_bytes": int(rate_delta),
+                    "passed_gate": bool(passed),
+                    "accepted": False,
+                    "reason": (
+                        "passed gate; waiting for ranked batch selection"
+                        if passed
+                        else "rejected: no held-out decision accuracy gain"
+                    ),
+                }
+            )
+
+        _restore_sparse_state(model, base_state)
+        passed_evaluations = [item for item in evaluations if item.get("passed_gate")]
+        passed_evaluations.sort(
+            key=lambda item: float(item.get("decision_gain_noise_normalized_rss", 0.0)),
+            reverse=True,
+        )
+        max_splits = int(gate_cfg.get("max_splits_per_round", gate_cfg.get("max_splits", len(passed_evaluations))))
+        max_added_bytes = gate_cfg.get("max_added_bytes")
+        remaining_added = int(max_added_bytes) if max_added_bytes is not None else None
+        if byte_budget is not None:
+            budget_remaining = max(0, int(byte_budget) - base_bytes)
+            remaining_added = budget_remaining if remaining_added is None else min(remaining_added, budget_remaining)
+        selected_keys = []
+        for item in passed_evaluations:
+            if len(selected_keys) >= max_splits:
+                item["reason"] = "passed gate; skipped by per-round split cap"
+                continue
+            rate_delta = int(item.get("rate_delta_bytes", 0))
+            if remaining_added is not None and rate_delta > remaining_added:
+                item["reason"] = "passed gate; skipped by byte budget"
+                continue
+            item["accepted"] = True
+            item["reason"] = "accepted: ranked held-out decision accuracy gain"
+            selected_keys.append(tuple(item["leaf_key"]))
+            if remaining_added is not None:
+                remaining_added -= rate_delta
+        selected_ids = [model.find_leaf(key) for key in selected_keys]
+        selected_ids = [int(leaf_id) for leaf_id in selected_ids if leaf_id is not None]
+        if selected_ids:
+            selected_fit_rays = _rays_intersecting_leaf_keys(model, fit_rays, selected_keys)
+            final_change = model.split_leaves_batch(selected_ids)
+            _tune_affected_on_fixed_rays(
+                model,
+                selected_fit_rays,
+                final_change.new_leaf_keys,
+                steps=int(gate_cfg.get("accepted_refit_steps", gate_cfg.get("tune_steps", 30))),
+                batch_rays=int(gate_cfg.get("accepted_refit_batch_rays", gate_cfg.get("tune_batch_rays", 2048))),
+                learning_rate=float(gate_cfg.get("tune_learning_rate", train_cfg.get("lr", 1.0e-2))),
+                weight_kwargs=weight_kwargs,
+            )
+        accepted = len(selected_ids)
+        reason_counts = {}
+        for item in evaluations:
+            reason = str(item.get("reason", ""))
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        fit_valid = sum(1 for item in evaluations if int(item.get("fit_ray_count_for_leaf", 0)) > 0)
+        decision_valid = sum(1 for item in evaluations if int(item.get("decision_ray_count_for_leaf", 0)) > 0)
+        tested = sum(1 for item in evaluations if int(item.get("candidate_active", 0)) > 0)
+        return accepted, {
+            "crossfit_enabled": True,
+            "crossfit_acceptance_mode": acceptance_mode,
+            "fit_ray_count": int(fit_rays.observation_count),
+            "decision_ray_count": int(decision_rays.observation_count),
+            "fit_fraction": float(gate_cfg.get("fit_fraction", 0.8)),
+            "candidate_count": len(candidate_keys),
+            "fit_ray_valid_count": int(fit_valid),
+            "decision_ray_valid_count": int(decision_valid),
+            "tested_count": int(tested),
+            "passed_gate_count": len(passed_evaluations),
+            "accepted_count": accepted,
+            "max_splits_per_round": max_splits,
+            "base_rate_bytes": int(base_bytes),
+            "byte_budget": int(byte_budget) if byte_budget is not None else None,
+            "local_selection_objective": "held-out decision accuracy gain",
+            "noise_variance": float(noise_variance),
+            "compact_quantization": quantization,
+            "rejection_reason_counts": reason_counts,
+            "evaluations": evaluations,
+        }
+
+    for key in candidate_keys:
+        leaf_id = model.find_leaf(key)
+        if leaf_id is None:
+            continue
+        candidate_fit_rays = _rays_intersecting_leaf_keys(model, fit_rays, [key])
+        candidate_decision_rays = _rays_intersecting_leaf_keys(model, decision_rays, [key])
+        if candidate_decision_rays.observation_count == 0:
+            evaluations.append(
+                {
+                    "leaf_key": list(key),
+                    "candidate_active": 0,
+                    "fit_ray_count_for_leaf": int(candidate_fit_rays.observation_count),
+                    "decision_ray_count_for_leaf": 0,
+                    "decision_before": {"ray_count": 0},
+                    "decision_after": {"ray_count": 0},
+                    "decision_gain_noise_normalized_rss": 0.0,
+                    "rate_delta_bytes": 0,
+                    "accepted": False,
+                    "reason": "rejected: no decision rays intersect candidate",
+                }
+            )
+            continue
+        before_state = _clone_sparse_state(model)
+        before_bytes = _compact_raw_payload_bytes(model, quantization=quantization)
+        before = _fixed_ray_distortion(
+            model,
+            candidate_decision_rays,
+            weight_kwargs=weight_kwargs,
+            noise_variance=noise_variance,
+        )
+        change = model.split_leaves_batch([leaf_id])
+        candidate_active = int(len(change.new_leaf_keys))
+        if candidate_active:
+            _tune_affected_on_fixed_rays(
+                model,
+                candidate_fit_rays,
+                change.new_leaf_keys,
+                steps=int(gate_cfg.get("tune_steps", 30)),
+                batch_rays=int(gate_cfg.get("tune_batch_rays", 2048)),
+                learning_rate=float(gate_cfg.get("tune_learning_rate", train_cfg.get("lr", 1.0e-2))),
+                weight_kwargs=weight_kwargs,
+            )
+        after = _fixed_ray_distortion(
+            model,
+            candidate_decision_rays,
+            weight_kwargs=weight_kwargs,
+            noise_variance=noise_variance,
+        )
+        after_bytes = _compact_raw_payload_bytes(model, quantization=quantization)
+        rate_delta = after_bytes - before_bytes
+        gain = float(before["noise_normalized_rss"] - after["noise_normalized_rss"])
+        within_budget = byte_budget is None or after_bytes <= int(byte_budget)
+        keep = candidate_active > 0 and rate_delta > 0 and gain > min_gain and within_budget
+        evaluations.append(
+            {
+                "leaf_key": list(key),
+                "candidate_active": candidate_active,
+                "fit_ray_count_for_leaf": int(candidate_fit_rays.observation_count),
+                "decision_ray_count_for_leaf": int(candidate_decision_rays.observation_count),
+                "decision_before": before,
+                "decision_after": after,
+                "decision_gain_noise_normalized_rss": gain,
+                "rate_delta_bytes": int(rate_delta),
+                "accepted": bool(keep),
+                "reason": (
+                    "accepted: held-out decision accuracy improved"
+                    if keep
+                    else (
+                        "rejected: byte budget reached"
+                        if not within_budget
+                        else "rejected: no held-out decision accuracy gain"
+                    )
+                ),
+            }
+        )
+        if keep:
+            accepted += 1
+        else:
+            _restore_sparse_state(model, before_state)
+    reason_counts = {}
+    for item in evaluations:
+        reason = str(item.get("reason", ""))
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    fit_valid = sum(1 for item in evaluations if int(item.get("fit_ray_count_for_leaf", 0)) > 0)
+    decision_valid = sum(1 for item in evaluations if int(item.get("decision_ray_count_for_leaf", 0)) > 0)
+    tested = sum(1 for item in evaluations if int(item.get("candidate_active", 0)) > 0)
+    return accepted, {
+        "crossfit_enabled": True,
+        "fit_ray_count": int(fit_rays.observation_count),
+        "decision_ray_count": int(decision_rays.observation_count),
+        "fit_fraction": float(gate_cfg.get("fit_fraction", 0.8)),
+        "candidate_count": len(candidate_keys),
+        "fit_ray_valid_count": int(fit_valid),
+        "decision_ray_valid_count": int(decision_valid),
+        "tested_count": int(tested),
+        "accepted_count": accepted,
+        "byte_budget": int(byte_budget) if byte_budget is not None else None,
+        "local_selection_objective": "held-out decision accuracy gain",
+        "noise_variance": float(noise_variance),
+        "compact_quantization": quantization,
+        "rejection_reason_counts": reason_counts,
+        "evaluations": evaluations,
+    }
+
+
+@torch.no_grad()
+def _complete_sibling_groups(model, *, level: int, max_groups: int | None = None) -> list[tuple[tuple[int, int, int, int], ...]]:
+    groups: dict[tuple[int, int, int, int], list[tuple[int, int, int, int]]] = {}
+    for leaf_id in range(int(model.leaf_levels.shape[0])):
+        key = model.leaf_key(leaf_id)
+        child_level, x, y, z = key
+        if int(child_level) != int(level):
+            continue
+        parent = (child_level - 1, x // 2, y // 2, z // 2)
+        groups.setdefault(parent, []).append(key)
+    siblings = [tuple(sorted(keys)) for keys in groups.values() if len(keys) == 8]
+    siblings.sort()
+    return siblings[:max_groups] if max_groups is not None else siblings
+
+
+def _apply_h_merge_with_crossfit_gate(
+    model,
+    *,
+    dataset,
+    detector_h: int,
+    detector_w: int,
+    samples_per_ray: int,
+    spec: dict,
+    adaptive_cfg: dict,
+    train_cfg: dict,
+    iteration: int,
+    materialize_ray_points: bool,
+    noise_variance: float,
+) -> tuple[int, dict]:
+    gate_cfg = spec.get("crossfit_acceptance") or spec.get("acceptance") or {}
+    if not bool(gate_cfg.get("enabled", False)):
+        return 0, {"crossfit_enabled": False, "accepted_count": 0}
+    level = int(spec.get("level", 1))
+    max_candidates = int(gate_cfg.get("max_candidates", spec.get("max_candidates", 256)))
+    candidate_groups = _complete_sibling_groups(model, level=level, max_groups=max_candidates)
+    if not candidate_groups:
+        return 0, {"crossfit_enabled": True, "candidate_count": 0, "accepted_count": 0}
+
+    fit_rays, decision_rays = _sample_fit_decision_rays(
+        dataset.train,
+        ray_count=int(gate_cfg.get("ray_count", 8192)),
+        fit_fraction=float(gate_cfg.get("fit_fraction", 0.8)),
+        detector_h=detector_h,
+        detector_w=detector_w,
+        samples_per_ray=samples_per_ray,
+        seed=int(gate_cfg.get("seed", iteration)),
+        chunk_rays=int(gate_cfg.get("ray_chunk", train_cfg.get("eval_ray_chunk", 4096))),
+        materialize_points=materialize_ray_points,
+    )
+    weight_kwargs = _projection_weight_kwargs(
+        train_cfg,
+        adaptive_cfg,
+        gate_cfg.get("projection_weighting"),
+        iteration=iteration,
+    )
+    quantization = str(gate_cfg.get("compact_quantization", (train_cfg.get("compact_quantization") or "float16")))
+    merge_lambda = float(gate_cfg.get("merge_lambda", gate_cfg.get("rate_lambda", adaptive_cfg.get("merge_lambda", 0.0))))
+    max_penalty = gate_cfg.get("max_penalty")
+    max_penalty = float(max_penalty) if max_penalty is not None else None
+    base_state = _clone_sparse_state(model)
+    base_bytes = _compact_raw_payload_bytes(model, quantization=quantization)
+    evaluations = []
+
+    for group in candidate_groups:
+        _restore_sparse_state(model, base_state)
+        candidate_fit_rays = _rays_intersecting_leaf_keys(model, fit_rays, group)
+        candidate_decision_rays = _rays_intersecting_leaf_keys(model, decision_rays, group)
+        if candidate_decision_rays.observation_count == 0:
+            evaluations.append(
+                {
+                    "leaf_keys": [list(key) for key in group],
+                    "decision_before": {"ray_count": 0},
+                    "decision_after": {"ray_count": 0},
+                    "bytes_saved": 0,
+                    "decision_penalty_noise_normalized_rss": 0.0,
+                    "cost_per_saved_byte": None,
+                    "passed_gate": False,
+                    "accepted": False,
+                    "reason": "rejected: no decision rays intersect candidate",
+                }
+            )
+            continue
+        before = _fixed_ray_distortion(
+            model,
+            candidate_decision_rays,
+            weight_kwargs=weight_kwargs,
+            noise_variance=noise_variance,
+        )
+        child_ids = [model.find_leaf(key) for key in group]
+        if any(leaf_id is None for leaf_id in child_ids):
+            continue
+        change = model.merge_siblings([int(leaf_id) for leaf_id in child_ids])
+        if change.new_leaf_keys:
+            _tune_affected_on_fixed_rays(
+                model,
+                candidate_fit_rays,
+                change.new_leaf_keys,
+                steps=int(gate_cfg.get("tune_steps", 30)),
+                batch_rays=int(gate_cfg.get("tune_batch_rays", 2048)),
+                learning_rate=float(gate_cfg.get("tune_learning_rate", train_cfg.get("lr", 1.0e-2))),
+                weight_kwargs=weight_kwargs,
+            )
+        after = _fixed_ray_distortion(
+            model,
+            candidate_decision_rays,
+            weight_kwargs=weight_kwargs,
+            noise_variance=noise_variance,
+        )
+        after_bytes = _compact_raw_payload_bytes(model, quantization=quantization)
+        bytes_saved = base_bytes - after_bytes
+        penalty = float(after["noise_normalized_rss"] - before["noise_normalized_rss"])
+        cost = max(penalty, 0.0) / max(bytes_saved, 1)
+        passed = bytes_saved > 0 and cost <= merge_lambda and (max_penalty is None or penalty <= max_penalty)
+        evaluations.append(
+            {
+                "leaf_keys": [list(key) for key in group],
+                "parent_key": list(change.new_leaf_keys[0]) if change.new_leaf_keys else None,
+                "fit_ray_count_for_group": int(candidate_fit_rays.observation_count),
+                "decision_ray_count_for_group": int(candidate_decision_rays.observation_count),
+                "decision_before": before,
+                "decision_after": after,
+                "bytes_saved": int(bytes_saved),
+                "decision_penalty_noise_normalized_rss": penalty,
+                "cost_per_saved_byte": cost,
+                "passed_gate": bool(passed),
+                "accepted": False,
+                "reason": (
+                    "passed gate; waiting for ranked merge selection"
+                    if passed
+                    else "rejected: decision penalty per saved byte is too high"
+                ),
+            }
+        )
+
+    _restore_sparse_state(model, base_state)
+    passed_evaluations = [item for item in evaluations if item.get("passed_gate")]
+    passed_evaluations.sort(key=lambda item: float(item.get("cost_per_saved_byte", float("inf"))))
+    max_merges = int(gate_cfg.get("max_merges_per_round", gate_cfg.get("max_merges", len(passed_evaluations))))
+    selected_groups = []
+    for item in passed_evaluations:
+        if len(selected_groups) >= max_merges:
+            item["reason"] = "passed gate; skipped by per-round merge cap"
+            continue
+        item["accepted"] = True
+        item["reason"] = "accepted: ranked decision penalty per saved byte"
+        selected_groups.append(tuple(tuple(key) for key in item["leaf_keys"]))
+    for group in selected_groups:
+        current_ids = [model.find_leaf(key) for key in group]
+        current_ids = [int(leaf_id) for leaf_id in current_ids if leaf_id is not None]
+        if len(current_ids) != 8:
+            continue
+        candidate_fit_rays = _rays_intersecting_leaf_keys(model, fit_rays, group)
+        change = model.merge_siblings(current_ids)
+        _tune_affected_on_fixed_rays(
+            model,
+            candidate_fit_rays,
+            change.new_leaf_keys,
+            steps=int(gate_cfg.get("accepted_refit_steps", gate_cfg.get("tune_steps", 30))),
+            batch_rays=int(gate_cfg.get("accepted_refit_batch_rays", gate_cfg.get("tune_batch_rays", 2048))),
+            learning_rate=float(gate_cfg.get("tune_learning_rate", train_cfg.get("lr", 1.0e-2))),
+            weight_kwargs=weight_kwargs,
+        )
+
+    reason_counts = {}
+    for item in evaluations:
+        reason = str(item.get("reason", ""))
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    accepted = len(selected_groups)
+    return accepted, {
+        "crossfit_enabled": True,
+        "fit_ray_count": int(fit_rays.observation_count),
+        "decision_ray_count": int(decision_rays.observation_count),
+        "fit_fraction": float(gate_cfg.get("fit_fraction", 0.8)),
+        "candidate_count": len(candidate_groups),
+        "passed_gate_count": len(passed_evaluations),
+        "accepted_count": accepted,
+        "max_merges_per_round": max_merges,
+        "base_rate_bytes": int(base_bytes),
+        "merge_lambda": merge_lambda,
+        "noise_variance": float(noise_variance),
+        "compact_quantization": quantization,
+        "rejection_reason_counts": reason_counts,
+        "evaluations": evaluations,
+    }
+
+
 def _apply_p_elevation_with_projection_gate(
     model,
     selected: torch.Tensor,
@@ -1801,9 +3017,61 @@ def _apply_p_elevation_with_projection_gate(
     }
 
 
+_DORFLER_OPERATIONS = {"dorfler_h_split", "dorfler_split"}
+
+
+def _validate_stage7_dorfler_scope(config: dict) -> None:
+    errors = []
+    model_cfg = config.get("model", {}) or {}
+    train_cfg = config.get("training", {}) or {}
+    progressive = train_cfg.get("progressive", {}) or {}
+    if str(model_cfg.get("representation", "")).lower() not in {"bernstein_octree", "bernstein"}:
+        errors.append("stage7 trains a Bernstein octree; latent codecs are applied at export only")
+    if str(model_cfg.get("initialization", "projection_mean")).lower() != "projection_mean":
+        errors.append("stage7 must initialize from projection_mean only (no FDK/reference volume)")
+    if bool(train_cfg.get("allow_test_during_training", False)):
+        errors.append("test views must not be used during training")
+    if float(train_cfg.get("tv_weight", 0.0)) != 0.0:
+        errors.append("tv_weight must be 0")
+    for key in ("volume_loss", "projection_gradient_loss", "coefficient_continuity"):
+        if float((train_cfg.get(key, {}) or {}).get("weight", 0.0)) != 0.0:
+            errors.append(f"training.{key}.weight must be 0")
+    milestones = [
+        item for item in (progressive.get("convergence_milestones", []) or [])
+        if bool((item or {}).get("enabled", True))
+    ]
+    if len(milestones) != 1 or str(milestones[0].get("operation", "")).lower() not in _DORFLER_OPERATIONS:
+        errors.append("stage7 needs exactly one convergence milestone with operation dorfler_h_split")
+    else:
+        spec = milestones[0]
+        if bool(spec.get("rollback", True)) and int((config.get("dataset", {}) or {}).get("dev_views", 0)) < 1:
+            errors.append("rollback needs dataset.dev_views >= 1")
+        if spec.get("byte_budget") is None:
+            errors.append("dorfler_h_split needs a byte_budget")
+    if progressive.get("milestones") or (progressive.get("structural_rounds", {}) or {}).get("enabled", False):
+        errors.append("stage7 uses only the dorfler convergence milestone")
+    if errors:
+        raise ValueError("Invalid stage7 Dorfler config:\n- " + "\n- ".join(errors))
+
+
 def run_training(config_path: str | Path) -> dict:
     run_start_time = time.perf_counter()
     config = load_config(config_path)
+    research_scope = str((config.get("research", {}) or {}).get("scope", "")).lower()
+    if research_scope == "first_paper":
+        _validate_first_paper_scope(config)
+    elif research_scope in {"stage0_direct_p1", "baseline_direct_p1"}:
+        _validate_stage0_direct_p1_scope(config)
+    elif research_scope in {"stage1_equal_topology", "stage1_latent_p1_equal_topology"}:
+        _validate_stage1_equal_topology_scope(config)
+    elif research_scope in {"stage3_crossfit_split", "stage3_projection_split"}:
+        _validate_stage3_crossfit_split_scope(config)
+    elif research_scope in {"stage4_structural_split", "stage4_projection_structural_split"}:
+        _validate_stage4_structural_split_scope(config)
+    elif research_scope in {"stage5_merge", "stage5_projection_merge", "stage6_compact_artifact"}:
+        _validate_stage5_merge_scope(config)
+    elif research_scope == "stage7_dorfler":
+        _validate_stage7_dorfler_scope(config)
     training_seed = int((config.get("training", {}) or {}).get("seed", 0))
     torch.manual_seed(training_seed)
     np.random.seed(training_seed)
@@ -1814,27 +3082,34 @@ def run_training(config_path: str | Path) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     requested_representation = str(config.get("model", {}).get("representation", "dynamic_leaf_voxel")).lower()
-    projection_domain_requested = requested_representation in {"bernstein_octree", "bernstein", "rd_cvf"}
+    projection_domain_requested = _projection_domain_representation(requested_representation)
     dataset = load_r2_dataset(
         config["dataset"]["root"],
         device=device,
         load_volume=not projection_domain_requested,
     )
+    dev_views = int((config.get("dataset", {}) or {}).get("dev_views", 0))
+    if dev_views > 0 and dataset.validation is None:
+        train_views = int(dataset.train.angles.shape[0])
+        train_split, dev_split = split_projection_views(
+            dataset.train,
+            validation_fraction=dev_views / float(train_views),
+            seed=int((config.get("dataset", {}) or {}).get("dev_seed", training_seed)),
+        )
+        dataset = dataclass_replace(dataset, train=train_split, validation=dev_split)
     detector_h, detector_w = dataset.detector_shape
     samples_per_ray = int(config["geometry"].get("samples_per_ray", dataset.volume_shape[0]))
     model = build_model(config).to(device=device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    projection_domain_model = getattr(model, "representation", "") == "bernstein_octree"
+    projection_domain_model = _projection_domain_representation(str(getattr(model, "representation", "")))
     if projection_domain_model:
         initialization = str(config["model"].get("initialization", "projection_mean")).lower()
         if initialization == "projection_mean":
             # For the normalized [-1, 1]^3 object box, the representative path
             # length is two. This initializes c000 directly from observations.
             initial_mu = (dataset.train.projections.mean() * 0.5).clamp_min(1e-8)
-            with torch.no_grad():
-                values = torch.full_like(model.coefficient_logits, float(initial_mu.item()))
-                model.coefficient_logits.copy_(model._coefficients_to_logits(values))
+            _initialize_constant_mu(model, initial_mu)
         elif initialization == "fdk_volume":
             fdk_path = config["model"].get("fdk_path")
             if not fdk_path:
@@ -1884,11 +3159,25 @@ def run_training(config_path: str | Path) -> dict:
         intermediate_evaluation_split = dataset.test
         intermediate_evaluation_name = "test"
     progressive = train_cfg.get("progressive", {}) or {}
+    structural_rounds_cfg = progressive.get("structural_rounds", {}) or {}
+    structural_gate_cfg = structural_rounds_cfg.get("crossfit_acceptance", {}) or {}
+    global_byte_budget = structural_gate_cfg.get("byte_budget", structural_rounds_cfg.get("byte_budget"))
+    if global_byte_budget is None:
+        for item in progressive.get("convergence_milestones", []) or []:
+            gate = (item or {}).get("crossfit_acceptance", {}) or {}
+            global_byte_budget = gate.get("byte_budget", (item or {}).get("byte_budget"))
+            if global_byte_budget is not None:
+                break
+    global_byte_budget = int(global_byte_budget) if global_byte_budget is not None else None
     milestones = {
         int(k): v
         for k, v in (progressive.get("milestones", {}) or {}).items()
         if bool((v or {}).get("enabled", True))
     }
+    for structural_iteration, structural_spec in _structural_round_milestones(progressive).items():
+        if structural_iteration in milestones:
+            raise ValueError(f"structural_rounds collides with progressive.milestones at iteration {structural_iteration}.")
+        milestones[structural_iteration] = structural_spec
     convergence_milestones = [
         dict(value)
         for value in (progressive.get("convergence_milestones", []) or [])
@@ -1903,7 +3192,46 @@ def run_training(config_path: str | Path) -> dict:
     convergence_values = deque(
         maxlen=max([int(value.get("window", 200)) for value in convergence_milestones] or [200])
     )
+    fixed_decision_cfg = train_cfg.get("fixed_decision_rays", {}) or {}
+    fixed_decision_enabled = bool(fixed_decision_cfg.get("enabled", False))
+    fixed_decision_interval = max(1, int(fixed_decision_cfg.get("interval", 1)))
+    fixed_decision_use_for_plateau = bool(
+        fixed_decision_cfg.get("use_for_plateau", fixed_decision_enabled)
+    )
+    fixed_decision_set = None
+    fixed_decision_last = None
+    if fixed_decision_enabled:
+        fixed_decision_set = FixedDecisionRaySet.sampled(
+            dataset.train,
+            ray_count=int(fixed_decision_cfg.get("ray_count", batch_rays)),
+            detector_h=detector_h,
+            detector_w=detector_w,
+            samples_per_ray=samples_per_ray,
+            seed=int(fixed_decision_cfg.get("seed", int(train_cfg.get("seed", 0)) + 104729)),
+            chunk_rays=int(
+                fixed_decision_cfg.get("chunk_rays", train_cfg.get("eval_ray_chunk", 65536))
+            ),
+            materialize_points=materialize_ray_points,
+        )
     refinement_defaults = progressive.get("refinement", {}) or {}
+    dorfler_controller = None
+    for item in convergence_milestones:
+        if str(item.get("operation", "")).lower() in _DORFLER_OPERATIONS:
+            dorfler_controller = DorflerController(
+                spec=item,
+                estimator_split=dataset.train,
+                dev_split=dataset.validation,
+                detector_h=detector_h,
+                detector_w=detector_w,
+                samples_per_ray=samples_per_ray,
+                materialize_points=materialize_ray_points,
+                chunk_rays=int(train_cfg.get("eval_ray_chunk", 65536)),
+                seed=training_seed,
+                byte_budget=global_byte_budget,
+                clone_state=_clone_sparse_state,
+                restore_state=_restore_sparse_state,
+            )
+            break
 
     def refinement_projection_split(spec: dict):
         split_name = str(
@@ -1937,6 +3265,13 @@ def run_training(config_path: str | Path) -> dict:
     if projection_gradient_weight > 0.0 and not projection_domain_model:
         raise ValueError("training.projection_gradient_loss is supported only by projection-domain models")
     adaptive_cfg = train_cfg.get("adaptive", {}) or {}
+    noise_cfg = train_cfg.get("noise_normalization", {}) or {}
+    noise_info = (
+        _estimate_projection_noise_variance(dataset.train, noise_cfg)
+        if bool(noise_cfg.get("enabled", False))
+        else {"enabled": False, "variance": 1.0, "frozen": True}
+    )
+    rate_lambda = float(adaptive_cfg.get("rate_lambda", train_cfg.get("rate_lambda", 0.0)))
     adaptive_enabled = projection_domain_model and bool(adaptive_cfg.get("enabled", True))
     adaptive_iterations: set[int] = set()
     if adaptive_enabled:
@@ -1969,18 +3304,27 @@ def run_training(config_path: str | Path) -> dict:
     growth_events = []
     adaptive_events = []
     evaluation_history = []
+    dynamic_stop_iteration = None
+    completed_iterations = 0
     start_time = time.perf_counter()
     for iteration in range(1, iterations + 1):
+        completed_iterations = iteration
         convergence_spec = None
         convergence_trigger_summary = {}
         if convergence_index < len(convergence_milestones):
             candidate = convergence_milestones[convergence_index]
+            overrides = {}
+            if dorfler_controller is not None and str(candidate.get("operation", "")).lower() in _DORFLER_OPERATIONS:
+                overrides = {k: v for k, v in dorfler_controller.window_overrides().items() if v is not None}
             min_iteration = int(candidate.get("min_iteration", 1))
-            min_after_previous = int(candidate.get("min_iterations_after_previous", 0))
+            min_after_previous = int(
+                overrides.get("min_iterations_after_previous", candidate.get("min_iterations_after_previous", 0))
+            )
+            plateau_window = int(overrides.get("window", candidate.get("window", 200)))
             max_iteration = candidate.get("max_iteration")
             window_summary = _convergence_window_summary(
                 convergence_values,
-                window=int(candidate.get("window", 200)),
+                window=plateau_window,
                 relative_improvement_threshold=float(candidate.get("relative_improvement", 0.002)),
                 max_relative_regression=float(candidate.get("max_relative_regression", 0.005)),
             )
@@ -1991,7 +3335,8 @@ def run_training(config_path: str | Path) -> dict:
             forced = max_iteration is not None and iteration >= int(max_iteration)
             if time_ready and (window_summary["ready"] or forced):
                 convergence_spec = candidate
-                convergence_index += 1
+                if not bool(candidate.get("repeat_until_stopped", False)):
+                    convergence_index += 1
                 convergence_last_trigger = iteration
                 convergence_values.clear()
                 convergence_trigger_summary = {
@@ -2016,15 +3361,22 @@ def run_training(config_path: str | Path) -> dict:
             adaptive_events.append(adaptive_event)
             print(json.dumps({"adaptive": adaptive_event}))
         elif convergence_spec is not None or iteration in milestones:
+            progress_checkpoint = out_dir / "checkpoint_latest.pt"
+            torch.save(
+                {"model": model.state_dict(), "config": config, "iteration": iteration - 1},
+                progress_checkpoint,
+            )
             growth_start_time = time.perf_counter()
             spec = convergence_spec if convergence_spec is not None else milestones[iteration]
+            operation = str(spec.get("operation", spec.get("action", "h_split"))).lower()
             milestone_levels = spec.get("levels")
-            if milestone_levels is None:
+            if milestone_levels is None and operation in {"global_h_split", "global_split", *_DORFLER_OPERATIONS}:
+                milestone_levels = []
+            elif milestone_levels is None:
                 milestone_levels = [int(spec["level"])]
             else:
                 milestone_levels = [int(value) for value in milestone_levels]
-            level = int(spec.get("level", milestone_levels[0]))
-            operation = str(spec.get("operation", spec.get("action", "h_split"))).lower()
+            level = int(spec.get("level", milestone_levels[0] if milestone_levels else 1))
             strategy = str(spec.get("strategy", refinement_defaults.get("strategy", "gradient"))).lower()
             active_fraction = float(spec.get("active_fraction", 1.0))
             halo = int(spec.get("halo", refinement_defaults.get("halo", 1)))
@@ -2074,6 +3426,8 @@ def run_training(config_path: str | Path) -> dict:
                     **hp_summary,
                 }
             elif projection_domain_model and operation in {"p", "p_refine", "p_elevate", "degree", "degree_elevate"}:
+                if getattr(model, "representation", "") == "latent_p1_octree":
+                    raise ValueError("latent_p1_octree first-paper scope forbids p-degree adaptation; use h_split/h_merge only.")
                 if strategy in {"gradient_rate_distortion", "gradient_rd", "gradient-rd"}:
                     target_degree = spec.get("target_degree", spec.get("degree", 1))
                     selection_split, selection_split_name = refinement_projection_split(spec)
@@ -2265,6 +3619,183 @@ def run_training(config_path: str | Path) -> dict:
                     "selection_split": selection_split_name,
                     **h_summary,
                 }
+            elif projection_domain_model and operation in {"h_merge", "merge"}:
+                active, merge_summary = _apply_h_merge_with_crossfit_gate(
+                    model,
+                    dataset=dataset,
+                    detector_h=detector_h,
+                    detector_w=detector_w,
+                    samples_per_ray=samples_per_ray,
+                    spec=spec,
+                    adaptive_cfg=adaptive_cfg,
+                    train_cfg=train_cfg,
+                    iteration=iteration,
+                    materialize_ray_points=materialize_ray_points,
+                    noise_variance=float(noise_info.get("variance", 1.0)),
+                )
+                growth_summary = {
+                    "operation": "h_merge",
+                    "level": level,
+                    **merge_summary,
+                }
+            elif projection_domain_model and operation in _DORFLER_OPERATIONS:
+                if dorfler_controller is None:
+                    raise RuntimeError("dorfler_h_split milestone without a controller.")
+                active, dorfler_summary = dorfler_controller.on_trigger(
+                    model,
+                    iteration=iteration,
+                    noise_variance=float(noise_info.get("variance", 0.0)) if noise_info.get("enabled") else 0.0,
+                    weight_kwargs=_projection_weight_kwargs(train_cfg, adaptive_cfg, iteration=iteration),
+                )
+                growth_summary = {
+                    "operation": "dorfler_h_split",
+                    "candidate_scope": "all_splittable_leaves",
+                    "projection_domain_seed": True,
+                    **dorfler_summary,
+                }
+            elif projection_domain_model and operation in {"global_h_split", "global_split"}:
+                if strategy not in {
+                    "residual",
+                    "projection_residual",
+                    "projected_residual",
+                    "heldout",
+                    "held_out",
+                }:
+                    raise ValueError("global_h_split currently supports residual cheap proposal only.")
+                model_levels = getattr(model, "level_shapes", None) or getattr(model, "level_resolutions", [])
+                max_split_level = int(spec.get("max_split_level", len(model_levels) - 1))
+                parent_levels_cfg = spec.get("parent_levels", spec.get("levels"))
+                if parent_levels_cfg is None:
+                    parent_levels = list(range(max(0, max_split_level)))
+                else:
+                    parent_levels = [int(value) for value in parent_levels_cfg]
+                max_parent_level = len(model_levels) - 2
+                parent_levels = [level_id for level_id in parent_levels if 0 <= level_id <= max_parent_level]
+                if not parent_levels:
+                    raise ValueError("global_h_split has no splittable parent levels.")
+                residual_split_name = str(
+                    spec.get(
+                        "selection_split",
+                        spec.get("residual_split", refinement_defaults.get("selection_split", refinement_defaults.get("residual_split", "train"))),
+                    )
+                ).lower()
+                residual_split, residual_split_name = refinement_projection_split(
+                    {**spec, "selection_split": residual_split_name}
+                )
+                score_weight_kwargs = _projection_weight_kwargs(
+                    train_cfg,
+                    adaptive_cfg,
+                    spec.get("projection_weighting") or refinement_defaults.get("projection_weighting"),
+                    iteration=iteration,
+                )
+                leaf_ids, leaf_scores, residual_summary = _bernstein_projection_residual_leaf_score(
+                    model,
+                    residual_split,
+                    level=parent_levels,
+                    detector_h=detector_h,
+                    detector_w=detector_w,
+                    samples_per_ray=samples_per_ray,
+                    ray_chunk=int(
+                        spec.get(
+                            "residual_ray_chunk",
+                            refinement_defaults.get("residual_ray_chunk", train_cfg.get("eval_ray_chunk", 4096)),
+                        )
+                    ),
+                    max_views=spec.get("residual_views", refinement_defaults.get("residual_views", 2)),
+                    max_rays_per_view=spec.get(
+                        "residual_rays_per_view",
+                        refinement_defaults.get("residual_rays_per_view", 65536),
+                    ),
+                    weight_kwargs=score_weight_kwargs,
+                    gradient_weight=float(spec.get("gradient_weight", refinement_defaults.get("gradient_weight", 0.0))),
+                    max_buffer_mb=float(
+                        spec.get("residual_max_buffer_mb", refinement_defaults.get("residual_max_buffer_mb", 512))
+                    ),
+                    score_mode=str(spec.get("residual_score_mode", "attributed_energy")),
+                )
+                pre_score_levels = model.leaf_levels[leaf_ids].detach().clone() if leaf_ids.numel() else model.leaf_levels[:0]
+                eligible_by_level = {
+                    str(level_id): int(torch.sum(pre_score_levels == level_id).item())
+                    for level_id in parent_levels
+                }
+                exposure_positive_by_level = {
+                    str(level_id): int(torch.sum((pre_score_levels == level_id) & torch.isfinite(leaf_scores) & (leaf_scores > 0)).item())
+                    for level_id in parent_levels
+                }
+                crossfit_cfg = spec.get("crossfit_acceptance") or {}
+                selected, selection_summary = _select_global_residual_h_candidates(
+                    model,
+                    leaf_ids,
+                    leaf_scores,
+                    max_candidates=int(spec.get("max_candidates", crossfit_cfg.get("max_candidates", 256))),
+                    reserve_leaf_count=int(spec.get("balance_reserve_leaves", 0)),
+                    min_mu_threshold=spec.get("min_mu_threshold", spec.get("material_threshold")),
+                )
+                if bool(crossfit_cfg.get("enabled", False)):
+                    active, acceptance_summary = _apply_h_split_with_crossfit_gate(
+                        model,
+                        selected,
+                        dataset=dataset,
+                        detector_h=detector_h,
+                        detector_w=detector_w,
+                        samples_per_ray=samples_per_ray,
+                        spec=spec,
+                        adaptive_cfg=adaptive_cfg,
+                        train_cfg=train_cfg,
+                        iteration=iteration,
+                        materialize_ray_points=materialize_ray_points,
+                        noise_variance=float(noise_info.get("variance", 1.0)),
+                    )
+                    balance_summary = (
+                        model.balance_2to1()
+                        if active > 0 and model.balance_2to1_enabled
+                        else {"enabled": False, "rounds": 0, "split_parents": 0, "complete": True}
+                    )
+                    new_leaf_count = int(active * 8)
+                else:
+                    change = model.split_leaves_batch(selected)
+                    balance_summary = (
+                        model.balance_2to1()
+                        if model.balance_2to1_enabled
+                        else {"enabled": False, "rounds": 0, "split_parents": 0, "complete": True}
+                    )
+                    active = int(selected.numel())
+                    acceptance_summary = {"crossfit_enabled": False}
+                    new_leaf_count = int(len(change.new_leaf_keys))
+                finite_scores = leaf_scores[torch.isfinite(leaf_scores)]
+                proposal_funnel = {
+                    "parent_levels": [int(value) for value in parent_levels],
+                    "level_leaf_total": int(residual_summary.get("residual_level_leaf_count", leaf_ids.numel())),
+                    "eligible": int(leaf_ids.numel()),
+                    "eligible_by_level": eligible_by_level,
+                    "residual_covered": int(residual_summary.get("residual_covered_count", 0)),
+                    "exposure_positive": int(residual_summary.get("residual_positive_count", 0)),
+                    "exposure_positive_by_level": exposure_positive_by_level,
+                    "shortlisted": int(selected.numel()),
+                    "shortlisted_by_level": selection_summary.get("global_shortlisted_by_level", {}),
+                    "fit_ray_valid": int(acceptance_summary.get("fit_ray_valid_count", 0)),
+                    "decision_ray_valid": int(acceptance_summary.get("decision_ray_valid_count", 0)),
+                    "tested": int(acceptance_summary.get("tested_count", 0)),
+                    "accepted": int(acceptance_summary.get("accepted_count", active)),
+                }
+                growth_summary = {
+                    "operation": "global_h_split",
+                    "candidate_scope": "all_splittable_leaves",
+                    "parent_levels": [int(value) for value in parent_levels],
+                    "max_split_level": max_split_level,
+                    "selected_parent_count": int(selected.numel()),
+                    "new_leaf_count": new_leaf_count,
+                    "score_mean": float(finite_scores.mean().detach().item()) if finite_scores.numel() else 0.0,
+                    "score_max": float(finite_scores.max().detach().item()) if finite_scores.numel() else 0.0,
+                    "projection_domain_seed": True,
+                    "selection_split": residual_split_name,
+                    "h_score_method": strategy,
+                    "balance_2to1": balance_summary,
+                    "proposal_funnel": proposal_funnel,
+                    **acceptance_summary,
+                    **selection_summary,
+                    **residual_summary,
+                }
             elif projection_domain_model:
                 if strategy in {
                     "residual",
@@ -2344,6 +3875,7 @@ def run_training(config_path: str | Path) -> dict:
                                     refinement_defaults.get("residual_max_buffer_mb", 512),
                                 )
                             ),
+                            score_mode=str(spec.get("residual_score_mode", "attributed_energy")),
                         )
                     selected, selection_summary = _select_residual_h_candidates(
                         model,
@@ -2356,24 +3888,65 @@ def run_training(config_path: str | Path) -> dict:
                         reserve_leaf_count=int(spec.get("balance_reserve_leaves", 0)),
                         min_mu_threshold=spec.get("min_mu_threshold", spec.get("material_threshold")),
                     )
-                    change = model.split_leaves_batch(selected)
-                    balance_summary = (
-                        model.balance_2to1()
-                        if model.balance_2to1_enabled
-                        else {"enabled": False, "rounds": 0, "split_parents": 0, "complete": True}
-                    )
-                    active = int(torch.sum(model.leaf_levels == level).item())
+                    crossfit_cfg = spec.get("crossfit_acceptance") or {}
+                    if bool(crossfit_cfg.get("enabled", False)):
+                        active, acceptance_summary = _apply_h_split_with_crossfit_gate(
+                            model,
+                            selected,
+                            dataset=dataset,
+                            detector_h=detector_h,
+                            detector_w=detector_w,
+                            samples_per_ray=samples_per_ray,
+                            spec=spec,
+                            adaptive_cfg=adaptive_cfg,
+                            train_cfg=train_cfg,
+                            iteration=iteration,
+                            materialize_ray_points=materialize_ray_points,
+                            noise_variance=float(noise_info.get("variance", 1.0)),
+                        )
+                        balance_summary = (
+                            model.balance_2to1()
+                            if active > 0 and model.balance_2to1_enabled
+                            else {"enabled": False, "rounds": 0, "split_parents": 0, "complete": True}
+                        )
+                        new_leaf_count = int(active * 8)
+                    else:
+                        change = model.split_leaves_batch(selected)
+                        balance_summary = (
+                            model.balance_2to1()
+                            if model.balance_2to1_enabled
+                            else {"enabled": False, "rounds": 0, "split_parents": 0, "complete": True}
+                        )
+                        active = int(torch.sum(model.leaf_levels == level).item())
+                        acceptance_summary = {"crossfit_enabled": False}
+                        new_leaf_count = int(len(change.new_leaf_keys))
                     finite_scores = leaf_scores[torch.isfinite(leaf_scores)]
+                    proposal_funnel = {
+                        "parent_level": int(parent_level),
+                        "level_leaf_total": int(residual_summary.get("residual_level_leaf_count", leaf_ids.numel())),
+                        "eligible": int(residual_summary.get("residual_level_leaf_count", leaf_ids.numel())),
+                        "residual_covered": int(residual_summary.get("residual_covered_count", 0)),
+                        "exposure_positive": int(residual_summary.get("residual_positive_count", 0)),
+                        "top_fraction": int(selection_summary.get("top_fraction_count", 0)),
+                        "proposal_threshold_union": int(selection_summary.get("threshold_union_count", 0)),
+                        "shortlisted": int(selected.numel()),
+                        "fit_ray_valid": int(acceptance_summary.get("fit_ray_valid_count", 0)),
+                        "decision_ray_valid": int(acceptance_summary.get("decision_ray_valid_count", 0)),
+                        "tested": int(acceptance_summary.get("tested_count", 0)),
+                        "accepted": int(acceptance_summary.get("accepted_count", active)),
+                    }
                     growth_summary = {
                         "operation": "h_split",
                         "selected_parent_count": int(selected.numel()),
-                        "new_leaf_count": int(len(change.new_leaf_keys)),
+                        "new_leaf_count": new_leaf_count,
                         "score_mean": float(finite_scores.mean().detach().item()) if finite_scores.numel() else 0.0,
                         "score_max": float(finite_scores.max().detach().item()) if finite_scores.numel() else 0.0,
                         "projection_domain_seed": True,
                         "selection_split": residual_split_name,
                         "h_score_method": strategy,
                         "balance_2to1": balance_summary,
+                        "proposal_funnel": proposal_funnel,
+                        **acceptance_summary,
                         **selection_summary,
                         **residual_summary,
                     }
@@ -2438,16 +4011,81 @@ def run_training(config_path: str | Path) -> dict:
                 **convergence_trigger_summary,
                 **growth_summary,
             }
+            if "structural_round_index" in spec:
+                event["structural_round_index"] = int(spec["structural_round_index"])
+                event["structural_rounds"] = int(spec.get("structural_rounds", event["structural_round_index"]))
             if event["operation"] == "h_jump_rate_distortion":
                 # This selector scores every eligible leaf in one global queue.
                 # Reporting a default active_fraction=1.0 is misleading: it is
                 # candidate-pool coverage, not a forced selection fraction.
                 event["candidate_scope"] = "all_eligible"
                 event["strategy"] = "global_volume_scaled_face_jump_per_byte"
+            elif event["operation"] in {"global_h_split", "dorfler_h_split"}:
+                event["candidate_scope"] = "all_splittable_leaves"
             else:
                 event["active_fraction"] = active_fraction
+            if (
+                convergence_spec is not None
+                and bool(spec.get("repeat_until_stopped", False))
+                and event["operation"] == "dorfler_h_split"
+            ):
+                event["structural_round_index"] = int(event.get("dorfler_round", 0))
+                event["dynamic_refinement"] = {
+                    "round": int(event.get("dorfler_round", 0)),
+                    "stop": bool(event.get("stop", False)),
+                    "stop_reasons": list(event.get("stop_reasons", [])),
+                }
+                if event.get("stop", False):
+                    convergence_index += 1
+                    dynamic_stop_iteration = min(
+                        iterations,
+                        iteration + max(0, int(spec.get("final_finetune_iterations", 1000))),
+                    )
+            elif convergence_spec is not None and bool(spec.get("repeat_until_stopped", False)):
+                round_index = 1 + sum("dynamic_refinement" in previous for previous in growth_events)
+                evaluations = event.get("evaluations", [])
+                accepted_gains = [
+                    float(value.get("decision_gain_noise_normalized_rss", 0.0))
+                    for value in evaluations
+                    if bool(value.get("accepted", False))
+                ]
+                added_bytes = [
+                    int(value.get("rate_delta_bytes", 0))
+                    for value in evaluations
+                    if int(value.get("rate_delta_bytes", 0)) > 0
+                ]
+                current_bytes = _compact_raw_payload_bytes(
+                    model,
+                    quantization=str(
+                        ((spec.get("crossfit_acceptance") or {}).get("compact_quantization"))
+                        or (train_cfg.get("compact_quantization") or "float16")
+                    ),
+                )
+                dynamic_status = _dynamic_refinement_status(
+                    tested=int(event.get("tested_count", 0)),
+                    accepted_gains=accepted_gains,
+                    round_index=round_index,
+                    min_rounds=int(spec.get("min_rounds", 1)),
+                    max_rounds=int(spec.get("max_rounds", 32)),
+                    stop_acceptance_ratio=float(spec.get("stop_acceptance_ratio", 0.03)),
+                    current_bytes=current_bytes,
+                    byte_budget=global_byte_budget,
+                    min_added_bytes=min(added_bytes, default=1),
+                )
+                event["structural_round_index"] = round_index
+                event["dynamic_refinement"] = dynamic_status
+                if dynamic_status["stop"]:
+                    convergence_index += 1
+                    dynamic_stop_iteration = min(
+                        iterations,
+                        iteration + max(0, int(spec.get("final_finetune_iterations", 1000))),
+                    )
             growth_events.append(event)
             print(json.dumps({"grow": event}))
+            torch.save(
+                {"model": model.state_dict(), "config": config, "iteration": iteration},
+                progress_checkpoint,
+            )
 
         rb = random_training_rays(
             dataset.train,
@@ -2535,21 +4173,46 @@ def run_training(config_path: str | Path) -> dict:
         optimizer.step()
 
         projection_loss_value = float(loss_proj.detach().item())
-        ema_alpha = 2.0 / float(max(1, convergence_ema_span) + 1)
-        convergence_ema = (
-            projection_loss_value
-            if convergence_ema is None
-            else (1.0 - ema_alpha) * convergence_ema + ema_alpha * projection_loss_value
+        plateau_loss_value = projection_loss_value
+        fixed_decision_measured = (
+            fixed_decision_set is not None
+            and (iteration == 1 or iteration % fixed_decision_interval == 0)
         )
-        convergence_values.append(float(convergence_ema))
+        if fixed_decision_measured:
+            fixed_decision_last = fixed_rss(model, fixed_decision_set)
+        if fixed_decision_use_for_plateau:
+            if fixed_decision_last is None:
+                raise RuntimeError("fixed decision rays did not produce a plateau measurement")
+            plateau_loss_value = float(fixed_decision_last["mse"])
+        if not fixed_decision_use_for_plateau or fixed_decision_measured:
+            ema_alpha = 2.0 / float(max(1, convergence_ema_span) + 1)
+            convergence_ema = (
+                plateau_loss_value
+                if convergence_ema is None
+                else (1.0 - ema_alpha) * convergence_ema + ema_alpha * plateau_loss_value
+            )
+            convergence_values.append(float(convergence_ema))
 
         if iteration == 1 or iteration % log_every == 0:
             stats = model.stats()
+            rate_bytes = _compact_raw_payload_bytes(
+                model,
+                quantization=str((config.get("export", {}) or {}).get("compact_octree", {}).get("quantization", "float16")),
+            )
+            distortion_value = projection_loss_value / max(float(noise_info.get("variance", 1.0)), 1.0e-12)
             row = {
                 "iteration": iteration,
                 "loss": float(loss.detach().item()),
                 "projection_loss": float(loss_proj.detach().item()),
                 "projection_mse": float(projection_mse.detach().item()),
+                "noise_normalized_distortion": float(distortion_value),
+                "rate_bytes": int(rate_bytes),
+                "plateau_loss": float(plateau_loss_value),
+                "plateau_source": (
+                    "fixed_decision_rays"
+                    if fixed_decision_use_for_plateau
+                    else "stochastic_training_batch"
+                ),
                 "projection_gradient_loss": float(loss_projection_gradient.detach().item()),
                 "projection_gradient_weight": effective_projection_gradient_weight,
                 "volume_sample_loss": float(loss_volume.detach().item()),
@@ -2565,6 +4228,21 @@ def run_training(config_path: str | Path) -> dict:
                 "l3_active": getattr(stats, "l3_active", 0),
                 "active_by_level": list(getattr(stats, "active_by_level", (stats.l0_active, stats.l1_active, stats.l2_active))),
             }
+            if global_byte_budget is not None:
+                row.update(
+                    {
+                        "constrained_accuracy_objective": float(distortion_value),
+                        "byte_budget": global_byte_budget,
+                        "within_byte_budget": rate_bytes <= global_byte_budget,
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "rate_lambda": float(rate_lambda),
+                        "rate_distortion_objective": float(distortion_value + rate_lambda * rate_bytes),
+                    }
+                )
             print(json.dumps(row))
             history.append(row)
 
@@ -2591,7 +4269,56 @@ def run_training(config_path: str | Path) -> dict:
             evaluation_history.append({"iteration": iteration, **metric})
             print(json.dumps({"iteration": iteration, f"{intermediate_evaluation_name}_projection": metric}))
 
+        if dynamic_stop_iteration is not None and iteration >= dynamic_stop_iteration:
+            break
+
     elapsed = time.perf_counter() - start_time
+    trained_model = model
+    codec_summary = None
+    export_codec_cfg = ((config.get("export", {}) or {}).get("codec")) or {}
+    if projection_domain_model and export_codec_cfg:
+        codec_type = str(export_codec_cfg.get("type", "p0")).lower()
+        codec_weight_kwargs = _projection_weight_kwargs(train_cfg, adaptive_cfg, iteration=completed_iterations)
+
+        def codec_test_metric(candidate):
+            return projection_metrics(
+                render_split(
+                    candidate,
+                    dataset.test,
+                    detector_h=detector_h,
+                    detector_w=detector_w,
+                    samples_per_ray=samples_per_ray,
+                    ray_chunk=int(train_cfg.get("eval_ray_chunk", 4096)),
+                ),
+                dataset.test.projections,
+            )
+
+        pre_codec = codec_test_metric(model)
+        codec_summary = {"type": codec_type, "projection_test_pre_codec": pre_codec}
+        if codec_type == "latent_p1":
+            deployed = LatentP1Octree.from_bernstein(model, int(export_codec_cfg.get("latent_dim", 4)))
+            codec_summary["projection_test_after_pca"] = codec_test_metric(deployed)
+            codec_summary["finetune"] = finetune_model(
+                deployed,
+                dataset.train,
+                steps=int(export_codec_cfg.get("finetune_iterations", 2000)),
+                lr=float(export_codec_cfg.get("finetune_lr", 0.003)),
+                batch_rays=batch_rays,
+                detector_h=detector_h,
+                detector_w=detector_w,
+                samples_per_ray=samples_per_ray,
+                weight_kwargs=codec_weight_kwargs,
+                materialize_points=materialize_ray_points,
+            )
+        elif codec_type in {"p0", "p1"}:
+            deployed = model
+        else:
+            raise ValueError(f"Unknown export.codec.type {codec_type!r}.")
+        quantize_roundtrip_(deployed, export_codec_cfg)
+        codec_summary["projection_test_deployed"] = codec_test_metric(deployed)
+        codec_summary["quantization"] = str(export_codec_cfg.get("quantization", "float16"))
+        codec_summary["quantization_applied_in_eval"] = True
+        model = deployed
     stats = model.stats()
     metrics_cfg = config.get("metrics", {}) or {}
     if bool(metrics_cfg.get("compute_projection_metrics", True)):
@@ -2640,7 +4367,18 @@ def run_training(config_path: str | Path) -> dict:
             "reason": "disabled by metrics.compute_boundary_metrics",
         }
     checkpoint_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": config}, checkpoint_path)
+    final_checkpoint = {
+        "model": trained_model.state_dict(),
+        "config": config,
+        "iteration": completed_iterations,
+    }
+    torch.save(final_checkpoint, checkpoint_path)
+    torch.save(final_checkpoint, out_dir / "checkpoint_latest.pt")
+    if model is not trained_model:
+        torch.save(
+            {"model": model.state_dict(), "config": config, "iteration": completed_iterations},
+            out_dir / "checkpoint_codec.pt",
+        )
     export_summary = {}
     if projection_domain_model:
         export_cfg = config.get("export", {}) or {}
@@ -2656,9 +4394,10 @@ def run_training(config_path: str | Path) -> dict:
             export_summary["mact"] = mact_summary.__dict__
         compact_cfg = export_cfg.get("compact_octree", {}) or {}
         if bool(compact_cfg.get("enabled", True)):
+            compact_name = str(compact_cfg.get("artifact_name", "compact_octree.npz"))
             compact_summary = export_compact_octree_artifact(
                 model,
-                out_dir / "compact_octree.npz",
+                out_dir / compact_name,
                 quantization=str(compact_cfg.get("quantization", "uint16")),
                 topology=str(compact_cfg.get("topology", "explicit")),
                 checkpoint_path=checkpoint_path,
@@ -2677,10 +4416,23 @@ def run_training(config_path: str | Path) -> dict:
                 uncertainty_rays=int(surface_cfg.get("uncertainty_rays", 64)),
                 uncertainty_surface_points=int(surface_cfg.get("uncertainty_surface_points", 1024)),
             )
+    export_summary["visual_slice"] = _export_center_slice_png(
+        model,
+        out_dir / "center_slice.png",
+        dataset.volume_shape,
+    )
+    export_summary["visual_slice_fullres"] = _export_center_slice_png(
+        model,
+        out_dir / "center_slice_fullres.png",
+        _finest_model_shape(model, dataset.volume_shape),
+    )
     total_elapsed = time.perf_counter() - run_start_time
     report = {
         "config": str(Path(config_path).resolve()),
         "training_seed": training_seed,
+        "configured_iterations": iterations,
+        "completed_iterations": completed_iterations,
+        "dynamic_stop_iteration": dynamic_stop_iteration,
         "dataset": str(dataset.root),
         "evaluation_protocol": {
             "training_views": int(dataset.train.angles.numel()),
@@ -2694,6 +4446,19 @@ def run_training(config_path: str | Path) -> dict:
             ),
             "test_role": "final evaluation only" if intermediate_evaluation_split is not dataset.test else "legacy intermediate and final evaluation",
         },
+        "dorfler": (
+            {
+                "rounds": dorfler_controller.round_index,
+                "stopped": dorfler_controller.stopped,
+                "stop_reasons": list(dorfler_controller.stop_reasons),
+                "rollback_enabled": dorfler_controller.rollback_enabled,
+                "theta": dorfler_controller.theta,
+                "dev_role": "rollback verdict and diagnostics only",
+            }
+            if dorfler_controller is not None
+            else None
+        ),
+        "codec": codec_summary,
         "elapsed_sec": elapsed,
         "total_elapsed_sec": total_elapsed,
         "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,
@@ -2708,6 +4473,23 @@ def run_training(config_path: str | Path) -> dict:
             "mode": getattr(model, "integration_mode", "native_or_sampled"),
         },
         "training_objective": {
+            "global_objective": (
+                {
+                    "form": "minimize D(y, A_T[D_phi(Z)]) subject to compact_bytes(T,Z,phi) <= B_max",
+                    "byte_budget": global_byte_budget,
+                    "rate_bytes_source": "compact raw payload byte estimate",
+                    "local_split_score": "held-out projection accuracy gain",
+                    "noise_normalized_distortion": bool(noise_info.get("enabled", False)),
+                }
+                if global_byte_budget is not None
+                else {
+                    "form": "D(y, A_T[D_phi(Z)]) + lambda * compact_bytes(T,Z,phi)",
+                    "rate_lambda": float(rate_lambda),
+                    "rate_bytes_source": "compact raw payload byte estimate",
+                    "noise_normalized_distortion": bool(noise_info.get("enabled", False)),
+                }
+            ),
+            "noise_normalization": noise_info,
             "projection_loss": "weighted_least_squares" if projection_domain_model else "mse",
             "projection_gradient_loss": {
                 "enabled": projection_gradient_weight > 0.0,
@@ -2760,6 +4542,26 @@ def run_training(config_path: str | Path) -> dict:
                 "note": "Coefficient-domain face continuity prior; no dense volume is decoded.",
             },
             "dense_volume_loaded_during_training": not projection_domain_model,
+            "fixed_decision_rays": {
+                "enabled": fixed_decision_enabled,
+                "use_for_plateau": fixed_decision_use_for_plateau,
+                "ray_count": (
+                    int(fixed_decision_set.observation_count)
+                    if fixed_decision_set is not None
+                    else 0
+                ),
+                "interval": fixed_decision_interval,
+                "last_mse": (
+                    float(fixed_decision_last["mse"])
+                    if fixed_decision_last is not None
+                    else None
+                ),
+                "selection_split": "train",
+                "note": (
+                    "Frozen training rays are used only as a stable plateau ruler; "
+                    "optimization still uses random rays."
+                ),
+            },
         },
         "history": history,
         "evaluation_history": evaluation_history,

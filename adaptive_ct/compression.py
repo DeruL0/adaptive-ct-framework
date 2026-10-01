@@ -416,9 +416,53 @@ def export_compact_octree_artifact(
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    coefficients = model.coefficients().detach().float().cpu().numpy()
     normalized_quantization = str(quantization).lower()
     topology_mode = str(topology).lower()
+    if getattr(model, "representation", "") == "latent_p1_octree":
+        if topology_mode not in {"packed_hierarchy", "packed", "hierarchy", "auto"}:
+            raise ValueError("Latent P1 compact export requires topology='packed_hierarchy'.")
+        if normalized_quantization not in {"float16", "float32"}:
+            raise ValueError("Latent P1 compact export supports only float16 or float32 quantization.")
+        float_dtype = np.float16 if normalized_quantization == "float16" else np.float32
+        arrays: dict[str, np.ndarray] = {
+            **_build_packed_hierarchy_topology(model),
+            **_level_shape_arrays(model),
+            "max_degree": np.asarray(model.max_degree, dtype=np.uint8),
+            "attenuation_shift": np.asarray([float(model.attenuation_shift)], dtype=np.float32),
+            "leaf_latents": model.leaf_latents.detach().cpu().numpy().astype(float_dtype),
+            "decoder_weight": model.decoder.weight.detach().cpu().numpy().astype(float_dtype),
+            "decoder_bias": model.decoder.bias.detach().cpu().numpy().astype(float_dtype),
+        }
+        metadata: dict[str, str | float | int] = {
+            "schema": "compact_latent_p1_octree_packed_v1",
+            "representation": "latent_p1_octree",
+            "topology": "packed_hierarchy",
+            "quantization": normalized_quantization,
+            "latent_dim": int(model.latent_dim),
+            "decoder": "linear",
+        }
+        arrays["metadata_json"] = np.asarray([json.dumps(metadata, sort_keys=True)], dtype="<U1024")
+        np.savez_compressed(output_path, **arrays)
+        raw_payload_bytes = int(sum(value.nbytes for value in arrays.values() if hasattr(value, "nbytes")))
+        file_bytes = int(output_path.stat().st_size)
+        stats = model.stats()
+        checkpoint_bytes = (
+            int(Path(checkpoint_path).stat().st_size)
+            if checkpoint_path is not None and Path(checkpoint_path).exists()
+            else None
+        )
+        return CompactOctreeSummary(
+            leaf_count=int(model.leaf_levels.shape[0]),
+            coefficient_count=int(model.leaf_levels.shape[0]) * 8,
+            quantization=normalized_quantization,
+            raw_payload_bytes=raw_payload_bytes,
+            file_bytes=file_bytes,
+            checkpoint_bytes=checkpoint_bytes,
+            model_bytes=int(stats.model_bytes),
+            file_ratio_vs_model_bytes=float(file_bytes / max(int(stats.model_bytes), 1)),
+        )
+
+    coefficients = model.coefficients().detach().float().cpu().numpy()
     if topology_mode in {"packed_hierarchy", "packed", "hierarchy", "auto"}:
         arrays: dict[str, np.ndarray] = {
             **_build_packed_hierarchy_topology(model),
@@ -559,6 +603,7 @@ def load_compact_octree_state_dict(
             "compact_bernstein_octree_v1",
             "compact_bernstein_octree_splitmask_v2",
             "compact_bernstein_octree_packed_v3",
+            "compact_latent_p1_octree_packed_v1",
         }:
             raise ValueError(f"Unsupported compact octree schema: {metadata.get('schema')!r}")
 
@@ -574,6 +619,22 @@ def load_compact_octree_state_dict(
         if "attenuation_shift" in payload:
             model.attenuation_shift = float(payload["attenuation_shift"][0])
 
+        if schema == "compact_latent_p1_octree_packed_v1":
+            leaf_levels_np, leaf_coords_np, leaf_degrees_np, coefficient_offsets_np = (
+                _reconstruct_packed_hierarchy_topology(payload)
+            )
+            leaf_count = int(leaf_levels_np.shape[0])
+            state_dict = {
+                "leaf_latents": torch.from_numpy(payload["leaf_latents"].astype(np.float32)).to(device=target_device).contiguous(),
+                "decoder.weight": torch.from_numpy(payload["decoder_weight"].astype(np.float32)).to(device=target_device).contiguous(),
+                "decoder.bias": torch.from_numpy(payload["decoder_bias"].astype(np.float32)).to(device=target_device).contiguous(),
+                "leaf_levels": torch.from_numpy(leaf_levels_np).to(device=target_device).contiguous(),
+                "leaf_coords": torch.from_numpy(leaf_coords_np).to(device=target_device).contiguous(),
+                "leaf_degrees": torch.from_numpy(leaf_degrees_np).to(device=target_device).contiguous(),
+                "coefficient_offsets": torch.from_numpy(coefficient_offsets_np).to(device=target_device).contiguous(),
+                "coefficient_leaf_ids": torch.arange(leaf_count, dtype=torch.long, device=target_device).repeat_interleave(8),
+            }
+            return state_dict, metadata
         if schema == "compact_bernstein_octree_packed_v3":
             leaf_levels_np, leaf_coords_np, leaf_degrees_np, coefficient_offsets_np = (
                 _reconstruct_packed_hierarchy_topology(payload)

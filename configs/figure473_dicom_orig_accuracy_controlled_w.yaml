@@ -1,0 +1,14 @@
+# Matched control for the final WPL3 run: identical seed, weighting,
+# continuity and packed four-level implementation, with both late p and L3 off.
+extends: figure473_dicom_orig_accuracy_wpl3_blend50_l3_10.yaml
+
+training:
+  progressive:
+    milestones:
+      9000:
+        enabled: false
+      10500:
+        enabled: false
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_controlled_w

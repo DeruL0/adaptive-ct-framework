@@ -1,0 +1,21 @@
+# Projection Sobolev fidelity plus conditional high-gradient magnitude
+# calibration. The scalar WLS remains the global intensity anchor.
+extends: figure473_dicom_orig_accuracy_controlled_wp.yaml
+
+training:
+  projection_gradient_loss:
+    weight: 0.25
+    start_iteration: 6001
+    ramp_steps: 1000
+    edge_rays: 2048
+    strides: [1, 2, 4]
+    uniform_fraction: 0.5
+    candidate_multiplier: 8
+    edge_weight_power: 0.5
+    edge_min_weight: 0.25
+    edge_max_weight: 4.0
+    magnitude_weight: 1.0
+    magnitude_quantile: 0.75
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_wp_sobolev_mag025

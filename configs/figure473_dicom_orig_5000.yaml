@@ -1,0 +1,49 @@
+device: cuda
+
+dataset:
+  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_convergence
+
+geometry:
+  samples_per_ray: 1024
+
+model:
+  representation: dynamic_leaf_voxel
+  levels: [64, 128, 256]
+  init_std: 0.001
+  attenuation_shift: -3.0
+  cuda_integrator: true
+
+training:
+  iterations: 5000
+  batch_rays: 8192
+  lr: 0.02
+  tv_weight: 0.0
+  log_every: 100
+  eval_every: 500
+  eval_test_views: 2
+  eval_ray_chunk: 131072
+  compute_eval: true
+  progressive:
+    refinement:
+      strategy: gradient
+      halo: 1
+    milestones:
+      80:
+        level: 1
+        active_fraction: 0.001
+        strategy: gradient
+        halo: 1
+      220:
+        level: 2
+        active_fraction: 0.0004
+        strategy: gradient
+        halo: 0
+
+metrics:
+  material_threshold: 0.10
+  compute_projection_metrics: true
+  compute_volume_metrics: false
+  compute_boundary_metrics: false
+
+output:
+  dir: output\figure473_dicom_orig_5000

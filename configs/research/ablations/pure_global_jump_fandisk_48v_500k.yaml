@@ -1,0 +1,7 @@
+extends: pure_global_jump_fandisk_48v.yaml
+
+model:
+  max_leaf_count: 500000
+
+output:
+  dir: output\research_fandisk_pure_global_jump_48v_500k

@@ -1,0 +1,132 @@
+# Stage 7: projection-driven Dorfler h-refinement, trilinear (P1) Bernstein octree.
+#
+# Protocol: train 240 / dev 16 (rollback verdict only) / 4 lockbox test views.
+# No FDK, no reference volume, no GT: topology and coefficients come from the
+# projections alone.  The byte budget is counted in the deployed codec
+# (latent d=4 + shared linear decoder, float16).
+research:
+  scope: stage7_dorfler
+
+device: cuda
+
+dataset:
+  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_256v_science
+  dev_views: 16
+  dev_seed: 20260702
+
+geometry:
+  samples_per_ray: 1024
+
+model:
+  representation: bernstein_octree
+  levels: [48, 96, 192, 384, 768]
+  topology: packed_hierarchy
+  balance_2to1: false
+  max_leaf_count: 6000000
+  max_degree: [1, 1, 1]
+  initial_leaf_degree: [1, 1, 1]
+  integration_mode: exact
+  cuda_integrator: true
+  initialization: projection_mean
+  init_std: 0.001
+  attenuation_shift: -3.0
+
+training:
+  seed: 20260702
+  iterations: 60000
+  batch_rays: 65536
+  lr: 0.015
+  tv_weight: 0.0
+  log_every: 200
+  eval_every: 10000
+  eval_test_views: 4
+  eval_ray_chunk: 65536
+  compute_eval: true
+  allow_test_during_training: false
+
+  projection_weighting_schedule:
+    1:
+      mode: uniform
+
+  noise_normalization:
+    enabled: true
+    air_quantile: 0.10
+    min_variance: 1.0e-8
+
+  coefficient_continuity:
+    weight: 0.0
+
+  projection_gradient_loss:
+    weight: 0.0
+
+  volume_loss:
+    weight: 0.0
+
+  fixed_decision_rays:
+    enabled: true
+    use_for_plateau: true
+    ray_count: 65536
+    interval: 50
+    seed: 20260706
+    chunk_rays: 65536
+
+  progressive:
+    milestones: {}
+    convergence_milestones:
+      - enabled: true
+        operation: dorfler_h_split
+        repeat_until_stopped: true
+        min_iteration: 1000
+        min_iterations_after_previous: 400
+        window: 8
+        ema_span: 4
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+        early_rounds: 4
+        early_window: 4
+        early_min_after_previous: 200
+        final_finetune_iterations: 2000
+        theta: 0.5
+        estimator_rays: 2097152
+        estimator_max_buffer_mb: 512
+        min_footprint_px: 1.0
+        # 0 = indicator is raw residual energy. The air-quantile sigma^2 (~1.7e-4) exceeds the
+        # actual residual MSE (~4e-5..9e-5), so subtracting it would only truncate the tail.
+        noise_variance_scale: 0.0
+        rollback: true
+        max_halvings: 3
+        dev_ray_count: 1048576
+        diagnostic_rays: 262144
+        byte_budget: 8388608
+        codec:
+          type: latent_p1
+          latent_dim: 4
+          quantization: float16
+
+  adaptive:
+    enabled: false
+
+metrics:
+  compute_projection_metrics: true
+  compute_volume_metrics: false
+  compute_boundary_metrics: false
+
+export:
+  codec:
+    type: latent_p1
+    latent_dim: 4
+    quantization: float16
+    finetune_iterations: 2000
+    finetune_lr: 0.003
+  compact_octree:
+    enabled: true
+    artifact_name: ANVO.npz
+    quantization: float16
+    topology: packed_hierarchy
+  mact:
+    enabled: false
+  surface:
+    enabled: false
+
+output:
+  dir: output\stage7_dorfler_p1_256v

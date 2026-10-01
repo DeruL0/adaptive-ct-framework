@@ -1,0 +1,37 @@
+extends: figure473_dicom_orig_accuracy_wp.yaml
+
+model:
+  levels: [96, 192, 384, 768]
+
+training:
+  progressive:
+    milestones:
+      5000:
+        enabled: false
+      5600:
+        enabled: false
+      7600:
+        enabled: false
+      8200:
+        enabled: false
+      9000:
+        level: 3
+        active_fraction: 0.08
+        max_fraction: 0.10
+        threshold_statistic: q95
+        threshold_multiplier: 0.5
+        balance_reserve_leaves: 300000
+        operation: h_split
+        strategy: projection_residual
+      10500:
+        levels: [2, 3]
+        active_fraction: 0.02
+        operation: p_elevate
+        strategy: gradient_rate_distortion
+        candidate_fraction: 0.08
+        target_degree: [1, 1, 1]
+        gradient_batches: 8
+        max_added_coefficients: 1000000
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_wpl3

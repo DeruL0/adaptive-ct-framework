@@ -1,0 +1,20 @@
+extends: figure473_128v_pure_adaptive.yaml
+
+# 96 independent parallel-beam training angles over [0, pi), at the original
+# 473x1024x1024 volume and 1024x1024 detector resolution.
+dataset:
+  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_96v_science
+
+training:
+  eval_test_views: 4
+
+output:
+  dir: output\industrial_detail_v5_96v_20mb\reference_h
+
+export:
+  compact_octree:
+    enabled: false
+  mact:
+    enabled: false
+  surface:
+    enabled: false

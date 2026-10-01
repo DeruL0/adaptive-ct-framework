@@ -1,0 +1,131 @@
+device: cuda
+
+dataset:
+  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_convergence
+
+geometry:
+  samples_per_ray: 1024
+
+model:
+  representation: bernstein_octree
+  levels: [96, 192, 384]
+  max_degree: [3, 3, 3]
+  integration_mode: exact
+  cuda_integrator: true
+  initialization: projection_mean
+  init_std: 0.001
+  attenuation_shift: -3.0
+
+training:
+  iterations: 5000
+  batch_rays: 8192
+  lr: 0.015
+  tv_weight: 0.0
+  log_every: 100
+  eval_every: 1000
+  eval_test_views: 2
+  eval_ray_chunk: 65536
+  compute_eval: true
+  coefficient_continuity:
+    weight: 0.0
+    start_iteration: 300
+    max_pairs: 262144
+    huber_delta: 0.01
+  progressive:
+    refinement:
+      strategy: coefficient
+      halo: 0
+      residual_views: 2
+      residual_rays_per_view: 65536
+      residual_ray_chunk: 65536
+      validation_views: 2
+      validation_rays_per_view: 32768
+      validation_ray_chunk: 32768
+    milestones:
+      80:
+        level: 1
+        active_fraction: 0.03
+        operation: h_split
+        strategy: coefficient
+        halo: 0
+      180:
+        level: 2
+        active_fraction: 0.35
+        operation: h_split
+        strategy: coefficient
+        halo: 0
+      260:
+        level: 2
+        active_fraction: 0.05
+        operation: p_elevate
+        strategy: projection_residual
+        residual_split: train
+        residual_views: 2
+        residual_rays_per_view: 65536
+        residual_ray_chunk: 65536
+        target_degree: [1, 1, 1]
+        halo: 0
+        acceptance: &heldout_p_gate
+          enabled: true
+          validation_source: train_holdout
+          validation_fraction: 0.25
+          validation_views: 2
+          validation_rays_per_view: 32768
+          validation_ray_chunk: 32768
+          group_leaf_count: 8192
+          tune_steps: 24
+          tune_batch_rays: 8192
+          tune_learning_rate: 0.005
+          min_gain: 0.0
+          min_relative_gain: 1.0e-4
+          rate_lambda: 0.0
+      900:
+        level: 2
+        active_fraction: 0.05
+        operation: p_elevate
+        strategy: projection_residual
+        residual_split: train
+        residual_views: 2
+        residual_rays_per_view: 65536
+        residual_ray_chunk: 65536
+        target_degree: [1, 1, 1]
+        halo: 0
+        acceptance: *heldout_p_gate
+      1500:
+        level: 2
+        active_fraction: 0.05
+        operation: p_elevate
+        strategy: projection_residual
+        residual_split: train
+        residual_views: 2
+        residual_rays_per_view: 65536
+        residual_ray_chunk: 65536
+        target_degree: [1, 1, 1]
+        halo: 0
+        acceptance: *heldout_p_gate
+  adaptive:
+    enabled: false
+    weight_epsilon: 1.0e-4
+
+metrics:
+  material_threshold: 0.10
+  compute_projection_metrics: true
+  compute_volume_metrics: false
+  compute_boundary_metrics: false
+
+output:
+  dir: output\figure473_dicom_orig_rd_cvf_auto5000_h384_pmulti_heldout_nocont
+
+export:
+  compact_octree:
+    enabled: true
+    quantization: uint16
+  mact:
+    enabled: true
+    material_clusters: 4
+    variance_retained: 0.99
+  surface:
+    enabled: false
+    threshold: 0.10
+    uncertainty_rays: 64
+    uncertainty_surface_points: 1024

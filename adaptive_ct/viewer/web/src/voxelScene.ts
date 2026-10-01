@@ -1,14 +1,22 @@
 import {
   AmbientLight,
+  BackSide,
   BoxGeometry,
   Color,
+  Data3DTexture,
   DirectionalLight,
+  GLSL3,
   InstancedBufferAttribute,
   InstancedBufferGeometry,
+  InstancedInterleavedBuffer,
+  InterleavedBufferAttribute,
+  LinearFilter,
   Mesh,
   PerspectiveCamera,
+  RedFormat,
   Scene,
   ShaderMaterial,
+  UnsignedByteType,
   Vector3,
   WebGLRenderer,
 } from "three";
@@ -132,6 +140,60 @@ const FRAGMENT_SHADER = `
   }
 `;
 
+const XRAY_VERTEX_SHADER = `
+  out vec3 vPosition;
+
+  void main() {
+    vPosition = position;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const XRAY_FRAGMENT_SHADER = `
+  precision highp float;
+  precision highp sampler3D;
+
+  uniform sampler3D uVolume;
+  uniform float uDensity;
+  uniform float uSteps;
+  uniform float uCutoff;
+  in vec3 vPosition;
+  out vec4 outColor;
+
+  vec2 intersectBox(vec3 origin, vec3 direction) {
+    vec3 inverseDirection = 1.0 / direction;
+    vec3 nearPlane = (-vec3(1.0) - origin) * inverseDirection;
+    vec3 farPlane = ( vec3(1.0) - origin) * inverseDirection;
+    vec3 lo = min(nearPlane, farPlane);
+    vec3 hi = max(nearPlane, farPlane);
+    return vec2(max(max(lo.x, lo.y), lo.z), min(min(hi.x, hi.y), hi.z));
+  }
+
+  void main() {
+    vec3 rayDirection = normalize(vPosition - cameraPosition);
+    vec2 bounds = intersectBox(cameraPosition, rayDirection);
+    float start = max(bounds.x, 0.0);
+    float distance = max(bounds.y - start, 0.0);
+    if (distance <= 0.0) discard;
+
+    float stepLength = distance / uSteps;
+    vec3 point = cameraPosition + rayDirection * (start + 0.5 * stepLength);
+    float integral = 0.0;
+    for (int sampleIndex = 0; sampleIndex < 64; sampleIndex += 1) {
+      if (float(sampleIndex) >= uSteps) break;
+      // Scene coordinates are (CT x, CT z, CT y).
+      vec3 texturePoint = vec3(point.x, point.z, point.y) * 0.5 + 0.5;
+      float value = texture(uVolume, texturePoint).r;
+      value = max(value - uCutoff, 0.0) / max(1.0 - uCutoff, 1e-5);
+      integral += value * stepLength;
+      point += rayDirection * stepLength;
+    }
+    float intensity = 1.0 - exp(-uDensity * integral);
+    vec3 color = mix(vec3(0.02, 0.04, 0.06), vec3(0.88, 0.96, 1.0), intensity);
+    outColor = vec4(color, 1.0);
+  }
+`;
+
 /**
  * GPU-driven adaptive voxel renderer.
  *
@@ -156,13 +218,20 @@ export class VoxelScene {
   private dirty = true;
   private resizeObserver: ResizeObserver;
   private visibleCount = 0;
+  private xrayGeometry: BoxGeometry;
+  private xrayMaterial: ShaderMaterial;
+  private xrayMesh: Mesh<BoxGeometry, ShaderMaterial>;
+  private volumeTexture: Data3DTexture | null = null;
+  private renderMode: "voxels" | "xray" = "voxels";
+  private volumeValueMin = 0;
+  private volumeValueSpan = 1;
 
   constructor(host: HTMLElement, options: VoxelOptions) {
     this.host = host;
     this.options = options;
 
     this.renderer = new WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
     host.replaceChildren(this.renderer.domElement);
 
     this.scene = new Scene();
@@ -185,6 +254,23 @@ export class VoxelScene {
     this.scene.add(key);
 
     this.baseGeometry = new BoxGeometry(1, 1, 1);
+    this.xrayGeometry = new BoxGeometry(2, 2, 2);
+    this.xrayMaterial = new ShaderMaterial({
+      glslVersion: GLSL3,
+      vertexShader: XRAY_VERTEX_SHADER,
+      fragmentShader: XRAY_FRAGMENT_SHADER,
+      side: BackSide,
+      depthWrite: false,
+      uniforms: {
+        uVolume: { value: null },
+        uDensity: { value: 2.2 },
+        uSteps: { value: 48 },
+        uCutoff: { value: 0 },
+      },
+    });
+    this.xrayMesh = new Mesh(this.xrayGeometry, this.xrayMaterial);
+    this.xrayMesh.visible = false;
+    this.scene.add(this.xrayMesh);
     const levelColors = Array.from({ length: MAX_SHADER_LEVELS }, (_, level) => levelColor(level).clone());
     this.material = new ShaderMaterial({
       vertexShader: VERTEX_SHADER,
@@ -219,7 +305,7 @@ export class VoxelScene {
     this.mesh = null;
     this.instanceGeometry = null;
 
-    const hasCorners = data.hasCorners && !!data.cornersLow && !!data.cornersHigh;
+    const hasCorners = data.hasCorners && !!data.corners;
     if (this.material.defines?.HAS_CORNERS !== (hasCorners ? 1 : undefined)) {
       this.material.defines = hasCorners ? { HAS_CORNERS: 1 } : {};
       this.material.needsUpdate = true;
@@ -234,13 +320,15 @@ export class VoxelScene {
       geometry.setAttribute("instanceMu", new InstancedBufferAttribute(data.mu, 1));
       geometry.setAttribute("instanceLevel", new InstancedBufferAttribute(data.levels, 1, false));
       if (hasCorners) {
-        geometry.setAttribute("instanceCornersLow", new InstancedBufferAttribute(data.cornersLow!, 4));
-        geometry.setAttribute("instanceCornersHigh", new InstancedBufferAttribute(data.cornersHigh!, 4));
+        const corners = new InstancedInterleavedBuffer(data.corners!, 8, 1);
+        geometry.setAttribute("instanceCornersLow", new InterleavedBufferAttribute(corners, 4, 0, false));
+        geometry.setAttribute("instanceCornersHigh", new InterleavedBufferAttribute(corners, 4, 4, false));
       }
       geometry.instanceCount = data.count;
       this.instanceGeometry = geometry;
       this.mesh = new Mesh(geometry, this.material);
       this.mesh.frustumCulled = false;
+      this.mesh.visible = this.renderMode === "voxels";
       this.scene.add(this.mesh);
     }
 
@@ -280,6 +368,10 @@ export class VoxelScene {
     uniforms.uMinMu.value = this.options.minMu;
     uniforms.uKeep.value = 1 - Math.max(0, Math.min(0.5, this.options.shrink));
     uniforms.uOpacity.value = this.options.opacity;
+    this.xrayMaterial.uniforms.uCutoff.value = Math.max(
+      0,
+      Math.min(0.999, (this.options.minMu - this.volumeValueMin) / this.volumeValueSpan),
+    );
     const visibility = uniforms.uLevelVisible.value as Float32Array;
     for (let level = 0; level < MAX_SHADER_LEVELS; level += 1) {
       visibility[level] = (this.options.levelVisible[level] ?? true) ? 1 : 0;
@@ -327,6 +419,45 @@ export class VoxelScene {
     this.dirty = true;
   }
 
+  setVolumeData(
+    data: Uint8Array<ArrayBuffer>,
+    width: number,
+    height: number,
+    depth: number,
+    valueMin: number,
+    valueMax: number,
+  ): void {
+    this.volumeTexture?.dispose();
+    const texture = new Data3DTexture(data, width, height, depth);
+    texture.format = RedFormat;
+    texture.type = UnsignedByteType;
+    texture.minFilter = LinearFilter;
+    texture.magFilter = LinearFilter;
+    texture.unpackAlignment = 1;
+    texture.needsUpdate = true;
+    this.volumeTexture = texture;
+    this.volumeValueMin = valueMin;
+    this.volumeValueSpan = Math.max(valueMax - valueMin, 1e-8);
+    this.xrayMaterial.uniforms.uVolume.value = texture;
+    this.xrayMaterial.uniforms.uSteps.value = Math.min(64, Math.max(32, Math.round(Math.max(width, height, depth) * 0.375)));
+    this.updateUniforms();
+    this.dirty = true;
+  }
+
+  setRenderMode(mode: "voxels" | "xray"): void {
+    this.renderMode = mode;
+    if (this.mesh) this.mesh.visible = mode === "voxels";
+    this.xrayMesh.visible = mode === "xray" && this.volumeTexture !== null;
+    this.renderer.setPixelRatio(mode === "xray" ? 0.5 : Math.min(window.devicePixelRatio || 1, 1.5));
+    this.resize();
+    this.dirty = true;
+  }
+
+  setXrayDensity(density: number): void {
+    this.xrayMaterial.uniforms.uDensity.value = Math.max(0.1, density);
+    this.dirty = true;
+  }
+
   private resize(): void {
     const rect = this.host.getBoundingClientRect();
     const width = Math.max(1, Math.floor(rect.width));
@@ -364,6 +495,9 @@ export class VoxelScene {
     if (this.mesh) this.scene.remove(this.mesh);
     this.instanceGeometry?.dispose();
     this.baseGeometry.dispose();
+    this.volumeTexture?.dispose();
+    this.xrayGeometry.dispose();
+    this.xrayMaterial.dispose();
     this.material.dispose();
     this.renderer.dispose();
   }

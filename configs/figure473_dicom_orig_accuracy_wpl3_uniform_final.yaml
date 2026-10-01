@@ -1,0 +1,13 @@
+extends: figure473_dicom_orig_accuracy_wpl3.yaml
+
+training:
+  projection_weighting_schedule:
+    10501:
+      mode: uniform
+      epsilon: 1.0e-3
+      min_weight: null
+      max_weight: null
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_wpl3_uniform_final
+

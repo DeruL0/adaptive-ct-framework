@@ -1,0 +1,8 @@
+extends: ..\figure473_48v.yaml
+
+export:
+  mact:
+    enabled: false
+
+output:
+  dir: output\ablations\rd_cvf_no_mact

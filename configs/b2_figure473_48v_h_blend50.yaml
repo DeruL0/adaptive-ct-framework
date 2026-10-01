@@ -1,0 +1,106 @@
+# B2 matched control: 48 training views (~50-view regime), h-only packed
+# Bernstein hierarchy, and the same blend50 projection objective as the
+# 16-view study. Test views are evaluation-only.
+device: cuda
+
+dataset:
+  root: D:\Projects\3.3DGS\SAD-GS\data\external_baselines\r2_local\figure473_ctgs96_48v
+
+geometry:
+  samples_per_ray: 96
+
+model:
+  representation: bernstein_octree
+  levels: [24, 48, 96]
+  topology: packed_hierarchy
+  balance_2to1: true
+  max_leaf_count: 7500000
+  max_degree: [3, 3, 3]
+  integration_mode: exact
+  cuda_integrator: true
+  initialization: projection_mean
+  init_std: 0.001
+  attenuation_shift: -3.0
+
+training:
+  seed: 20260629
+  iterations: 15000
+  batch_rays: 8192
+  lr: 0.015
+  tv_weight: 0.0
+  log_every: 100
+  eval_every: 1000
+  eval_test_views: 12
+  eval_ray_chunk: 65536
+  compute_eval: true
+
+  projection_weighting_schedule:
+    1:
+      mode: inverse
+      epsilon: 1.0e-4
+      min_weight: null
+      max_weight: null
+    6001:
+      mode: inverse_target_blend
+      epsilon: 1.0e-4
+      target_power: 0.25
+      blend_alpha: 0.50
+      min_weight: 0.3
+      max_weight: 2.0
+
+  coefficient_continuity:
+    weight: 0.001
+    start_iteration: 6001
+    ramp_steps: 1000
+    max_pairs: 8192
+    huber_delta: 0.01
+    include_cross_level: true
+    face_quadrature_order: 2
+
+  progressive:
+    refinement:
+      strategy: coefficient
+      halo: 0
+      residual_split: train
+      residual_views: 48
+      residual_rays_per_view: 9216
+      residual_ray_chunk: 65536
+      residual_max_buffer_mb: 512
+      gradient_weight: 4.0
+    milestones:
+      80:
+        level: 1
+        active_fraction: 0.03
+        operation: h_split
+        strategy: coefficient
+        halo: 0
+      180:
+        level: 2
+        active_fraction: 0.35
+        operation: h_split
+        strategy: coefficient
+        halo: 0
+
+  adaptive:
+    enabled: false
+    weight_epsilon: 1.0e-4
+
+metrics:
+  material_threshold: 0.10
+  compute_projection_metrics: true
+  compute_volume_metrics: false
+  compute_boundary_metrics: false
+
+output:
+  dir: output\b2_figure473_48v_h_blend50
+
+export:
+  compact_octree:
+    enabled: true
+    quantization: float16
+    topology: auto
+  mact:
+    enabled: false
+  surface:
+    enabled: false
+

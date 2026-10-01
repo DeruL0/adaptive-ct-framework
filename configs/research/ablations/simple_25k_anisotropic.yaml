@@ -1,0 +1,17 @@
+extends: ../figure473_128v_simple.yaml
+
+# Single-variable geometry ablation.  The root cell count stays close to the
+# cubic 96^3 baseline, while each dyadic level follows the native
+# 473 x 1024 x 1024 sampling aspect ratio.
+model:
+  levels:
+    - [60, 128, 128]
+    - [120, 256, 256]
+    - [240, 512, 512]
+    - [480, 1024, 1024]
+
+training:
+  iterations: 25000
+
+output:
+  dir: output\research_figure473_128v_simple_25k_anisotropic

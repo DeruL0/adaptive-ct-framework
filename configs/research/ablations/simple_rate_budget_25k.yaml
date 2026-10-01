@@ -1,0 +1,51 @@
+# Rate-controlled rewrite of the best simple pipeline.  Support cells are
+# mandatory; the highest coefficient/interface scores fill an explicit parent
+# budget.  No layer-specific fractions or validation-view topology selection.
+extends: ../figure473_128v_simple.yaml
+
+model:
+  balance_2to1: false
+  max_leaf_count: 6000000
+
+training:
+  iterations: 25000
+
+  progressive:
+    refinement:
+      selection_split: train
+      halo: 0
+
+    convergence_milestones:
+      - level: 1
+        operation: h_split
+        strategy: coefficient
+        active_fraction: 1.0
+        min_mu_threshold: 0.10
+        max_fraction: 1.0
+        max_parent_count: 153652
+        halo: 0
+        min_iteration: 1500
+        max_iteration: 3000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+      - level: 2
+        operation: h_split
+        strategy: coefficient
+        active_fraction: 1.0
+        max_fraction: 1.0
+        halo: 0
+        min_iteration: 3000
+        min_iterations_after_previous: 1000
+        max_iteration: 6000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+    milestones: {}
+
+output:
+  dir: output\research_figure473_128v_rate_budget_25k

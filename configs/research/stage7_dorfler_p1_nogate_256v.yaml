@@ -1,0 +1,35 @@
+# Ablation: stage7_dorfler_p1_256v without the dev rollback verdict.
+extends: stage7_dorfler_p1_256v.yaml
+
+training:
+  progressive:
+    convergence_milestones:
+      - enabled: true
+        operation: dorfler_h_split
+        repeat_until_stopped: true
+        min_iteration: 1000
+        min_iterations_after_previous: 400
+        window: 8
+        ema_span: 4
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+        early_rounds: 4
+        early_window: 4
+        early_min_after_previous: 200
+        final_finetune_iterations: 2000
+        theta: 0.5
+        estimator_rays: 2097152
+        estimator_max_buffer_mb: 512
+        min_footprint_px: 1.0
+        # 0 = indicator is raw residual energy. The air-quantile sigma^2 (~1.7e-4) exceeds the
+        # actual residual MSE (~4e-5..9e-5), so subtracting it would only truncate the tail.
+        noise_variance_scale: 0.0
+        rollback: false
+        byte_budget: 8388608
+        codec:
+          type: latent_p1
+          latent_dim: 4
+          quantization: float16
+
+output:
+  dir: output\stage7_dorfler_p1_nogate_256v

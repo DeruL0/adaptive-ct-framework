@@ -1,0 +1,15 @@
+extends: ../figure473_128v_reference.yaml
+
+training:
+  projection_weighting_schedule:
+    6001:
+      mode: uniform
+  progressive:
+    milestones:
+      9000:
+        enabled: false
+      10500:
+        enabled: false
+
+output:
+  dir: output\research_figure473_128v_uniform_fidelity

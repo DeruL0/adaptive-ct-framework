@@ -1,0 +1,6 @@
+# Canonical final configuration selected by the matched W/WP/WPL3 test.
+# WPL3 was measured but rejected because L3 did not Pareto-improve on WP.
+extends: figure473_dicom_orig_accuracy_controlled_wp.yaml
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_controlled_wp

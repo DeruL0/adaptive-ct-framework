@@ -1,0 +1,14 @@
+extends: ../figure473_128v_reference.yaml
+
+training:
+  coefficient_continuity:
+    weight: 0.0
+  progressive:
+    milestones:
+      9000:
+        enabled: false
+      10500:
+        enabled: false
+
+output:
+  dir: output\research_figure473_128v_no_continuity

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .backend import dynamic_voxel_integrate, has_native
 from .bernstein import BernsteinOctree
+from .latent_p1 import LatentP1Octree
 
 
 @dataclass(frozen=True)
@@ -307,9 +308,21 @@ class DynamicVoxelGrid(nn.Module):
         return result
 
 
-def build_model(config: Dict) -> DynamicVoxelGrid | BernsteinOctree:
+def build_model(config: Dict) -> DynamicVoxelGrid | BernsteinOctree | LatentP1Octree:
     model_cfg = config["model"]
     representation = str(model_cfg.get("representation", "dynamic_leaf_voxel")).lower()
+    if representation in {"latent_p1_octree", "latent_p1", "compact_neural_voxel_field"}:
+        return LatentP1Octree(
+            levels=model_cfg["levels"],
+            latent_dim=int(model_cfg.get("latent_dim", 4)),
+            attenuation_shift=float(model_cfg.get("attenuation_shift", -3.0)),
+            init_std=float(model_cfg.get("init_std", 1e-3)),
+            cuda_integrator=bool(model_cfg.get("cuda_integrator", True)),
+            integration_mode=str(model_cfg.get("integration_mode", "exact")),
+            topology=str(model_cfg.get("topology", "packed_hierarchy")),
+            balance_2to1=bool(model_cfg.get("balance_2to1", False)),
+            max_leaf_count=model_cfg.get("max_leaf_count"),
+        )
     if representation in {"bernstein_octree", "rd_cvf", "bernstein"}:
         return BernsteinOctree(
             levels=model_cfg["levels"],

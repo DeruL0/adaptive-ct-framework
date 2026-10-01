@@ -1,0 +1,10 @@
+extends: ../figure473_128v_reference.yaml
+
+training:
+  progressive:
+    milestones:
+      10500:
+        enabled: false
+
+output:
+  dir: output\research_figure473_128v_h_only

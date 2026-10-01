@@ -4,12 +4,12 @@ import {
   getLeaves,
   getProjection,
   getSlice,
-  getSources,
   getState,
-  loadSource,
+  getVolumeTexture,
+  loadModel,
+  selectModel,
   type ArtifactsPayload,
   type LeavesPayload,
-  type SourcesPayload,
   type StatePayload,
 } from "./api";
 import { VoxelScene, type ColorMode, type VoxelOptions } from "./voxelScene";
@@ -27,7 +27,8 @@ APP.innerHTML = `
         <h1 id="title">RD-CVF</h1>
       </div>
       <div class="statline" id="statline"></div>
-      <button class="model-button" id="openSource" type="button">Choose model</button>
+      <span class="model-feedback" id="modelFeedback" hidden></span>
+      <button class="model-button" id="openSource" type="button">Open model...</button>
       <div class="segmented" id="modes">
         <button data-mode="voxel" class="is-active" type="button">Voxels</button>
         <button data-mode="slice" type="button">Slice</button>
@@ -43,6 +44,7 @@ APP.innerHTML = `
                 <option value="level">by level</option>
                 <option value="mu">by &mu; (attenuation)</option>
                 <option value="size">by voxel size</option>
+                <option value="xray">X-ray projection</option>
               </select>
             </label>
             <label class="field"><span>Min &mu;</span>
@@ -56,7 +58,20 @@ APP.innerHTML = `
             <label class="field"><span>Gap</span>
               <input id="shrink" type="range" min="0" max="0.4" step="0.02" value="0.04">
             </label>
+            <label class="field"><span>Leaves</span>
+              <select id="leafBudget">
+                <option value="100000">100k</option>
+                <option value="250000" selected>250k</option>
+                <option value="500000">500k</option>
+                <option value="1000000">1M</option>
+                <option value="0">all</option>
+              </select>
+            </label>
             <label class="field check"><input id="wireframe" type="checkbox"><span>Wireframe</span></label>
+            <label class="field"><span>Density</span>
+              <input id="xrayDensity" type="range" min="0.2" max="8" step="0.1" value="2.2">
+              <span id="xrayDensityVal" style="min-width:32px">2.2</span>
+            </label>
             <button class="field" id="resetView" type="button" style="cursor:pointer;border:1px solid var(--border);border-radius:6px;padding:6px 10px;background:rgba(8,12,17,0.74)">Reset view</button>
           </div>
           <div class="ctl-group" data-controls="slice" hidden style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
@@ -96,31 +111,6 @@ APP.innerHTML = `
 
       <aside class="inspector" id="inspector"></aside>
     </main>
-    <div class="source-backdrop" id="sourceBackdrop" hidden>
-      <section class="source-dialog" role="dialog" aria-modal="true" aria-labelledby="sourceTitle">
-        <div class="source-head">
-          <div>
-            <span class="eyebrow">Local workspace files</span>
-            <h2 id="sourceTitle">Choose reconstruction</h2>
-          </div>
-          <button id="closeSource" type="button" aria-label="Close model chooser">&times;</button>
-        </div>
-        <label class="source-field">
-          <span>Config (.yaml)</span>
-          <select id="configPath"></select>
-        </label>
-        <label class="source-field">
-          <span>Model (.pt / .npz)</span>
-          <select id="checkpointPath"></select>
-        </label>
-        <p class="source-note" id="sourceWorkspace"></p>
-        <p class="error-text" id="sourceError" hidden></p>
-        <div class="source-actions">
-          <button id="refreshSources" type="button">Refresh list</button>
-          <button class="primary" id="loadSource" type="button">Load</button>
-        </div>
-      </section>
-    </div>
   </div>
 `;
 
@@ -130,9 +120,11 @@ const state = {
   mode: "voxel" as Mode,
   meta: null as StatePayload | null,
   artifacts: null as ArtifactsPayload | null,
-  sources: null as SourcesPayload | null,
   leaves: null as LeavesPayload | null,
   busy: false,
+  leafBudget: 250000,
+  render3dMode: "voxels" as "voxels" | "xray",
+  volumeTextureLoaded: false,
 };
 
 const voxelOptions: VoxelOptions = {
@@ -163,81 +155,36 @@ function fmtBytes(value: number | null | undefined): string {
   return `${fmt(scaled, unit === 0 ? 0 : 2)} ${units[unit]}`;
 }
 
-function populateSourceLists(sources: SourcesPayload, meta: StatePayload, resetInputs = false): void {
-  state.sources = sources;
-  const fill = (
-    id: string,
-    files: SourcesPayload["configs"],
-    current: string,
-    placeholder: string | null,
-  ): void => {
-    const select = $(id) as HTMLSelectElement;
-    const previous = select.value;
-    select.replaceChildren();
-    if (placeholder !== null) {
-      const empty = document.createElement("option");
-      empty.value = "";
-      empty.textContent = placeholder;
-      select.appendChild(empty);
-    }
-    files.forEach((file) => {
-      const option = document.createElement("option");
-      option.value = file.path;
-      option.textContent = `${file.relative_path} · ${fmtBytes(file.size_bytes)}`;
-      select.appendChild(option);
-    });
-    const known = new Set(files.map((file) => file.path));
-    const target = resetInputs ? current : previous || current;
-    select.value = known.has(target) ? target : select.options[0]?.value ?? "";
-  };
-  fill("configPath", sources.configs, meta.paths.config, null);
-  fill("checkpointPath", sources.checkpoints, meta.paths.checkpoint || "", "Blank = checkpoint from config output");
-  $("sourceWorkspace").textContent =
-    `${sources.workspace} · ${sources.configs.length} configs · ${sources.checkpoints.length} models`;
-}
-
-function setSourceDialog(open: boolean): void {
-  $("sourceBackdrop").hidden = !open;
-  if (open) {
-    $("sourceError").hidden = true;
-    ($("configPath") as HTMLSelectElement).focus();
-  }
-}
-
-function bindSourcePicker(meta: StatePayload, sources: SourcesPayload): void {
-  populateSourceLists(sources, meta, true);
-  $("openSource").addEventListener("click", () => setSourceDialog(true));
-  $("closeSource").addEventListener("click", () => setSourceDialog(false));
-  $("sourceBackdrop").addEventListener("click", (event) => {
-    if (event.target === $("sourceBackdrop")) setSourceDialog(false);
-  });
-  $("refreshSources").addEventListener("click", async () => {
-    const button = $("refreshSources") as HTMLButtonElement;
+function bindModelPicker(): void {
+  const button = $("openSource") as HTMLButtonElement;
+  const feedback = $("modelFeedback");
+  button.addEventListener("click", async () => {
+    let reloading = false;
+    feedback.hidden = true;
+    feedback.textContent = "";
     button.disabled = true;
+    button.textContent = "Selecting...";
     try {
-      populateSourceLists(await getSources(), meta);
-    } catch (error) {
-      $("sourceError").textContent = error instanceof Error ? error.message : "Could not refresh files.";
-      $("sourceError").hidden = false;
-    } finally {
-      button.disabled = false;
-    }
-  });
-  $("loadSource").addEventListener("click", async () => {
-    const button = $("loadSource") as HTMLButtonElement;
-    const config = ($("configPath") as HTMLSelectElement).value.trim();
-    const checkpoint = ($("checkpointPath") as HTMLSelectElement).value.trim();
-    $("sourceError").hidden = true;
-    button.disabled = true;
-    button.textContent = "Loading…";
-    try {
-      await loadSource(config, checkpoint);
+      const result = await selectModel();
+      if (result.status === "cancelled" || !result.checkpoint) return;
+      // The picker returned fast; loading the dataset + decoding the model can
+      // take up to a minute (longer on CPU), so surface a visible progress note
+      // instead of leaving the button on a misleading "Selecting..." label.
+      const name = result.checkpoint.split(/[\\/]/).pop() || result.checkpoint;
+      button.textContent = "Loading...";
+      feedback.textContent = `Loading ${name}… this can take up to a minute.`;
+      feedback.hidden = false;
+      await loadModel(result.checkpoint);
+      reloading = true;
       window.location.reload();
     } catch (error) {
-      $("sourceError").textContent = error instanceof Error ? error.message : "Could not load reconstruction.";
-      $("sourceError").hidden = false;
-      button.disabled = false;
-      button.textContent = "Load";
+      feedback.textContent = error instanceof Error ? error.message : "Could not load the selected model.";
+      feedback.hidden = false;
+    } finally {
+      if (!reloading) {
+        button.disabled = false;
+        button.textContent = "Open model...";
+      }
     }
   });
 }
@@ -275,13 +222,13 @@ function setMetrics(cells: Array<[string, string]>): void {
 function renderInspector(meta: StatePayload, artifacts: ArtifactsPayload | null = state.artifacts): void {
   $("title").textContent = meta.name || "RD-CVF";
   $("statline").innerHTML = [
-    `${meta.volume_shape.join("×")} volume`,
-    `${meta.detector_shape.join("×")} detector`,
-    `${meta.train_views}/${meta.test_views} views`,
+    meta.dataset_available !== false && meta.volume_shape ? `${meta.volume_shape.join("×")} volume` : "model only (no dataset)",
+    meta.dataset_available !== false && meta.detector_shape ? `${meta.detector_shape.join("×")} detector` : null,
+    meta.dataset_available !== false ? `${meta.train_views}/${meta.test_views} views` : null,
     meta.device,
     meta.model.representation,
     meta.checkpoint_loaded ? "checkpoint loaded" : "no checkpoint",
-  ].map((item) => `<span>${item}</span>`).join("");
+  ].filter(Boolean).map((item) => `<span>${item}</span>`).join("");
 
   const m = meta.model;
   const ls = meta.leaf_structure;
@@ -449,12 +396,13 @@ function renderInspector(meta: StatePayload, artifacts: ArtifactsPayload | null 
     <section class="section">
       <h2>Checkpoint <span class="meta">${meta.checkpoint_loaded ? "loaded" : "not loaded"}</span></h2>
       <dl class="kv">
-        <div><dt>Config</dt><dd>${meta.paths.config}</dd></div>
+        <div><dt>Config</dt><dd>${meta.paths.config || "— (model only, no YAML)"}</dd></div>
         <div><dt>Checkpoint</dt><dd>${meta.paths.checkpoint || meta.checkpoint_error || "-"}</dd></div>
-        <div><dt>Dataset</dt><dd>${meta.paths.dataset}</dd></div>
+        <div><dt>Dataset</dt><dd>${meta.paths.dataset || "— (no dataset loaded)"}</dd></div>
         <div><dt>Output</dt><dd>${meta.paths.output}</dd></div>
       </dl>
       ${meta.checkpoint_error ? `<p class="error-text">${meta.checkpoint_error}</p>` : ""}
+      ${meta.dataset_error ? `<p class="error-text">${meta.dataset_error}</p>` : ""}
     </section>
   `;
 }
@@ -505,22 +453,22 @@ function updateVoxelHud(): void {
   const leaves = state.leaves;
   $("voxelHud").innerHTML = [
     `${(scene?.visible ?? 0).toLocaleString()} / ${(leaves?.total ?? 0).toLocaleString()} leaves`,
-    `color: ${voxelOptions.colorMode}`,
+    `render: ${state.render3dMode}`,
     `min μ ${fmt(voxelOptions.minMu, 3)}`,
   ].map((t) => `<span>${t}</span>`).join("");
   setMetrics([
     ["Visible leaves", (scene?.visible ?? 0).toLocaleString()],
     ["Total leaves", (leaves?.total ?? 0).toLocaleString()],
     ["Returned", (leaves?.count ?? 0).toLocaleString()],
-    ["Color mode", voxelOptions.colorMode],
+    ["Render", state.render3dMode],
   ]);
 }
 
 async function loadLeaves(): Promise<void> {
   if (!state.meta) return;
-  setOverlay("Loading all voxels");
+  setOverlay(state.leafBudget > 0 ? `Loading ${Math.round(state.leafBudget / 1000)}k display leaves` : "Loading all voxels");
   try {
-    const leaves = await getLeaves(null, 0);
+    const leaves = await getLeaves(state.leafBudget > 0 ? state.leafBudget : null, 0);
     state.leaves = leaves;
     // Configure the min-mu slider to the actual attenuation range.
     const slider = $("minMu") as HTMLInputElement;
@@ -531,10 +479,54 @@ async function loadLeaves(): Promise<void> {
     }
     scene.setData(leaves);
     scene.setOptions({ ...voxelOptions });
+    scene.setRenderMode(state.render3dMode);
+    if (state.render3dMode === "xray" && !state.volumeTextureLoaded) {
+      await setRender3dMode("xray");
+    }
     // Ensure the render loop runs even if the voxel tab was already active on
     // load (setMode's scene?.start() is a no-op while the scene is still null).
     if (state.mode === "voxel") scene.start();
     updateVoxelLegend();
+    updateVoxelHud();
+  } finally {
+    setOverlay(null);
+  }
+}
+
+function decodeBase64Bytes(encoded: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+async function setRender3dMode(mode: "voxels" | "xray"): Promise<void> {
+  state.render3dMode = mode;
+  if (!scene) return;
+  $("voxelLegend").hidden = mode === "xray";
+  if (mode === "voxels") {
+    scene.setRenderMode("voxels");
+    updateVoxelHud();
+    return;
+  }
+  scene.setRenderMode("xray");
+  if (state.volumeTextureLoaded) {
+    updateVoxelHud();
+    return;
+  }
+  setOverlay("Building 3D X-ray volume");
+  try {
+    const payload = await getVolumeTexture(128);
+    scene.setVolumeData(
+      decodeBase64Bytes(payload.data),
+      payload.width,
+      payload.height,
+      payload.depth,
+      payload.value_range.min,
+      payload.value_range.max,
+    );
+    state.volumeTextureLoaded = true;
+    scene.setRenderMode("xray");
     updateVoxelHud();
   } finally {
     setOverlay(null);
@@ -624,16 +616,36 @@ function setMode(mode: Mode): void {
   }
 }
 
+// Hide slice/projection mode buttons when there is no dataset to compare
+// against, leaving only the model-intrinsic voxel view.
+function setModeAvailability(meta: StatePayload): void {
+  // Only hide the comparison modes when the server *explicitly* reports no
+  // dataset. An older server that predates this field returns undefined, in
+  // which case it always has a dataset and the modes must stay visible.
+  const comparisonModes = new Set(["slice", "projection"]);
+  const hideComparisons = meta.dataset_available === false;
+  document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((btn) => {
+    if (comparisonModes.has(btn.dataset.mode || "")) {
+      btn.hidden = hideComparisons;
+    }
+  });
+}
+
 function bindControls(meta: StatePayload): void {
   document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((btn) => {
     btn.addEventListener("click", () => setMode(btn.dataset.mode as Mode));
   });
 
   $("colorMode").addEventListener("change", (e) => {
-    voxelOptions.colorMode = (e.target as HTMLSelectElement).value as ColorMode;
+    const value = (e.target as HTMLSelectElement).value;
+    if (value === "xray") {
+      void setRender3dMode("xray");
+      return;
+    }
+    voxelOptions.colorMode = value as ColorMode;
     scene?.setOptions({ colorMode: voxelOptions.colorMode });
+    void setRender3dMode("voxels");
     updateVoxelLegend();
-    updateVoxelHud();
   });
   $("minMu").addEventListener("input", (e) => {
     voxelOptions.minMu = Number((e.target as HTMLInputElement).value);
@@ -653,18 +665,33 @@ function bindControls(meta: StatePayload): void {
     voxelOptions.wireframe = (e.target as HTMLInputElement).checked;
     scene?.setOptions({ wireframe: voxelOptions.wireframe });
   });
+  $("leafBudget").addEventListener("change", (e) => {
+    state.leafBudget = Number((e.target as HTMLSelectElement).value);
+    void loadLeaves();
+  });
+  $("xrayDensity").addEventListener("input", (event) => {
+    const density = Number((event.target as HTMLInputElement).value);
+    $("xrayDensityVal").textContent = density.toFixed(1);
+    scene?.setXrayDensity(density);
+  });
   $("resetView").addEventListener("click", () => scene?.resetView());
+
+  // Slice and projection compare the model against ground truth, so they only
+  // work when a dataset was loaded. In model-only mode the mode buttons are
+  // hidden (see setModeAvailability) and these controls stay inert.
+  const volumeShape = meta.volume_shape;
+  if (meta.dataset_available === false || !volumeShape) return;
 
   // slice
   const sliceSlider = $("sliceSlider") as HTMLInputElement;
-  sliceSlider.max = String(meta.volume_shape[2] - 1);
-  sliceSlider.value = String(Math.floor(meta.volume_shape[2] / 2));
+  sliceSlider.max = String(volumeShape[2] - 1);
+  sliceSlider.value = String(Math.floor(volumeShape[2] / 2));
   $("sliceVal").textContent = sliceSlider.value;
   $("axis").addEventListener("change", () => {
     const axis = ($("axis") as HTMLSelectElement).value as "x" | "y" | "z";
     const dim = { x: 0, y: 1, z: 2 }[axis];
-    sliceSlider.max = String(meta.volume_shape[dim] - 1);
-    sliceSlider.value = String(Math.floor(meta.volume_shape[dim] / 2));
+    sliceSlider.max = String(volumeShape[dim] - 1);
+    sliceSlider.value = String(Math.floor(volumeShape[dim] / 2));
     $("sliceVal").textContent = sliceSlider.value;
     void renderSlice();
   });
@@ -688,14 +715,14 @@ function bindControls(meta: StatePayload): void {
 async function boot(): Promise<void> {
   setOverlay("Connecting");
   try {
-    const [meta, artifacts, sources] = await Promise.all([getState(), getArtifacts(), getSources()]);
+    const [meta, artifacts] = await Promise.all([getState(), getArtifacts()]);
     state.meta = meta;
     state.artifacts = artifacts;
-    state.sources = sources;
     renderInspector(meta, artifacts);
     buildLevelToggles(meta);
+    setModeAvailability(meta);
     bindControls(meta);
-    bindSourcePicker(meta, sources);
+    bindModelPicker();
     setOverlay(null);
     setMode("voxel");
   } catch (error) {

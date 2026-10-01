@@ -42,6 +42,22 @@ schema. CUDA is used for native projection rendering when available. State,
 leaf, artifact, and selected plane-sampling paths can run without full-volume
 CUDA decoding, but high-resolution projections are substantially slower on CPU.
 
+Use **Open model...** to choose a `.pt` or `.npz` file in the system file
+manager. Picking a file returns immediately; the viewer then loads and hot-swaps
+the model in a second step (this can take up to a minute on CPU, so a
+"Loading..." state is shown).
+
+The parameter YAML is optional. The viewer first tries to resolve one from the
+model folder, its JSON training report, checkpoint metadata, or a workspace
+config whose `output.dir` points to that folder. When a YAML resolves, the full
+viewer is available (voxels plus slice and projection comparisons against the
+ground-truth dataset). When none resolves — or the resolved config's dataset
+cannot be loaded — the viewer falls back to a **model-only** view built straight
+from the model file (compact `.npz` geometry metadata or a `.pt`'s embedded
+config): the adaptive leaf/voxel structure and model stats render, while the
+slice and projection comparison modes are hidden because there is no dataset to
+compare against.
+
 ## Frontend Development
 
 ```powershell
@@ -71,8 +87,10 @@ Open `http://localhost:5173/` for the Vite development server.
   metrics.
 - `GET /api/volume_texture`: quantized dense texture helper.
 - `GET /api/volume_projection`: interactive dense-volume projection helper.
-- `GET /api/sources`: compatible configs and `.pt`/`.npz` model sources.
-- `POST /api/load`: hot-load a selected config and optional model.
+- `POST /api/select-model`: open the system model picker and return the chosen
+  path (fast; no loading).
+- `POST /api/load-model`: given the chosen `checkpoint` path, resolve its
+  optional parameter YAML, build the model (full or model-only), and hot-swap it.
 - `GET /healthz`: service and checkpoint status.
 
 Original-resolution slice requests sample only the requested 2D model plane and

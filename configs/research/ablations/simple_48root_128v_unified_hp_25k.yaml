@@ -1,0 +1,62 @@
+# Minimal hp research pipeline:
+#   one projection fidelity term;
+#   one local Gauss-Newton estimator shared by h and p;
+#   one greedy rate-distortion decision per eligible cell;
+#   one global raw compact-byte budget per adaptation round.
+extends: ../figure473_128v_simple.yaml
+
+model:
+  levels: [48, 96, 192, 384]
+  balance_2to1: false
+  max_leaf_count: 7500000
+
+training:
+  iterations: 25000
+
+  progressive:
+    refinement:
+      selection_split: train
+      residual_views: 16
+      residual_rays_per_view: 8192
+      residual_ray_chunk: 8192
+
+    convergence_milestones:
+      - levels: [0]
+        operation: hp_compete
+        max_added_bytes: 5000000
+        fisher_damping: 1.0e-8
+        min_iteration: 1500
+        max_iteration: 3000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+      - levels: [0, 1]
+        operation: hp_compete
+        max_added_bytes: 5000000
+        fisher_damping: 1.0e-8
+        min_iteration: 3000
+        min_iterations_after_previous: 1000
+        max_iteration: 6000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+      - levels: [0, 1, 2]
+        operation: hp_compete
+        max_added_bytes: 5000000
+        fisher_damping: 1.0e-8
+        min_iteration: 6000
+        min_iterations_after_previous: 1500
+        max_iteration: 9000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+    milestones: {}
+
+output:
+  dir: output\research_figure473_48root_128v_unified_hp_25k

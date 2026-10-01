@@ -122,14 +122,18 @@ export interface StatePayload {
   device: string;
   checkpoint_loaded: boolean;
   checkpoint_error: string | null;
-  paths: { config: string; checkpoint: string | null; dataset: string; output: string; report: string | null };
-  volume_shape: [number, number, number];
-  detector_shape: [number, number];
+  /** False when the model was opened without a dataset/parameter YAML: only the
+   * voxel view and model stats are available, slice/projection are hidden. */
+  dataset_available: boolean;
+  dataset_error: string | null;
+  paths: { config: string | null; checkpoint: string | null; dataset: string | null; output: string; report: string | null };
+  volume_shape: [number, number, number] | null;
+  detector_shape: [number, number] | null;
   train_views: number;
   test_views: number;
   train_angles: number[];
   test_angles: number[];
-  samples_per_ray: number;
+  samples_per_ray: number | null;
   material_threshold: number;
   model: ModelStats;
   leaf_structure: { levels: LevelStructure[]; size_range: { min: number; max: number } | null; leaf_cells: number };
@@ -170,11 +174,11 @@ export interface LeavesPayload {
   mu: Float32Array;
   levels: Uint8Array;
   /** True when any leaf is a non-constant (p1) Bernstein block; only then
-   * are `cornersLow`/`cornersHigh` present, so p1 leaves can be shaded by
+   * is `corners` present, so p1 leaves can be shaded by
    * their real corner values instead of a single flat block color. */
   hasCorners: boolean;
-  cornersLow?: Float32Array;
-  cornersHigh?: Float32Array;
+  /** Interleaved low/high corner groups, eight floats per leaf. */
+  corners?: Float32Array;
 }
 
 export interface ImageTriple {
@@ -212,21 +216,28 @@ export interface SlicePayload {
   images: ImageTriple;
 }
 
-export interface SourceFile {
-  path: string;
-  relative_path: string;
-  size_bytes: number;
-  modified_time: number;
+export interface VolumeTexturePayload {
+  kind: "volume_texture";
+  source: "prediction";
+  shape: [number, number, number];
+  width: number;
+  height: number;
+  depth: number;
+  value_range: { min: number; max: number };
+  encoding: "uint8_base64_x_fastest";
+  data: string;
 }
 
-export interface SourcesPayload {
-  workspace: string;
-  configs: SourceFile[];
-  checkpoints: SourceFile[];
+export interface SelectModelPayload {
+  status: "ok" | "cancelled";
+  checkpoint?: string;
 }
 
-export interface LoadSourcePayload {
+export interface LoadModelPayload {
   status: "ok";
+  config: string | null;
+  checkpoint: string;
+  dataset_available: boolean;
   state: StatePayload;
   artifacts: ArtifactsPayload;
 }
@@ -246,15 +257,17 @@ export async function getArtifacts(): Promise<ArtifactsPayload> {
   return fetchJson<ArtifactsPayload>("/api/artifacts");
 }
 
-export async function getSources(): Promise<SourcesPayload> {
-  return fetchJson<SourcesPayload>("/api/sources");
+export async function selectModel(): Promise<SelectModelPayload> {
+  return fetchJson<SelectModelPayload>("/api/select-model", {
+    method: "POST",
+  });
 }
 
-export async function loadSource(config: string, checkpoint: string): Promise<LoadSourcePayload> {
-  return fetchJson<LoadSourcePayload>("/api/load", {
+export async function loadModel(checkpoint: string): Promise<LoadModelPayload> {
+  return fetchJson<LoadModelPayload>("/api/load-model", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ config, checkpoint }),
+    body: JSON.stringify({ checkpoint }),
   });
 }
 
@@ -277,18 +290,10 @@ export async function getLeaves(maxLeaves: number | null, minMu: number): Promis
   const muOffset = payloadOffset + Number(header.mu_offset);
   const levelsOffset = payloadOffset + Number(header.levels_offset);
   const hasCorners = Boolean(header.has_corners);
-  let cornersLow: Float32Array | undefined;
-  let cornersHigh: Float32Array | undefined;
+  let corners: Float32Array | undefined;
   if (hasCorners) {
     const cornersOffset = payloadOffset + Number(header.corners_offset);
-    const interleaved = new Float32Array(buffer, cornersOffset, count * 8);
-    cornersLow = new Float32Array(count * 4);
-    cornersHigh = new Float32Array(count * 4);
-    for (let leaf = 0; leaf < count; leaf += 1) {
-      const base = leaf * 8;
-      cornersLow.set(interleaved.subarray(base, base + 4), leaf * 4);
-      cornersHigh.set(interleaved.subarray(base + 4, base + 8), leaf * 4);
-    }
+    corners = new Float32Array(buffer, cornersOffset, count * 8);
   }
   return {
     kind: "leaves",
@@ -305,8 +310,7 @@ export async function getLeaves(maxLeaves: number | null, minMu: number): Promis
     mu: new Float32Array(buffer, muOffset, count),
     levels: new Uint8Array(buffer, levelsOffset, count),
     hasCorners,
-    cornersLow,
-    cornersHigh,
+    corners,
   };
 }
 
@@ -316,4 +320,8 @@ export async function getProjection(split: string, view: number): Promise<Projec
 
 export async function getSlice(axis: string, index: number): Promise<SlicePayload> {
   return fetchJson<SlicePayload>(`/api/slice?axis=${encodeURIComponent(axis)}&index=${index}`);
+}
+
+export async function getVolumeTexture(resolution = 192): Promise<VolumeTexturePayload> {
+  return fetchJson<VolumeTexturePayload>(`/api/volume_texture?resolution=${Math.round(resolution)}`);
 }

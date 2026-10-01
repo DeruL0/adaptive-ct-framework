@@ -1,0 +1,47 @@
+# P0 + P1 detail-recovery experiment.
+# P0: 128 independent parallel-beam angles over [0, pi).
+# P1: material-support threshold union plus wider h-refinement fractions.
+extends: figure473_dicom_orig_accuracy_wpl3_blend50_l3_10_128v_a_uniform_converged_p_coarseband.yaml
+
+dataset:
+  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_128v_halfturn
+
+training:
+  progressive:
+    refinement:
+      residual_views: 128
+
+    convergence_milestones:
+      - level: 1
+        operation: h_split
+        strategy: coefficient
+        active_fraction: 0.15
+        min_mu_threshold: 0.10
+        max_fraction: 0.20
+        balance_reserve_leaves: 1500000
+        halo: 0
+        min_iteration: 1500
+        max_iteration: 3000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+      - level: 2
+        operation: h_split
+        strategy: coefficient
+        active_fraction: 0.50
+        min_mu_threshold: 0.10
+        max_fraction: 0.60
+        balance_reserve_leaves: 1500000
+        halo: 0
+        min_iteration: 3000
+        min_iterations_after_previous: 1000
+        max_iteration: 6000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_128unique_force_material

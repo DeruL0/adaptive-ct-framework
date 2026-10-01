@@ -1,0 +1,88 @@
+device: cuda
+dataset:
+  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_convergence
+geometry:
+  samples_per_ray: 1024
+model:
+  representation: bernstein_octree
+  levels:
+  - 64
+  - 128
+  - 256
+  max_degree:
+  - 3
+  - 3
+  - 3
+  integration_mode: exact
+  cuda_integrator: true
+  initialization: projection_mean
+  init_std: 0.001
+  attenuation_shift: -3.0
+training:
+  iterations: 320
+  batch_rays: 8192
+  lr: 0.015
+  tv_weight: 0.0
+  log_every: 100
+  eval_every: 320
+  eval_test_views: 2
+  eval_ray_chunk: 65536
+  compute_eval: false
+  coefficient_continuity:
+    weight: 0.1
+    start_iteration: 300
+    max_pairs: 262144
+    huber_delta: 0.01
+  progressive:
+    refinement:
+      strategy: coefficient
+      halo: 0
+    milestones:
+      80:
+        level: 1
+        active_fraction: 0.06
+        operation: h_split
+        strategy: coefficient
+        halo: 0
+      180:
+        level: 2
+        active_fraction: 0.6
+        operation: h_split
+        strategy: coefficient
+        halo: 0
+      260:
+        level: 2
+        active_fraction: 0.08
+        operation: p_elevate
+        strategy: projection_residual
+        target_degree:
+        - 1
+        - 1
+        - 1
+        halo: 0
+        residual_views: 1
+        residual_rays_per_view: 8192
+        residual_ray_chunk: 8192
+  adaptive:
+    enabled: false
+    weight_epsilon: 0.0001
+metrics:
+  material_threshold: 0.1
+  compute_projection_metrics: true
+  compute_volume_metrics: false
+  compute_boundary_metrics: false
+output:
+  dir: output\debug_p_residual_smoke
+export:
+  compact_octree:
+    enabled: true
+    quantization: uint16
+  mact:
+    enabled: false
+    material_clusters: 4
+    variance_retained: 0.99
+  surface:
+    enabled: false
+    threshold: 0.1
+    uncertainty_rays: 64
+    uncertainty_surface_points: 1024

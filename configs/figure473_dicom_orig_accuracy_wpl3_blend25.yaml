@@ -1,0 +1,9 @@
+extends: figure473_dicom_orig_accuracy_wpl3_blend.yaml
+
+training:
+  projection_weighting_schedule:
+    6001:
+      blend_alpha: 0.25
+
+output:
+  dir: output\figure473_dicom_orig_accuracy_wpl3_blend25

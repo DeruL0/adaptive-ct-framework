@@ -1,0 +1,7 @@
+extends: ../figure473_128v_simple.yaml
+
+training:
+  iterations: 25000
+
+output:
+  dir: output\research_figure473_128v_simple_25k

@@ -1,0 +1,74 @@
+extends: figure473_dicom_orig_accuracy_wpl3.yaml
+
+model:
+  levels: [12, 24, 48, 96]
+  max_leaf_count: 100000
+
+training:
+  iterations: 12
+  batch_rays: 256
+  log_every: 1
+  compute_eval: false
+  projection_weighting_schedule:
+    1:
+      mode: uniform
+    5:
+      mode: target_power
+      target_power: 0.25
+      min_weight: 0.3
+      max_weight: 2.0
+  coefficient_continuity:
+    weight: 0.001
+    start_iteration: 5
+    ramp_steps: 2
+    max_pairs: 128
+  progressive:
+    refinement:
+      residual_views: 4
+      residual_rays_per_view: 256
+      residual_ray_chunk: 512
+      residual_max_buffer_mb: 8
+      gradient_weight: 1.0
+    milestones:
+      2:
+        level: 1
+        active_fraction: 0.03
+        operation: h_split
+        strategy: coefficient
+      3:
+        level: 2
+        active_fraction: 0.10
+        operation: h_split
+        strategy: coefficient
+      4:
+        level: 1
+        active_fraction: 0.02
+        max_fraction: 0.20
+        threshold_statistic: q95
+        threshold_multiplier: 0.5
+        operation: h_split
+        strategy: projection_residual
+      6:
+        level: 3
+        active_fraction: 0.02
+        max_fraction: 0.10
+        threshold_statistic: q95
+        threshold_multiplier: 0.5
+        operation: h_split
+        strategy: projection_residual
+      8:
+        levels: [2, 3]
+        active_fraction: 0.02
+        operation: p_elevate
+        strategy: gradient_rate_distortion
+        candidate_fraction: 0.08
+        target_degree: [1, 1, 1]
+        gradient_batches: 2
+        gradient_batch_rays: 256
+        max_added_coefficients: 10000
+
+metrics:
+  compute_projection_metrics: false
+
+output:
+  dir: output\debug_accuracy_wpl3_smoke

@@ -5,6 +5,9 @@ import base64
 import json
 import math
 import struct
+import subprocess
+import sys
+import tempfile
 import time
 import webbrowser
 from dataclasses import asdict, dataclass
@@ -34,48 +37,225 @@ def _resolve_default_checkpoint(config: dict[str, Any]) -> Path:
     return (output_dir / "checkpoint.pt").resolve()
 
 
-def _resolve_workspace_path(workspace_root: Path, value: str | Path, *, suffixes: set[str]) -> Path:
-    raw = Path(value).expanduser()
-    path = raw.resolve() if raw.is_absolute() else (workspace_root / raw).resolve()
-    try:
-        path.relative_to(workspace_root)
-    except ValueError as exc:
-        raise ValueError(f"Path must stay inside viewer workspace: {workspace_root}") from exc
-    if path.suffix.lower() not in suffixes:
-        allowed = ", ".join(sorted(suffixes))
-        raise ValueError(f"Unsupported file type for {path.name}; expected one of {allowed}.")
+_MODEL_SUFFIXES = {".pt", ".npz"}
+_CONFIG_SUFFIXES = {".yaml", ".yml"}
+
+
+def _validate_model_path(value: str | Path) -> Path:
+    path = Path(value).expanduser().resolve()
+    if path.suffix.lower() not in _MODEL_SUFFIXES:
+        raise ValueError(f"Unsupported model file: {path.name}. Choose a .pt or .npz file.")
     if not path.is_file():
-        raise ValueError(f"File not found: {path}")
+        raise ValueError(f"Model file not found: {path}")
     return path
 
 
-def _discover_viewer_sources(workspace_root: Path) -> dict[str, Any]:
-    def entries(paths: list[Path]) -> list[dict[str, Any]]:
-        result = []
-        for path in sorted(set(paths), key=lambda item: item.stat().st_mtime, reverse=True):
-            stat = path.stat()
-            result.append(
-                {
-                    "path": str(path),
-                    "relative_path": str(path.relative_to(workspace_root)),
-                    "size_bytes": int(stat.st_size),
-                    "modified_time": float(stat.st_mtime),
-                }
-            )
-        return result
+def _config_output_dir(config_path: Path) -> Path | None:
+    try:
+        config = load_config(config_path)
+        value = config.get("output", {}).get("dir")
+        return Path(value).expanduser().resolve() if value else None
+    except Exception:
+        return None
 
-    config_root = workspace_root / "configs"
-    output_root = workspace_root / "output"
-    config_paths = list(config_root.rglob("*.yaml")) + list(config_root.rglob("*.yml")) if config_root.exists() else []
-    checkpoint_paths: list[Path] = []
-    if output_root.exists():
-        checkpoint_paths.extend(output_root.rglob("checkpoint.pt"))
-        checkpoint_paths.extend(output_root.rglob("compact_octree*.npz"))
-    return {
-        "workspace": str(workspace_root),
-        "configs": entries(config_paths),
-        "checkpoints": entries(checkpoint_paths),
-    }
+
+def _referenced_config_path(value: Any, *, model_dir: Path, workspace_root: Path) -> Path | None:
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        return None
+    raw = Path(value).expanduser()
+    candidates = [raw] if raw.is_absolute() else [model_dir / raw, workspace_root / raw]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.suffix.lower() in _CONFIG_SUFFIXES and resolved.is_file():
+            return resolved
+    return None
+
+
+def _report_config_candidates(model_dir: Path, workspace_root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for report_path in sorted(model_dir.glob("*.json")):
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        for key in ("config", "config_path", "final_config", "reference_config"):
+            candidate = _referenced_config_path(report.get(key), model_dir=model_dir, workspace_root=workspace_root)
+            if candidate is not None:
+                candidates.append(candidate)
+    return candidates
+
+
+def _checkpoint_config_candidate(model_path: Path, workspace_root: Path) -> Path | None:
+    if model_path.suffix.lower() != ".pt":
+        return None
+    try:
+        payload = torch.load(model_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    checkpoint_config = payload.get("config") if isinstance(payload, dict) else None
+    if not isinstance(checkpoint_config, dict):
+        return None
+    model_dir = model_path.parent
+    for key in ("_config_path", "config", "config_path"):
+        candidate = _referenced_config_path(checkpoint_config.get(key), model_dir=model_dir, workspace_root=workspace_root)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _resolve_model_config(model_path: str | Path, workspace_root: Path) -> Path | None:
+    model = _validate_model_path(model_path)
+    model_dir = model.parent
+    workspace = workspace_root.resolve()
+
+    adjacent = sorted(
+        {
+            *model_dir.glob("*.yaml"),
+            *model_dir.glob("*.yml"),
+        }
+    )
+    preferred_names = ("config.yaml", "config.yml", f"{model.stem}.yaml", f"{model.stem}.yml")
+    for name in preferred_names:
+        candidate = (model_dir / name).resolve()
+        if candidate in adjacent:
+            return candidate
+
+    report_candidates = _report_config_candidates(model_dir, workspace)
+    if report_candidates:
+        return report_candidates[0]
+
+    embedded_candidate = _checkpoint_config_candidate(model, workspace)
+    if embedded_candidate is not None:
+        return embedded_candidate
+
+    config_root = workspace / "configs"
+    workspace_configs = (
+        sorted({*config_root.rglob("*.yaml"), *config_root.rglob("*.yml")})
+        if config_root.exists()
+        else []
+    )
+    output_matches = [path.resolve() for path in (*adjacent, *workspace_configs) if _config_output_dir(path) == model_dir]
+    output_matches = list(dict.fromkeys(output_matches))
+    if len(output_matches) == 1:
+        return output_matches[0]
+    if len(output_matches) > 1:
+        names = ", ".join(str(path) for path in output_matches)
+        raise ValueError(f"Multiple config files point to this model folder: {names}")
+    if len(adjacent) == 1:
+        return adjacent[0].resolve()
+    if len(adjacent) > 1:
+        names = ", ".join(path.name for path in adjacent)
+        raise ValueError(f"Multiple YAML files found beside the model; keep one usable config: {names}")
+    # No parameter YAML found. This is not an error anymore: the caller can fall
+    # back to a model-only view synthesized from the model file itself, which
+    # renders the adaptive leaf structure and model stats without a dataset.
+    return None
+
+
+def _synthesize_model_config(model_path: Path) -> dict[str, Any] | None:
+    """Build a minimal, dataset-free config straight from the model file.
+
+    Used when no parameter YAML can be resolved: compact `.npz` artifacts embed
+    their octree geometry (level resolutions, max degree, attenuation shift) and
+    `.pt` checkpoints usually embed their full training config. Either is enough
+    to rebuild the model and inspect it standalone (voxel view + stats), just
+    without the ground-truth dataset needed for slice/projection comparisons.
+    Returns None when the file carries too little to reconstruct the model.
+    """
+    suffix = model_path.suffix.lower()
+    if suffix == ".npz":
+        try:
+            with np.load(model_path, allow_pickle=False) as payload:
+                metadata = json.loads(str(payload["metadata_json"][0])) if "metadata_json" in payload else {}
+                if "level_resolutions" in payload:
+                    levels = [int(v) for v in payload["level_resolutions"].tolist()]
+                elif "level_shapes" in payload:
+                    levels = [int(shape[0]) for shape in payload["level_shapes"].tolist()]
+                else:
+                    return None
+                max_degree = (
+                    [int(v) for v in payload["max_degree"].tolist()] if "max_degree" in payload else 3
+                )
+                attenuation_shift = (
+                    float(payload["attenuation_shift"][0]) if "attenuation_shift" in payload else -3.0
+                )
+        except Exception:
+            return None
+        return {
+            "device": "cpu",
+            "model": {
+                "representation": str(metadata.get("representation", "bernstein_octree")),
+                "levels": levels,
+                "max_degree": max_degree,
+                "attenuation_shift": attenuation_shift,
+                "topology": str(metadata.get("topology", "packed_hierarchy")),
+                "cuda_integrator": False,
+            },
+        }
+    if suffix == ".pt":
+        try:
+            payload = torch.load(model_path, map_location="cpu", weights_only=False)
+        except Exception:
+            return None
+        embedded = payload.get("config") if isinstance(payload, dict) else None
+        model_cfg = embedded.get("model") if isinstance(embedded, dict) else None
+        if not isinstance(model_cfg, dict) or "levels" not in model_cfg:
+            return None
+        slim_model = dict(model_cfg)
+        slim_model["cuda_integrator"] = False
+        return {"device": "cpu", "model": slim_model}
+    return None
+
+
+def _open_model_file_dialog(initial_dir: Path) -> Path | None:
+    initial = initial_dir.resolve() if initial_dir.is_dir() else Path.cwd().resolve()
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    executable = pythonw if pythonw.is_file() else Path(sys.executable)
+    script = r"""
+from pathlib import Path
+import sys
+import tkinter as tk
+from tkinter import filedialog
+
+result_path = Path(sys.argv[1])
+initial_dir = sys.argv[2]
+root = tk.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+root.update_idletasks()
+try:
+    selected = filedialog.askopenfilename(
+        parent=root,
+        initialdir=initial_dir,
+        title="Select Adaptive CT model",
+        filetypes=(
+            ("Adaptive CT model", "*.pt *.npz"),
+            ("PyTorch checkpoint", "*.pt"),
+            ("Compact NumPy model", "*.npz"),
+        ),
+    )
+    result_path.write_text(selected, encoding="utf-8")
+except Exception as exc:
+    result_path.write_text("ERROR:" + repr(exc), encoding="utf-8")
+    raise
+finally:
+    root.destroy()
+"""
+    with tempfile.TemporaryDirectory(prefix="adaptive_ct_picker_") as temporary:
+        result_path = Path(temporary) / "selection.txt"
+        completed = subprocess.run(
+            [str(executable), "-c", script, str(result_path), str(initial)],
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        result = result_path.read_text(encoding="utf-8") if result_path.is_file() else ""
+    if completed.returncode != 0:
+        detail = result.removeprefix("ERROR:") or "The system file dialog could not be opened."
+        raise RuntimeError(detail)
+    selected = result.strip()
+    return _validate_model_path(selected) if selected else None
 
 
 def _load_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -420,7 +600,11 @@ def _leaf_geometry_payload(model, *, max_leaves: int | None = None, min_mu: floa
     }
 
 
-def _leaf_corner_values(model, mu_np: np.ndarray) -> np.ndarray | None:
+def _leaf_corner_values(
+    model,
+    leaf_ids_np: np.ndarray,
+    selected_mu_np: np.ndarray,
+) -> np.ndarray | None:
     """Per-leaf 8-corner mu values in (i,j,k) order (k fastest), i.e. the same
     corner ordering as `bernstein._all_coords(2)`.
 
@@ -437,16 +621,31 @@ def _leaf_corner_values(model, mu_np: np.ndarray) -> np.ndarray | None:
     leaf_degrees = getattr(model, "leaf_degrees", None)
     if leaf_degrees is None:
         return None
-    degrees_np = leaf_degrees.detach().cpu().numpy()
+    device = leaf_degrees.device
+    leaf_ids = torch.as_tensor(leaf_ids_np, dtype=torch.long, device=device)
+    degrees = leaf_degrees[leaf_ids]
+    degrees_np = degrees.detach().cpu().numpy()
     is_p1 = np.all(degrees_np == 1, axis=1)
     if not np.any(is_p1):
         return None
-    corners = np.repeat(mu_np[:, None], 8, axis=1).astype(np.float32)
-    p1_ids = np.nonzero(is_p1)[0]
-    physical = model.coefficients().detach().cpu().numpy().astype(np.float32)
-    offsets_np = model.coefficient_offsets.detach().cpu().numpy()
-    starts = offsets_np[p1_ids]
-    corners[p1_ids] = physical[starts[:, None] + np.arange(8)[None, :]]
+    corners = np.repeat(selected_mu_np[:, None], 8, axis=1).astype(np.float32)
+    p1_rows_np = np.nonzero(is_p1)[0]
+    p1_rows = torch.as_tensor(p1_rows_np, dtype=torch.long, device=device)
+    p1_leaf_ids = leaf_ids[p1_rows]
+    local_rows = model.coefficient_offsets[p1_leaf_ids, None] + torch.arange(8, device=device)[None, :]
+    if bool(getattr(model, "constrained_nodal", False)):
+        constraint_ids = model.coefficient_constraint_ids[local_rows]
+        constraint_weights = model.coefficient_constraint_weights[local_rows]
+        valid = constraint_ids >= 0
+        masters = model.master_coefficients()
+        values = (
+            masters[constraint_ids.clamp_min(0)]
+            * constraint_weights.to(dtype=masters.dtype)
+            * valid.to(dtype=masters.dtype)
+        ).sum(dim=-1)
+    else:
+        values = model.coefficients()[local_rows]
+    corners[p1_rows_np] = values.detach().float().cpu().numpy()
     return corners
 
 
@@ -475,7 +674,6 @@ def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float
     levels_np = leaf_levels.detach().cpu().numpy().astype(np.uint8, copy=False)
     coords_np = leaf_coords.detach().cpu().numpy().astype(np.uint16, copy=False)
     mu_np = model._leaf_mu().detach().cpu().numpy().astype(np.float32, copy=False)
-    corners_np = _leaf_corner_values(model, mu_np)
     total = int(levels_np.shape[0])
     idx = np.flatnonzero(mu_np >= float(min_mu))
     if idx.size == 0:
@@ -488,6 +686,7 @@ def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float
     selected_coords = np.ascontiguousarray(coords_np[idx])
     selected_mu = np.ascontiguousarray(mu_np[idx])
     selected_levels = np.ascontiguousarray(levels_np[idx])
+    corners_np = _leaf_corner_values(model, idx, selected_mu)
     count = int(idx.size)
     level_counts = [int(np.count_nonzero(levels_np == level)) for level in range(len(resolutions))]
     level_sizes_xyz = [[2.0 / float(value) for value in shape] for shape in resolutions]
@@ -505,8 +704,7 @@ def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float
     if corners_np is not None:
         levels_padding = (-len(selected_levels.tobytes())) % 4
         corners_offset = levels_offset + len(selected_levels.tobytes()) + levels_padding
-        selected_corners = np.ascontiguousarray(corners_np[idx])
-        body += (b"\0" * levels_padding) + selected_corners.tobytes()
+        body += (b"\0" * levels_padding) + np.ascontiguousarray(corners_np).tobytes()
 
     header = {
         "kind": "leaves",
@@ -823,17 +1021,36 @@ def _volume_projection_payload_from_arrays(
 
 @dataclass(frozen=True)
 class ViewerPaths:
-    config: Path
+    config: Path | None
     checkpoint: Path | None
-    dataset: Path
+    dataset: Path | None
     output: Path
     report: Path | None
 
 
 class ViewerState:
-    def __init__(self, *, config_path: Path, checkpoint_path: Path | None) -> None:
-        self.config_path = config_path.resolve()
-        self.config = load_config(self.config_path)
+    def __init__(
+        self,
+        *,
+        config_path: Path | None,
+        checkpoint_path: Path | None,
+        config: dict[str, Any] | None = None,
+        dataset_available: bool = True,
+        dataset_note: str | None = None,
+    ) -> None:
+        if config is not None:
+            # Model-only mode: a config dict synthesized from the model file, with
+            # no dataset section. config_path may still point at a YAML we failed
+            # to fully load (kept for display) or be None.
+            self.config = config
+            self.config_path = config_path.resolve() if config_path is not None else None
+        else:
+            if config_path is None:
+                raise ValueError("ViewerState needs either a config path or a synthesized config.")
+            self.config_path = config_path.resolve()
+            self.config = load_config(self.config_path)
+        self.dataset_available = bool(dataset_available)
+        self.dataset_note = dataset_note
         self.device = torch.device(self.config.get("device", "cuda"))
         # The dynamic leaf-voxel paths (state, leaves, slices, projection render)
         # are pure torch and run fine on CPU. Only /api/volume_projection uses the
@@ -843,24 +1060,38 @@ class ViewerState:
             print("[viewer] CUDA unavailable; falling back to CPU (native volume_projection disabled).")
             self.device = torch.device("cpu")
 
-        # Projections are used by the renderer, but the original-resolution GT
-        # volume can be several GiB. Keep it memory-mapped on CPU and read only
-        # the requested slice instead of permanently occupying GPU memory.
-        self.dataset = load_r2_dataset(self.config["dataset"]["root"], device=self.device, load_volume=False)
-        metadata_path = self.dataset.root / "meta_data.json"
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        volume_path = Path(metadata["vol"])
-        if not volume_path.is_absolute():
-            volume_path = self.dataset.root / volume_path
-        self.target_volume_path = volume_path.resolve()
-        self.target_volume = np.load(self.target_volume_path, mmap_mode="r")
-        if tuple(int(v) for v in self.target_volume.shape) != tuple(int(v) for v in self.dataset.volume_shape):
-            raise ValueError(
-                f"GT volume shape {self.target_volume.shape} does not match scanner nVoxel {self.dataset.volume_shape}."
+        if self.dataset_available:
+            # Projections are used by the renderer, but the original-resolution GT
+            # volume can be several GiB. Keep it memory-mapped on CPU and read only
+            # the requested slice instead of permanently occupying GPU memory.
+            self.dataset = load_r2_dataset(self.config["dataset"]["root"], device=self.device, load_volume=False)
+            metadata_path = self.dataset.root / "meta_data.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            volume_path = Path(metadata["vol"])
+            if not volume_path.is_absolute():
+                volume_path = self.dataset.root / volume_path
+            self.target_volume_path: Path | None = volume_path.resolve()
+            self.target_volume = np.load(self.target_volume_path, mmap_mode="r")
+            if tuple(int(v) for v in self.target_volume.shape) != tuple(int(v) for v in self.dataset.volume_shape):
+                raise ValueError(
+                    f"GT volume shape {self.target_volume.shape} does not match scanner nVoxel {self.dataset.volume_shape}."
+                )
+            self.detector_h, self.detector_w = self.dataset.detector_shape
+            self.samples_per_ray = int(self.config["geometry"].get("samples_per_ray", self.dataset.volume_shape[0]))
+        else:
+            # Model-only: no ground-truth dataset, so slice/projection comparisons
+            # are unavailable. Everything the voxel view and inspector need comes
+            # straight from the model.
+            self.dataset = None
+            self.target_volume_path = None
+            self.target_volume = None
+            self.detector_h = self.detector_w = None
+            self.samples_per_ray = None
+        self.ray_chunk = int(
+            self.config.get("viewer", {}).get(
+                "ray_chunk", self.config.get("training", {}).get("eval_ray_chunk", 4096)
             )
-        self.detector_h, self.detector_w = self.dataset.detector_shape
-        self.samples_per_ray = int(self.config["geometry"].get("samples_per_ray", self.dataset.volume_shape[0]))
-        self.ray_chunk = int(self.config.get("viewer", {}).get("ray_chunk", self.config["training"].get("eval_ray_chunk", 4096)))
+        )
         self.model = build_model(self.config).to(device=self.device)
         self.checkpoint_path = checkpoint_path.resolve() if checkpoint_path is not None else _resolve_default_checkpoint(self.config)
         self.checkpoint_loaded = False
@@ -868,14 +1099,20 @@ class ViewerState:
         self._load_checkpoint()
         self.model.eval()
 
-        output_dir = Path(self.config["output"]["dir"]).resolve()
+        if self.dataset_available:
+            output_dir = Path(self.config["output"]["dir"]).resolve()
+        elif self.checkpoint_path is not None:
+            # Show artifacts that live beside the selected model file.
+            output_dir = self.checkpoint_path.parent
+        else:
+            output_dir = Path.cwd().resolve()
         report_path = output_dir / "training_report.json"
         self.output_dir = output_dir
         self.report_path = report_path if report_path.exists() else None
         self.paths = ViewerPaths(
             config=self.config_path,
             checkpoint=self.checkpoint_path if self.checkpoint_loaded else None,
-            dataset=self.dataset.root,
+            dataset=self.dataset.root if self.dataset is not None else None,
             output=output_dir,
             report=self.report_path,
         )
@@ -883,6 +1120,7 @@ class ViewerState:
         self._decoded_volume: np.ndarray | None = None
         self._decoded_volume_tensor: torch.Tensor | None = None
         self._decoded_volume_time_sec: float | None = None
+        self._preview_volume_cache: dict[int, np.ndarray] = {}
         self._lock = Lock()
 
     def _load_checkpoint(self) -> None:
@@ -937,13 +1175,8 @@ class ViewerState:
             adaptive_events = self.training_report.get("adaptive_events")
             rate_distortion_curve = self.training_report.get("rate_distortion_curve")
             history = self.training_report.get("history")
-        return _to_jsonable(
-            {
-                "name": "Projection-domain RD-CVF",
-                "device": str(self.device),
-                "checkpoint_loaded": self.checkpoint_loaded,
-                "checkpoint_error": self.checkpoint_error,
-                "paths": asdict(self.paths),
+        if self.dataset is not None:
+            dataset_fields: dict[str, Any] = {
                 "volume_shape": self.dataset.volume_shape,
                 "detector_shape": self.dataset.detector_shape,
                 "train_views": int(self.dataset.train.projections.shape[0]),
@@ -951,6 +1184,29 @@ class ViewerState:
                 "train_angles": self.dataset.train.angles.detach().float().cpu().numpy(),
                 "test_angles": self.dataset.test.angles.detach().float().cpu().numpy(),
                 "samples_per_ray": self.samples_per_ray,
+            }
+        else:
+            # Model-only: no ground truth, so the slice/projection comparison
+            # modes have nothing to compare against and the client hides them.
+            dataset_fields = {
+                "volume_shape": None,
+                "detector_shape": None,
+                "train_views": 0,
+                "test_views": 0,
+                "train_angles": [],
+                "test_angles": [],
+                "samples_per_ray": None,
+            }
+        return _to_jsonable(
+            {
+                "name": "Projection-domain RD-CVF",
+                "device": str(self.device),
+                "checkpoint_loaded": self.checkpoint_loaded,
+                "checkpoint_error": self.checkpoint_error,
+                "dataset_available": self.dataset_available,
+                "dataset_error": self.dataset_note,
+                "paths": asdict(self.paths),
+                **dataset_fields,
                 "ray_chunk": self.ray_chunk,
                 "material_threshold": float(self.config.get("metrics", {}).get("material_threshold", 0.1)),
                 "model": stats,
@@ -974,7 +1230,15 @@ class ViewerState:
     def artifacts_payload(self) -> dict[str, Any]:
         return _to_jsonable(_artifact_payload(self.output_dir, checkpoint_path=self.checkpoint_path, report_path=self.report_path))
 
+    def _require_dataset(self) -> None:
+        if self.dataset is None:
+            raise ValueError(
+                "This model was opened without a dataset, so slice and projection comparisons "
+                "are unavailable. Open it alongside a parameter YAML to enable them."
+            )
+
     def _split(self, split_name: str) -> ProjectionSplit:
+        self._require_dataset()
         if split_name == "train":
             return self.dataset.train
         if split_name == "test":
@@ -1045,7 +1309,12 @@ class ViewerState:
         self._decoded_volume = decoded
         return decoded
 
-    def _decode_slice(self, *, axis: str, index: int) -> np.ndarray:
+    def _slice_points(
+        self,
+        *,
+        axis: str,
+        index: int,
+    ) -> tuple[tuple[int, int, int], list[int], torch.Tensor]:
         shape = tuple(int(v) for v in self.dataset.volume_shape)
         axis_index = {"x": 0, "y": 1, "z": 2}[axis]
         free_axes = [dim for dim in range(3) if dim != axis_index]
@@ -1062,6 +1331,10 @@ class ViewerState:
         coords[:, free_axes[1]] = grid_second.reshape(-1)
         scale = torch.tensor(shape, dtype=torch.float32, device=self.device)
         points = -1.0 + (coords + 0.5) * 2.0 / scale
+        return shape, free_axes, points
+
+    def _decode_slice(self, *, axis: str, index: int) -> np.ndarray:
+        shape, free_axes, points = self._slice_points(axis=axis, index=index)
 
         chunks: list[torch.Tensor] = []
         chunk_size = 65536
@@ -1082,6 +1355,7 @@ class ViewerState:
         return self._decoded_volume_tensor
 
     def render_slice_payload(self, *, axis: str, index: int) -> dict[str, Any]:
+        self._require_dataset()
         axis = str(axis).lower()
         dims = dict(zip(("x", "y", "z"), self.dataset.volume_shape))
         if axis not in dims:
@@ -1090,6 +1364,11 @@ class ViewerState:
         pred = self._decode_slice(axis=axis, index=index)
         target = _slice_from_volume(self.target_volume, axis, index)
         vmin, vmax = _percentile_range(pred, target)
+        images = {
+            "prediction": _encode_gray_png(pred, vmin=vmin, vmax=vmax),
+            "target": _encode_gray_png(target, vmin=vmin, vmax=vmax),
+            "error": _encode_error_png(pred - target),
+        }
         return {
             "kind": "slice",
             "axis": axis,
@@ -1100,11 +1379,7 @@ class ViewerState:
             ),
             "device": str(self.device),
             "metrics": _array_stats(pred, target),
-            "images": {
-                "prediction": _encode_gray_png(pred, vmin=vmin, vmax=vmax),
-                "target": _encode_gray_png(target, vmin=vmin, vmax=vmax),
-                "error": _encode_error_png(pred - target),
-            },
+            "images": images,
         }
 
     def leaf_geometry_payload(self, *, max_leaves: int | None, min_mu: float) -> dict[str, Any]:
@@ -1115,12 +1390,24 @@ class ViewerState:
         with self._lock, torch.no_grad():
             return _leaf_geometry_binary(self.model, max_leaves=max_leaves, min_mu=min_mu)
 
-    def render_volume_texture_payload(self, *, source: str) -> dict[str, Any]:
-        pred_volume = self._decode_volume()
-        target_volume = np.asarray(self.target_volume, dtype=np.float32)
-        return _volume_texture_payload_from_arrays(pred_volume, target_volume, source=source)
+    def render_volume_texture_payload(self, *, resolution: int) -> dict[str, Any]:
+        resolution = max(64, min(int(resolution), 256))
+        cached = self._preview_volume_cache.get(resolution)
+        if cached is None:
+            with self._lock, torch.no_grad():
+                decoded = self.model.decoded_at_resolution(
+                    (resolution, resolution, resolution),
+                    chunk=262144,
+                )
+                cached = decoded.detach().float().cpu().numpy()
+            self._preview_volume_cache[resolution] = cached
+        # The texture endpoint is model-intrinsic and also works when no GT
+        # dataset was loaded. Passing the same array as target keeps the shared
+        # quantizer focused on prediction without decoding the native volume.
+        return _volume_texture_payload_from_arrays(cached, cached, source="prediction")
 
     def render_volume_projection_payload(self, *, angle_rad: float, source: str) -> dict[str, Any]:
+        self._require_dataset()
         normalized_source = str(source).lower()
         if normalized_source not in {"prediction", "target", "error"}:
             raise ValueError("source must be prediction, target, or error")
@@ -1177,15 +1464,6 @@ class ViewerHandler(BaseHTTPRequestHandler):
 
     def _send_error(self, status: int, message: str) -> None:
         self._send_json({"error": message, "status": status}, status=status)
-
-    def _read_json_body(self) -> dict[str, Any]:
-        content_length = int(self.headers.get("Content-Length", "0"))
-        if content_length <= 0 or content_length > 65536:
-            raise ValueError("Expected a JSON request body no larger than 64 KiB.")
-        payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("JSON request body must be an object.")
-        return payload
 
     _CONTENT_TYPES = {
         ".html": "text/html; charset=utf-8",
@@ -1251,9 +1529,6 @@ class ViewerHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/artifacts":
                 self._send_json(self.viewer_state.artifacts_payload())
                 return
-            if parsed.path == "/api/sources":
-                self._send_json(_discover_viewer_sources(self.server.workspace_root))  # type: ignore[attr-defined]
-                return
             if parsed.path == "/api/projection":
                 split = query.get("split", ["test"])[0]
                 view = int(query.get("view", ["0"])[0])
@@ -1261,7 +1536,16 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/slice":
                 axis = query.get("axis", ["z"])[0]
-                index = int(query.get("index", [str(self.viewer_state.dataset.volume_shape[2] // 2)])[0])
+                dataset = self.viewer_state.dataset
+                # Don't dereference the dataset to build a default index when it is
+                # absent: render_slice_payload raises the friendly "no dataset"
+                # error, but only if we reach it. index=0 is a safe placeholder.
+                if "index" in query:
+                    index = int(query["index"][0])
+                elif dataset is not None:
+                    index = int(dataset.volume_shape[2] // 2)
+                else:
+                    index = 0
                 self._send_json(self.viewer_state.render_slice_payload(axis=axis, index=index))
                 return
             if parsed.path == "/api/leaves":
@@ -1280,8 +1564,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parsed.path == "/api/volume_texture":
-                source = query.get("source", ["prediction"])[0]
-                self._send_json(self.viewer_state.render_volume_texture_payload(source=source))
+                resolution = int(query.get("resolution", ["192"])[0])
+                self._send_json(self.viewer_state.render_volume_texture_payload(resolution=resolution))
                 return
             if parsed.path == "/api/volume_projection":
                 source = query.get("source", ["prediction"])[0]
@@ -1297,40 +1581,108 @@ class ViewerHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # pragma: no cover - user-facing diagnostic path.
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, repr(exc))
 
+    def _read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Request body must be a JSON object.")
+        return payload
+
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         try:
-            if parsed.path != "/api/load":
-                self._send_error(HTTPStatus.NOT_FOUND, "Not found.")
+            # Picking a file and loading a model are split into two requests on
+            # purpose. Rebuilding the ViewerState re-reads the dataset and decodes
+            # the model, which takes ~100 s on CPU; folding that into the picker
+            # request left the browser blocked for a minute-plus with no feedback,
+            # so the selection looked like it "never came back". Now the picker
+            # returns the chosen path immediately and the client shows a real
+            # "Loading..." state while it calls /api/load-model separately.
+            if parsed.path == "/api/select-model":
+                self._handle_select_model()
                 return
-            payload = self._read_json_body()
-            workspace_root: Path = self.server.workspace_root  # type: ignore[attr-defined]
-            config_value = str(payload.get("config", "")).strip()
-            checkpoint_value = str(payload.get("checkpoint", "")).strip()
-            if not config_value:
-                raise ValueError("A config file is required.")
-            config_path = _resolve_workspace_path(workspace_root, config_value, suffixes={".yaml", ".yml"})
-            checkpoint_path = (
-                _resolve_workspace_path(workspace_root, checkpoint_value, suffixes={".pt", ".npz"})
-                if checkpoint_value
-                else None
-            )
-            new_state = ViewerState(config_path=config_path, checkpoint_path=checkpoint_path)
-            if checkpoint_value and not new_state.checkpoint_loaded:
-                raise ValueError(new_state.checkpoint_error or f"Could not load checkpoint: {checkpoint_path}")
-            with self.server.viewer_state_lock:  # type: ignore[attr-defined]
-                self.server.viewer_state = new_state  # type: ignore[attr-defined]
-            self._send_json(
-                {
-                    "status": "ok",
-                    "state": new_state.state_payload(),
-                    "artifacts": new_state.artifacts_payload(),
-                }
-            )
-        except (ValueError, json.JSONDecodeError) as exc:
+            if parsed.path == "/api/load-model":
+                self._handle_load_model()
+                return
+            self._send_error(HTTPStatus.NOT_FOUND, "Not found.")
+        except ValueError as exc:
             self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:  # pragma: no cover - user-facing diagnostic path.
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, repr(exc))
+
+    def _handle_select_model(self) -> None:
+        workspace_root: Path = self.server.workspace_root  # type: ignore[attr-defined]
+        dialog_lock: Lock = self.server.model_dialog_lock  # type: ignore[attr-defined]
+        if not dialog_lock.acquire(blocking=False):
+            self._send_error(HTTPStatus.CONFLICT, "A model file dialog is already open.")
+            return
+        try:
+            current_checkpoint = self.viewer_state.checkpoint_path
+            initial_dir = current_checkpoint.parent if current_checkpoint is not None else workspace_root / "output"
+            checkpoint_path = _open_model_file_dialog(initial_dir)
+        finally:
+            dialog_lock.release()
+        if checkpoint_path is None:
+            self._send_json({"status": "cancelled"})
+            return
+        self._send_json({"status": "ok", "checkpoint": str(checkpoint_path)})
+
+    def _handle_load_model(self) -> None:
+        workspace_root: Path = self.server.workspace_root  # type: ignore[attr-defined]
+        body = self._read_json_body()
+        raw_checkpoint = body.get("checkpoint")
+        if not isinstance(raw_checkpoint, str) or not raw_checkpoint.strip():
+            raise ValueError("Request body must include the selected model 'checkpoint' path.")
+        checkpoint_path = _validate_model_path(raw_checkpoint)
+        # The parameter YAML is optional. If one resolves we open in full mode
+        # (voxels + slice/projection comparisons); otherwise, or if the config's
+        # dataset can't be loaded, we fall back to a model-only view built from
+        # the model file itself (voxels + stats, no comparisons).
+        config_path = _resolve_model_config(checkpoint_path, workspace_root)
+        new_state: ViewerState | None = None
+        dataset_note: str | None = None
+        if config_path is not None:
+            try:
+                new_state = ViewerState(config_path=config_path, checkpoint_path=checkpoint_path)
+            except Exception as exc:
+                dataset_note = f"Config found but its dataset could not be loaded: {exc}"
+        if new_state is None:
+            model_config = _synthesize_model_config(checkpoint_path)
+            if model_config is None:
+                raise ValueError(
+                    dataset_note
+                    or (
+                        "No parameter YAML could be resolved and the model file does not embed enough "
+                        "metadata to inspect it standalone. Put config.yaml beside the model, or keep a "
+                        "training report/config whose output.dir points to this folder."
+                    )
+                )
+            new_state = ViewerState(
+                config_path=config_path,
+                checkpoint_path=checkpoint_path,
+                config=model_config,
+                dataset_available=False,
+                dataset_note=dataset_note,
+            )
+        if not new_state.checkpoint_loaded:
+            raise ValueError(new_state.checkpoint_error or f"Could not load checkpoint: {checkpoint_path}")
+        with self.server.viewer_state_lock:  # type: ignore[attr-defined]
+            self.server.viewer_state = new_state  # type: ignore[attr-defined]
+        self._send_json(
+            {
+                "status": "ok",
+                "config": str(config_path) if config_path is not None else None,
+                "checkpoint": str(checkpoint_path),
+                "dataset_available": new_state.dataset_available,
+                "state": new_state.state_payload(),
+                "artifacts": new_state.artifacts_payload(),
+            }
+        )
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[viewer] {self.address_string()} - {fmt % args}")
@@ -1348,6 +1700,7 @@ def serve(*, config: Path, checkpoint: Path | None, host: str, port: int, open_b
     httpd = ThreadingHTTPServer((host, int(port)), ViewerHandler)
     httpd.viewer_state = viewer_state  # type: ignore[attr-defined]
     httpd.viewer_state_lock = Lock()  # type: ignore[attr-defined]
+    httpd.model_dialog_lock = Lock()  # type: ignore[attr-defined]
     httpd.workspace_root = workspace_root  # type: ignore[attr-defined]
     url = f"http://{host}:{port}/"
     print(json.dumps({"viewer": url, "checkpoint_loaded": viewer_state.checkpoint_loaded}, indent=2))

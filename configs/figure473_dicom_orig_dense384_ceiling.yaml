@@ -1,0 +1,39 @@
+device: cuda
+
+dataset:
+  root: D:\Projects\7.CT Framework\output\figure473_dicom_orig_r2_convergence
+
+geometry:
+  samples_per_ray: 384
+
+dense_baseline:
+  resolution: 384
+
+training:
+  seed: 20260629
+  iterations: 15000
+  batch_rays: 8192
+  lr: 0.01
+  log_every: 100
+  eval_every: 1000
+  eval_ray_chunk: 8192
+
+  projection_weighting_schedule:
+    1:
+      mode: inverse
+      epsilon: 1.0e-4
+      min_weight: null
+      max_weight: null
+    6001:
+      mode: inverse_target_blend
+      epsilon: 1.0e-4
+      target_power: 0.25
+      blend_alpha: 0.50
+      min_weight: 0.3
+      max_weight: 2.0
+
+metrics:
+  material_threshold: 0.10
+
+output:
+  dir: output\figure473_dicom_orig_dense384_ceiling

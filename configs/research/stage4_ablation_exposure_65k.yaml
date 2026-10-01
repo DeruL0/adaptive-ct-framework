@@ -1,0 +1,11 @@
+extends: stage5_6_latent_p1_merge_anvo_256v_global_split_no_merge.yaml
+
+training:
+  progressive:
+    structural_rounds:
+      residual_score_mode: residual_exposure
+      crossfit_acceptance:
+        ray_count: 65536
+
+output:
+  dir: output\stage4_ablation_exposure_65k

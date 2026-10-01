@@ -410,12 +410,13 @@ def propose_reverse_actions(model, *, max_candidates: int) -> list[CandidateActi
     candidates: list[CandidateAction] = []
     # Prefer reducing the weakest high-order coefficient differences first.
     diagnostics = coefficient_diagnostics(model)
-    for leaf_id in range(int(model.leaf_levels.shape[0])):
-        key = model.leaf_key(leaf_id)
-        for axis in range(3):
-            if int(model.leaf_degrees[leaf_id, axis].item()) > 0:
-                score = float(diagnostics.directional_variation[leaf_id, axis].item())
-                candidates.append(CandidateAction("p_reduce", (key,), axis, score))
+    if getattr(model, "representation", "") != "latent_p1_octree":
+        for leaf_id in range(int(model.leaf_levels.shape[0])):
+            key = model.leaf_key(leaf_id)
+            for axis in range(3):
+                if int(model.leaf_degrees[leaf_id, axis].item()) > 0:
+                    score = float(diagnostics.directional_variation[leaf_id, axis].item())
+                    candidates.append(CandidateAction("p_reduce", (key,), axis, score))
 
     sibling_groups: dict[tuple[int, int, int, int], list[tuple[int, int, int, int]]] = {}
     for leaf_id in range(int(model.leaf_levels.shape[0])):
@@ -570,6 +571,41 @@ def _tune_affected_coefficients(
 ) -> None:
     if int(steps) <= 0:
         return
+    if getattr(model, "representation", "") == "latent_p1_octree":
+        affected_leaf_ids = [model.find_leaf(key) for key in affected_leaf_keys]
+        affected_leaf_ids = [int(leaf_id) for leaf_id in affected_leaf_ids if leaf_id is not None]
+        if not affected_leaf_ids:
+            return
+        trainable_mask = torch.zeros(
+            (model.leaf_latents.shape[0],),
+            dtype=torch.bool,
+            device=model.leaf_latents.device,
+        )
+        trainable_mask[torch.tensor(affected_leaf_ids, dtype=torch.long, device=model.leaf_latents.device)] = True
+        optimizer = torch.optim.Adam([model.leaf_latents], lr=float(learning_rate))
+        for _ in range(int(steps)):
+            ray_batch = random_training_rays(
+                training_split,
+                batch_rays=int(batch_rays),
+                detector_h=detector_h,
+                detector_w=detector_w,
+                samples_per_ray=samples_per_ray,
+                materialize_points=not (
+                    hasattr(model, "prefer_compact_ray_batch") and model.prefer_compact_ray_batch()
+                ),
+            )
+            prediction = model.integrate_ray_batch(ray_batch)
+            loss = weighted_projection_loss(
+                prediction,
+                ray_batch.target,
+                **(weight_kwargs or {"epsilon": weight_epsilon}),
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if model.leaf_latents.grad is not None:
+                model.leaf_latents.grad[~trainable_mask] = 0.0
+            optimizer.step()
+        return
     affected_leaf_ids = [model.find_leaf(key) for key in affected_leaf_keys]
     affected_leaf_ids = [int(leaf_id) for leaf_id in affected_leaf_ids if leaf_id is not None]
     if not affected_leaf_ids:
@@ -650,7 +686,8 @@ def _tune_all_coefficients(
 ) -> None:
     if int(steps) <= 0:
         return
-    optimizer = torch.optim.Adam([model.coefficient_logits], lr=float(learning_rate))
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(parameters, lr=float(learning_rate))
     for _ in range(int(steps)):
         ray_batch = random_training_rays(
             training_split,

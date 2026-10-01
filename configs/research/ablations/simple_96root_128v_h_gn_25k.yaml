@@ -1,0 +1,49 @@
+# Same root grid and essentially the same 6M-leaf rate as simple_25k, but
+# replaces coefficient thresholds/top fractions with one train-only
+# Haar-detail Gauss-Newton selector.
+extends: ../figure473_128v_simple.yaml
+
+model:
+  balance_2to1: false
+  max_leaf_count: 6000000
+
+training:
+  iterations: 25000
+
+  progressive:
+    refinement:
+      selection_split: train
+      residual_views: 16
+      residual_rays_per_view: 8192
+      residual_ray_chunk: 8192
+
+    convergence_milestones:
+      - levels: [0]
+        operation: h_gauss_newton_rd
+        # 153,652 parents, matching the simple_25k first round.
+        max_added_bytes: 15211548
+        fisher_damping: 1.0e-8
+        min_iteration: 1500
+        max_iteration: 3000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+      - levels: [1]
+        operation: h_gauss_newton_rd
+        # 577,100 parents, matching the simple_25k second round.
+        max_added_bytes: 57132900
+        fisher_damping: 1.0e-8
+        min_iteration: 3000
+        min_iterations_after_previous: 1000
+        max_iteration: 6000
+        window: 200
+        ema_span: 50
+        relative_improvement: 0.002
+        max_relative_regression: 0.005
+
+    milestones: {}
+
+output:
+  dir: output\research_figure473_96root_128v_h_gn_25k

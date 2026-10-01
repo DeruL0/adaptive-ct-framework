@@ -1,0 +1,12 @@
+# B2 p-capacity stress test. Identical to hp2 except that every residual
+# candidate in the top-8% pool may be elevated.
+extends: b2_figure473_48v_hp_blend50.yaml
+
+training:
+  progressive:
+    milestones:
+      10500:
+        active_fraction: 0.08
+
+output:
+  dir: output\b2_figure473_48v_hp8_blend50
