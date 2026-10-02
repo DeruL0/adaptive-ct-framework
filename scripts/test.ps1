@@ -1,2 +1,2 @@
 $ErrorActionPreference = "Stop"
-py -3.10 -m unittest discover -s tests -t .
+& "$PSScriptRoot\..\.venv\Scripts\python.exe" -m unittest discover -s tests -t .

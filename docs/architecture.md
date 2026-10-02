@@ -15,7 +15,7 @@ adaptive_ct/
   refinement/      estimator.py  marking.py  controller.py
   training/        loop.py  plateau.py  export.py  validate.py  __main__.py
   viewer/          server.py + web/ (Three.js)
-native/            bernstein_octree.cu  projector.cu  dynamic_voxel.cu(未使用)  ext.cpp
+native/            bernstein_octree.cu  projector.cu  ext.cpp
 configs/stage7/    p1.yaml  p0.yaml  p0_longft.yaml  p1_nogate.yaml
 tests/             与 adaptive_ct/ 镜像
 ```
@@ -94,15 +94,15 @@ flowchart TD
 
 ## 运行
 
+环境：项目内 `.venv`（Python 3.10 + torch 2.11.0+cu130，匹配本机 CUDA 13.0 工具链，可重编原生扩展）。
+
 ```powershell
-py -3.10 -m adaptive_ct.training --config configs\stage7\p1.yaml
-scripts\test.ps1        # py -3.10 -m unittest discover -s tests -t .
+.venv\Scripts\python.exe -m adaptive_ct.training --config configs\stage7\p1.yaml
+scripts\test.ps1        # .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
 ## 已知缺口
 
 - 噪声底估计：空气分位数方差（约 1.7e-4）比实际残差 MSE 大 2–4 倍，目前配置里
   `noise_variance_scale: 0`，"误差降到噪声底就停"这条停止条件暂不生效。
-- `native/dynamic_voxel.cu` 及其绑定是旧稠密体素模型留下的，Python 端已不再使用；
-  本机只装了 CUDA 13.0 而 torch 是 cu128，无法重编扩展，待换成匹配的工具链后再删。
 - 尚无切片/体域指标脚本和与 NeAT / 3DGS 的字节公平比较。

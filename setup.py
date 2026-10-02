@@ -22,7 +22,6 @@ setup(
             sources=[
                 "native/ext.cpp",
                 "native/projector.cu",
-                "native/dynamic_voxel.cu",
                 "native/bernstein_octree.cu",
             ],
             extra_compile_args={

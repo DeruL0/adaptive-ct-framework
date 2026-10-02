@@ -50,8 +50,8 @@ tests/             mirrors adaptive_ct/ (core, data, representation, codec, refi
 The currently verified Windows environment is:
 
 - Python 3.10.11
-- PyTorch 2.11.0+cu128
-- CUDA Toolkit/runtime 12.8
+- PyTorch 2.11.0+cu130
+- CUDA Toolkit 13.0 (must match the PyTorch CUDA build to compile the extension)
 - NVIDIA GPU with CUDA support
 - Visual Studio C++ build tools
 - Node.js 24.13 and npm 11.6 for the viewer
@@ -64,22 +64,23 @@ Create an environment and install a CUDA-enabled PyTorch build matching the
 local CUDA toolkit:
 
 ```powershell
-python -m venv .venv
+py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip setuptools wheel ninja
+python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 python -m pip install numpy pyyaml pillow
 ```
 
 Build the native extension:
 
 ```powershell
-python setup.py build_ext --inplace
+python setup.py build_ext --inplace   # or scriptsuild_native.ps1
 ```
 
 Check that the CUDA backend loads:
 
 ```powershell
-python -c "from adaptive_ct.backend import require_native; require_native(); print('native backend: ok')"
+python -c "from adaptive_ct.core.projector import require_native; require_native(); print('native backend: ok')"
 ```
 
 ## Dataset Format
@@ -123,7 +124,7 @@ An optional `proj_val` list may define a validation split. Update
 ## Training
 
 ```powershell
-py -3.10 -m adaptive_ct.training --config configs\stage7\p1.yaml
+.venv\Scripts\python.exe -m adaptive_ct.training --config configs\stage7\p1.yaml
 ```
 
 Controls: `p0.yaml` (P0 leaves), `p0_longft.yaml` (compute-matched P0),
@@ -132,7 +133,7 @@ writes `checkpoint.pt` (trained octree), `checkpoint_codec.pt` (deployed codec
 model), `ANVO.npz` (compact export), `training_report.json`, and slice previews.
 
 Run the tests with `scripts	est.ps1` or
-`py -3.10 -m unittest discover -s tests -t .`.
+`.venv\Scripts\python.exe -m unittest discover -s tests -t .`.
 
 ## Viewer
 

@@ -7,8 +7,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Python = "py"
-$ArgsList = @("-3.10", "-m", "adaptive_ct.viewer", "--config", $Config, "--host", $HostName, "--port", "$Port")
+$Python = Join-Path $PSScriptRoot "..\.venv\Scripts\python.exe"
+$ArgsList = @("-m", "adaptive_ct.viewer", "--config", $Config, "--host", $HostName, "--port", "$Port")
 if ($Checkpoint -ne "") {
     $ArgsList += @("--checkpoint", $Checkpoint)
 }
