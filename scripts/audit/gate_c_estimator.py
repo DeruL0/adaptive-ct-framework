@@ -115,6 +115,73 @@ for rays_n in (2_097_152, 8_388_608):
     scores[f"eta_{rays_n // 1_000_000}M"] = eta.cpu().numpy()
     scores[f"eta_density_{rays_n // 1_000_000}M"] = (eta / exposure.clamp_min(1e-12)).cpu().numpy()
 vol = nvox.cpu().numpy()
+
+
+# ---------------------------------------------------------------- signed-residual (Gauss-Newton) scores
+GAUSS = torch.tensor([-1.0 / 3**0.5, 1.0 / 3**0.5], device=dev)
+
+
+def gn_stats(m, rays, residual_model):
+    """Per-leaf gradient g_k = sum_r r * a_rk and diag Hessian H_k = sum_r a_rk^2 of the 8 trilinear DOF."""
+    n = int(m.leaf_levels.shape[0])
+    g = torch.zeros(n, 8, dtype=torch.float64, device=dev)
+    hd = torch.zeros(n, 8, dtype=torch.float64, device=dev)
+    sh = torch.tensor(m.level_shapes, dtype=torch.float32, device=dev)
+    from adaptive_ct.core.projector import bernstein_segment_ray_capacity
+    from adaptive_ct.data.rays import ray_batch
+    chunk = min(rays.chunk_rays, bernstein_segment_ray_capacity(m.level_shapes, 512.0))
+    for start in range(0, rays.observation_count, chunk):
+        batch = ray_batch(rays, start, min(start + chunk, rays.observation_count))
+        with torch.no_grad():
+            r = (residual_model.integrate_ray_batch(batch) - batch.target).double()
+            ray_ids, leaf_ids, iv = m._parallel_ray_segments(batch)
+            ang = -batch.angles.to(dev).float()
+            dirs = torch.stack([torch.cos(ang), torch.sin(ang)], 1)
+            uax = torch.stack([-torch.sin(ang), torch.cos(ang)], 1)
+            uu = -1.0 + (batch.cols.to(dev).float() + 0.5) * 2.0 / batch.detector_w
+            zz = -1.0 + (batch.rows.to(dev).float() + 0.5) * 2.0 / batch.detector_h
+            base = uax * uu[:, None]
+            half = 0.5 * (iv[:, 1] - iv[:, 0])
+            mid = 0.5 * (iv[:, 1] + iv[:, 0])
+            size = 2.0 / sh[m.leaf_levels[leaf_ids]]
+            origin = -1.0 + m.leaf_coords[leaf_ids].float() * size
+            a = torch.zeros(leaf_ids.shape[0], 8, device=dev)
+            for q in GAUSS:
+                t = mid + half * q
+                xy = base[ray_ids] + dirs[ray_ids] * t[:, None]
+                pts = torch.stack([xy[:, 0], xy[:, 1], zz[ray_ids]], 1)
+                a += trilinear(((pts - origin) / size).clamp(0, 1)) * half[:, None]
+            a = a.double()
+            g.index_add_(0, leaf_ids, a * r[ray_ids, None])
+            hd.index_add_(0, leaf_ids, a * a)
+    return g, hd
+
+
+def gn_gain(g, hd, delta):
+    pos = hd[hd > 0]
+    lam = delta * (pos.median() if pos.numel() else 1.0)
+    return (g * g / (hd + lam)).sum(1)
+
+
+with torch.no_grad():
+    children = build_model(cfg)
+    children.prepare_sparse_from_state_dict(ck["model"])
+    children.load_state_dict(ck["model"], strict=True)
+    children = children.to(dev).eval()
+    children.split_leaves_batch(torch.arange(N, device=dev))
+    assert torch.equal(torch.div(children.leaf_coords.view(N, 8, 3), 2, rounding_mode="floor"), model.leaf_coords[:, None, :].expand(-1, 8, -1))
+rays = sample_random_rays(dataset.train, ray_count=2_097_152, detector_h=dh, detector_w=dw, samples_per_ray=1024, seed=7, chunk_rays=65536, materialize_points=False)
+gp, hp = gn_stats(model, rays, model)
+gc, hc = gn_stats(children, rays, model)
+for delta in (1e-2, 1.0):
+    parent_gain = gn_gain(gp, hp, delta)
+    child_gain = gn_gain(gc, hc, delta).view(N, 8).sum(1)
+    scores[f"gn_child_d{delta:g}"] = child_gain.cpu().numpy()
+    scores[f"gn_split_d{delta:g}"] = (child_gain - parent_gain).cpu().numpy()
+scores["gradnorm_child"] = (gc * gc).sum(1).view(N, 8).sum(1).cpu().numpy()
+scores["gradnorm_parent"] = (gp * gp).sum(1).cpu().numpy()
+del children
+torch.cuda.empty_cache()
 scores["oracle_error_e"] = e_np
 scores["random"] = np.random.default_rng(0).random(N)
 
