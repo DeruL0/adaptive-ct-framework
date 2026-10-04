@@ -135,8 +135,8 @@ def evaluate_volume(model):
         "band_sse_share": se["band"] / tot,
         "band_rmse": math.sqrt(se["band"] / cnt["band"]),
         "far_rmse": math.sqrt(se["far"] / cnt["far"]),
-        "leaves": int(model.leaf_levels.shape[0]),
-        "codec_bytes": codec_bytes(model, CODEC),
+        "leaves": int(model.leaf_levels.shape[0]) if hasattr(model, "leaf_levels") else None,
+        "codec_bytes": codec_bytes(model, CODEC) if hasattr(model, "leaf_levels") else None,
     }
 
 
@@ -186,7 +186,6 @@ def stage_s0(ds):
     model = our_tree_model(ds.train).eval()
     dh, dw = ds.detector_shape
     dense = torch.empty(D, H, W, device=dev)
-    pts_chunks = 0
     with torch.no_grad():
         for z0 in range(0, D, 8):
             z1 = min(D, z0 + 8)
@@ -421,6 +420,131 @@ def stage_solve_c_save(ds):
     save("solve_C_80_saved", ev)
 
 
+def load_checkpoint(path, latent=False):
+    ck = torch.load(path, map_location="cpu")
+    cfg = dict(ck["config"])
+    if latent:
+        cfg["model"] = dict(cfg["model"], representation="latent_p1_octree", latent_dim=4)
+    m = build_model(cfg)
+    m.prepare_sparse_from_state_dict(ck["model"])
+    m.load_state_dict(ck["model"], strict=True)
+    return m.to(dev).eval()
+
+
+def stage_main_eval(ds):
+    """Official run in output/<RUN>: volume metrics for the solved and the deployed model, slice figure vs the legacy pipeline."""
+    run_dir = ROOT / "output" / RUN
+    solved = load_checkpoint(run_dir / "checkpoint.pt")
+    legacy = load_checkpoint(ROOT / "output/stage7_dorfler_p1_256v/checkpoint.pt")
+    out = {"solved": evaluate_volume(solved), "legacy_pipeline_trained": evaluate_volume(legacy)}
+    if (run_dir / "checkpoint_codec.pt").exists():
+        out["deployed"] = evaluate_volume(load_checkpoint(run_dir / "checkpoint_codec.pt", latent=True))
+    out.update(slice_figure([solved, legacy], run_dir / "slice_vs_legacy.png"))
+    out["slice_png"] = str(run_dir / "slice_vs_legacy.png")
+    save(f"main_eval_{RUN}", out)
+
+
+class GridField:
+    """Uniform-grid field used only for the continuity capacity check (fitted to GT)."""
+
+    def __init__(self, kind, n, values):
+        self.kind, self.n, self.values = kind, n, values  # values: nodes (n+1)^3, or per-cell (n^3, 8) / (n^3,)
+
+    def eval(self):
+        return self
+
+    def forward_mu(self, pts):
+        if self.kind == "shared":
+            grid = pts[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
+            return F.grid_sample(self.values.view(1, 1, self.n + 1, self.n + 1, self.n + 1), grid, align_corners=True).view(-1)
+        q = (pts + 1.0) * 0.5 * self.n
+        cell = q.floor().clamp(0, self.n - 1)
+        lin = ((cell[:, 0] * self.n + cell[:, 1]) * self.n + cell[:, 2]).long()
+        if self.kind == "constant":
+            return self.values[lin]
+        return (trilinear((q - cell).clamp(0, 1)) * self.values[lin]).sum(1)
+
+
+def fit_shared(n, iters=40):
+    """Least squares fit of a continuous trilinear field (one value per grid corner) to GT, by conjugate gradients."""
+    x = torch.zeros((n + 1) ** 3, device=dev)
+
+    def apply(vec, rhs):  # returns F^T F vec (rhs=False) or F^T v (rhs=True)
+        vec = vec.clone().requires_grad_(True)
+        for z0 in range(0, D, 8):
+            z1 = min(D, z0 + 8)
+            pts = slab_points(z0, z1)
+            pred = GridField("shared", n, vec).forward_mu(pts)
+            if rhs:
+                gt = torch.from_numpy(np.ascontiguousarray(GT[z0:z1])).to(dev).reshape(-1)
+                (pred * gt).sum().backward()
+            else:
+                (0.5 * (pred * pred).sum()).backward()
+        return vec.grad.detach()
+
+    b = apply(x, True)
+    r = b.clone()
+    pdir = r.clone()
+    rs = float(r @ r)
+    for it in range(iters):
+        ap = apply(pdir, False)
+        alpha = rs / float(pdir @ ap)
+        x += alpha * pdir
+        r -= alpha * ap
+        rs_new = float(r @ r)
+        if it % 10 == 0:
+            print(f"shared n={n} cg it {it} rel resid {(rs_new / float(b @ b)) ** 0.5:.2e}", flush=True)
+        pdir = r + (rs_new / rs) * pdir
+        rs = rs_new
+    return GridField("shared", n, x)
+
+
+@torch.no_grad()
+def fit_cells(n, kind):
+    """Per-cell least squares: independent trilinear corners (kind='independent') or a constant per cell."""
+    cells = n**3
+    k = 8 if kind == "independent" else 1
+    A = torch.zeros(cells, k * k, device=dev)
+    B = torch.zeros(cells, k, device=dev)
+    s2 = torch.zeros(cells, dtype=torch.float64, device=dev)
+    for z0 in range(0, D, 4):
+        z1 = min(D, z0 + 4)
+        pts = slab_points(z0, z1)
+        v = torch.from_numpy(np.ascontiguousarray(GT[z0:z1])).to(dev).reshape(-1)
+        q = (pts + 1.0) * 0.5 * n
+        cell = q.floor().clamp(0, n - 1)
+        lin = ((cell[:, 0] * n + cell[:, 1]) * n + cell[:, 2]).long()
+        for s0 in range(0, lin.numel(), 2_000_000):
+            sl = slice(s0, s0 + 2_000_000)
+            bas = trilinear((q[sl] - cell[sl]).clamp(0, 1)) if k == 8 else torch.ones(lin[sl].numel(), 1, device=dev)
+            A.index_add_(0, lin[sl], (bas[:, :, None] * bas[:, None, :]).reshape(-1, k * k))
+            B.index_add_(0, lin[sl], bas * v[sl, None])
+            s2.index_add_(0, lin[sl], (v[sl] * v[sl]).double())
+    if k == 1:
+        return GridField("constant", n, (B[:, 0] / A[:, 0].clamp_min(1e-9)))
+    coef, _ = ls_solve(A, B, s2)
+    return GridField("independent", n, coef)
+
+
+def stage_continuity(ds):
+    """Capacity at (nearly) equal stored-value counts: continuous shared corners vs independent corners vs constants."""
+    fields = {
+        "shared_corners_192": fit_shared(192),
+        "independent_corners_96": fit_cells(96, "independent"),
+        "constant_192": fit_cells(192, "constant"),
+        "shared_corners_96": fit_shared(96),
+    }
+    values = {"shared_corners_192": 193**3, "independent_corners_96": 96**3 * 8, "constant_192": 192**3, "shared_corners_96": 97**3}
+    out = {}
+    for name, fld in fields.items():
+        out[name] = {**evaluate_volume(fld), "stored_values": values[name]}
+        print(name, out[name], flush=True)
+    out.update(slice_figure([fields["shared_corners_192"], fields["independent_corners_96"], fields["constant_192"]], OUT / "continuity_slice.png"))
+    out["slice_png"] = str(OUT / "continuity_slice.png")
+    out["panel_order"] = "GT | shared corners 192 | independent corners 96 | constant 192 | |error of shared corners 192|"
+    save("continuity_capacity", out)
+
+
 def stage_views(ds, iters=30000, extra=480):
     dh, dw = ds.detector_shape
     angles = torch.tensor([math.pi * (i + 0.37) / extra for i in range(extra)], dtype=torch.float32, device=dev)
@@ -436,4 +560,4 @@ def stage_views(ds, iters=30000, extra=480):
 if __name__ == "__main__":
     ds = get_dataset()
     for st in STAGES:
-        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm, "solve": stage_solve, "solve_long": stage_solve_long, "solve_c_save": stage_solve_c_save}[st](ds)
+        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm, "solve": stage_solve, "solve_long": stage_solve_long, "solve_c_save": stage_solve_c_save, "main_eval": stage_main_eval, "continuity": stage_continuity}[st](ds)
