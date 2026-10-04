@@ -337,6 +337,40 @@ def stage_warm(ds, iters=10000):
     save("warm_oracle_tree", train_fixed(m, ds.train, iters, "warm", ds, eval_every=2000))
 
 
+def stage_solve(ds, variants=None):
+    """Stage 1: cold start on the oracle tree with the fixed-tree solver (physical coefficients, c >= 0)."""
+    from adaptive_ct.training.solve import _set, solve
+    dh, dw = ds.detector_shape
+    n_rays = int(ds.train.angles.numel()) * dh * dw
+    variants = variants or {"A_full_basic": dict(passes=10, extrapolate=False), "B_full_extrapolated": dict(passes=30), "C_groups24_then_extrapolated": dict(passes=30, groups=24, group_passes=4)}
+    for name, kw in variants.items():
+        m = oracle_tree_for(ds)
+
+        def on_pass(c, m=m):
+            p = len(hist_box)
+            hist_box.append(1)
+            if p % 3 != 2:
+                return {}
+            _set(m, c)
+            e = evaluate_volume(m)
+            return {"volume_psnr_db": e["volume_psnr_db"], "band_rmse": e["band_rmse"], "far_rmse": e["far_rmse"]}
+
+        hist_box = []
+        t0 = time.time()
+        c, hist = solve(m, ds.train, detector_h=dh, detector_w=dw, on_pass=on_pass, **kw)
+        for h in hist:
+            if "objective_at_eval_point" in h:
+                h["train_mse"] = 2 * h["objective_at_eval_point"] / n_rays
+        with torch.no_grad():
+            pm = projection_metrics(render_split(m, ds.test, detector_h=dh, detector_w=dw, samples_per_ray=1024, ray_chunk=4096), ds.test.projections)
+        final = evaluate_volume(m)
+        save(f"solve_{name}", {**final, "test_projection_psnr": pm["psnr"], "seconds": time.time() - t0, "history": hist})
+
+
+def stage_solve_long(ds):
+    stage_solve(ds, {"C_groups24_then_extrapolated_80": dict(passes=80, groups=24, group_passes=4)})
+
+
 def stage_views(ds, iters=30000, extra=480):
     dh, dw = ds.detector_shape
     angles = torch.tensor([math.pi * (i + 0.37) / extra for i in range(extra)], dtype=torch.float32, device=dev)
@@ -351,4 +385,4 @@ def stage_views(ds, iters=30000, extra=480):
 if __name__ == "__main__":
     ds = get_dataset()
     for st in STAGES:
-        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm}[st](ds)
+        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm, "solve": stage_solve, "solve_long": stage_solve_long}[st](ds)
