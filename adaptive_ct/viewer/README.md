@@ -29,7 +29,7 @@ cd ..\..\..
 
 python -m adaptive_ct.viewer `
   --config configs\stage7\p1.yaml `
-  --checkpoint output\stage7_dorfler_p1_256v\checkpoint.pt `
+  --checkpoint output\main_p1_256v\checkpoint.pt `
   --open
 ```
 

@@ -5,34 +5,25 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from collections import deque
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 
 from adaptive_ct.codec.artifact import export_compact_octree_artifact
 from adaptive_ct.codec.budget import codec_bytes
 from adaptive_ct.core.config import load_config
-from adaptive_ct.core.geometry import random_training_rays
-from adaptive_ct.core.loss import projection_weight_kwargs, weighted_projection_loss
+from adaptive_ct.core.loss import projection_weight_kwargs
 from adaptive_ct.data.dataset import load_r2_dataset
-from adaptive_ct.data.rays import FixedDecisionRaySet, fixed_rss
 from adaptive_ct.data.splits import split_projection_views
 from adaptive_ct.evaluation.metrics import projection_metrics
 from adaptive_ct.evaluation.render import render_split
 from adaptive_ct.evaluation.volume import boundary_sharpness_metrics, material_volume_metrics
-from adaptive_ct.refinement.controller import DorflerController
+from adaptive_ct.refinement.controller import RefinementController
 from adaptive_ct.representation.factory import build_model
 from adaptive_ct.training.export import apply_export_codec, export_center_slice_png, finest_model_shape
-from adaptive_ct.training.plateau import plateau_ready
-from adaptive_ct.training.validate import active_milestone, validate_config
-
-
-def _make_optimizer(model, lr: float):
-    return torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
+from adaptive_ct.training.solve import solve
+from adaptive_ct.training.validate import validate_config
 
 
 @torch.no_grad()
@@ -42,30 +33,6 @@ def _initialize_constant_mu(model, value: torch.Tensor) -> None:
         return
     values = torch.full_like(model.coefficient_logits, float(value.item()))
     model.coefficient_logits.copy_(model._coefficients_to_logits(values))
-
-
-@torch.no_grad()
-def _estimate_projection_noise_variance(split, config: dict) -> dict:
-    flat = split.projections.detach().float().abs().cpu().numpy().reshape(-1)
-    max_samples = int(config.get("max_samples", 1048576))
-    if flat.size > max_samples:
-        ids = np.linspace(0, flat.size - 1, max_samples).round().astype(np.int64)
-        flat = flat[ids]
-    quantile = float(config.get("air_quantile", 0.10))
-    cutoff = float(np.quantile(flat, min(1.0, max(0.0, quantile))))
-    air = flat[flat <= cutoff]
-    if air.size < 2:
-        air = flat
-    variance = max(float(np.var(air)), float(config.get("min_variance", 1.0e-8)))
-    return {
-        "enabled": True,
-        "source": "low_attenuation_training_detector_pixels",
-        "air_quantile": quantile,
-        "air_cutoff": cutoff,
-        "sample_count": int(air.size),
-        "variance": variance,
-        "frozen": True,
-    }
 
 
 def _split_dev_views(dataset, dataset_cfg: dict, seed: int):
@@ -83,14 +50,12 @@ def _split_dev_views(dataset, dataset_cfg: dict, seed: int):
 
 
 def run_training(config_path: str | Path) -> dict:
+    """Rounds of: solve the fixed tree to convergence -> score leaves -> split a batch; then a final strict solve."""
     run_start_time = time.perf_counter()
     config = load_config(config_path)
     validate_config(config)
     training_seed = int((config.get("training", {}) or {}).get("seed", 0))
     torch.manual_seed(training_seed)
-    np.random.seed(training_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(training_seed)
     device = torch.device(config.get("device", "cuda"))
     out_dir = Path(config["output"]["dir"]).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -114,171 +79,61 @@ def run_training(config_path: str | Path) -> dict:
     materialize_ray_points = not model.prefer_compact_ray_batch()
 
     train_cfg = config["training"]
-    optimizer = _make_optimizer(model, float(train_cfg.get("lr", 2e-2)))
-    iterations = int(train_cfg.get("iterations", 300))
-    batch_rays = int(train_cfg.get("batch_rays", 4096))
-    log_every = int(train_cfg.get("log_every", 25))
-    eval_every = int(train_cfg.get("eval_every", 100))
-    eval_views = int(train_cfg.get("eval_test_views", 3))
-    compute_eval = bool(train_cfg.get("compute_eval", True))
-    eval_split = dataset.validation
-    eval_split_name = "validation"
-    if eval_split is None and bool(train_cfg.get("allow_test_during_training", False)):
-        eval_split, eval_split_name = dataset.test, "test"
-
-    spec = active_milestone(config)
-    global_byte_budget = int(spec["byte_budget"])
-    noise_cfg = train_cfg.get("noise_normalization", {}) or {}
-    noise_info = (
-        _estimate_projection_noise_variance(dataset.train, noise_cfg)
-        if bool(noise_cfg.get("enabled", False))
-        else {"enabled": False, "variance": 1.0, "frozen": True}
-    )
-    fixed_cfg = train_cfg["fixed_decision_rays"]
-    fixed_interval = max(1, int(fixed_cfg.get("interval", 1)))
-    fixed_set = FixedDecisionRaySet.sampled(
-        dataset.train,
-        ray_count=int(fixed_cfg.get("ray_count", batch_rays)),
-        detector_h=detector_h,
-        detector_w=detector_w,
-        samples_per_ray=samples_per_ray,
-        seed=int(fixed_cfg.get("seed", training_seed + 104729)),
-        chunk_rays=int(fixed_cfg.get("chunk_rays", train_cfg.get("eval_ray_chunk", 65536))),
-        materialize_points=materialize_ray_points,
-    )
-    controller = DorflerController(
-        spec=spec,
+    solver_cfg = train_cfg["solver"]
+    ref_cfg = train_cfg["refinement"]
+    eval_chunk = int(train_cfg.get("eval_ray_chunk", 65536))
+    weight_kwargs = projection_weight_kwargs(train_cfg, iteration=1)
+    controller = RefinementController(
+        spec=ref_cfg,
         estimator_split=dataset.train,
-        dev_split=dataset.validation,
         detector_h=detector_h,
         detector_w=detector_w,
         samples_per_ray=samples_per_ray,
         materialize_points=materialize_ray_points,
-        chunk_rays=int(train_cfg.get("eval_ray_chunk", 65536)),
+        chunk_rays=eval_chunk,
         seed=training_seed,
-        byte_budget=global_byte_budget,
+        byte_budget=int(ref_cfg["byte_budget"]),
     )
 
-    ema_alpha = 2.0 / float(max(1, int(spec.get("ema_span", 50))) + 1)
-    plateau_values = deque(maxlen=int(spec.get("window", 200)))
-    plateau_ema = None
-    fixed_last = None
-    last_trigger = 0
-    refining = True
-    history, growth_events, evaluation_history = [], [], []
-    dynamic_stop_iteration = None
-    completed_iterations = 0
+    def held_out_metric():
+        split = dataset.validation
+        if split is None:
+            return None
+        with torch.no_grad():
+            rendered = render_split(model, split, detector_h=detector_h, detector_w=detector_w, samples_per_ray=samples_per_ray, ray_chunk=eval_chunk)
+        return projection_metrics(rendered, split.projections)
+
+    rounds, history, growth_events = [], [], []
+    max_rounds = int(ref_cfg.get("max_rounds", 32))
     start_time = time.perf_counter()
-    for iteration in range(1, iterations + 1):
-        completed_iterations = iteration
-        if refining:
-            ready, trigger_info = plateau_ready(spec, controller, plateau_values, iteration, last_trigger)
-            if ready:
-                last_trigger = iteration
-                plateau_values.clear()
-                torch.save(
-                    {"model": model.state_dict(), "config": config, "iteration": iteration - 1},
-                    out_dir / "checkpoint_latest.pt",
-                )
-                growth_start = time.perf_counter()
-                active, summary = controller.on_trigger(
-                    model,
-                    iteration=iteration,
-                    noise_variance=float(noise_info.get("variance", 0.0)) if noise_info.get("enabled") else 0.0,
-                    weight_kwargs=projection_weight_kwargs(train_cfg, iteration=iteration),
-                )
-                optimizer = _make_optimizer(model, float(train_cfg.get("lr", 2e-2)))
-                event = {
-                    "iteration": iteration,
-                    "operation": "dorfler_h_split",
-                    "candidate_scope": "all_splittable_leaves",
-                    "active": active,
-                    "elapsed_sec": time.perf_counter() - growth_start,
-                    **trigger_info,
-                    **summary,
-                    "structural_round_index": int(summary.get("dorfler_round", 0)),
-                    "dynamic_refinement": {
-                        "round": int(summary.get("dorfler_round", 0)),
-                        "stop": bool(summary.get("stop", False)),
-                        "stop_reasons": list(summary.get("stop_reasons", [])),
-                    },
-                }
-                if summary.get("stop", False):
-                    refining = False
-                    dynamic_stop_iteration = min(
-                        iterations, iteration + max(0, int(spec.get("final_finetune_iterations", 1000)))
-                    )
-                growth_events.append(event)
-                print(json.dumps({"grow": event}))
-
-        batch = random_training_rays(
-            dataset.train,
-            batch_rays=batch_rays,
-            detector_h=detector_h,
-            detector_w=detector_w,
-            samples_per_ray=samples_per_ray,
-            materialize_points=materialize_ray_points,
-        )
-        prediction = model.integrate_ray_batch(batch)
-        loss = weighted_projection_loss(
-            prediction, batch.target, **projection_weight_kwargs(train_cfg, iteration=iteration)
-        )
-        projection_mse = F.mse_loss(prediction, batch.target)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-
-        if iteration == 1 or iteration % fixed_interval == 0:
-            fixed_last = fixed_rss(model, fixed_set)
-            plateau_ema = (
-                fixed_last["mse"]
-                if plateau_ema is None
-                else (1.0 - ema_alpha) * plateau_ema + ema_alpha * fixed_last["mse"]
-            )
-            plateau_values.append(float(plateau_ema))
-
-        if iteration == 1 or iteration % log_every == 0:
-            stats = model.stats()
-            rate_bytes = codec_bytes(model, controller.codec)
-            distortion = float(fixed_last["mse"]) / max(float(noise_info.get("variance", 1.0)), 1.0e-12)
-            row = {
-                "iteration": iteration,
-                "loss": float(loss.detach().item()),
-                "projection_mse": float(projection_mse.detach().item()),
-                "noise_normalized_distortion": distortion,
-                "rate_bytes": int(rate_bytes),
-                "plateau_loss": float(fixed_last["mse"]),
-                "plateau_source": "fixed_decision_rays",
-                "parameter_count": stats.parameter_count,
-                "model_bytes": stats.model_bytes,
-                "leaf_cells": stats.leaf_cells,
-                "active_by_level": list(stats.active_by_level),
-                "byte_budget": global_byte_budget,
-                "within_byte_budget": rate_bytes <= global_byte_budget,
-            }
-            print(json.dumps(row))
-            history.append(row)
-
-        if compute_eval and eval_split is not None and (iteration % eval_every == 0 or iteration == iterations):
-            sub_split = type(eval_split)(
-                angles=eval_split.angles[:eval_views],
-                projections=eval_split.projections[:eval_views],
-                paths=eval_split.paths[:eval_views],
-            )
-            rendered = render_split(
-                model,
-                sub_split,
-                detector_h=detector_h,
-                detector_w=detector_w,
-                samples_per_ray=samples_per_ray,
-                ray_chunk=int(train_cfg.get("eval_ray_chunk", 4096)),
-            )
-            metric = projection_metrics(rendered, sub_split.projections)
-            evaluation_history.append({"iteration": iteration, **metric})
-            print(json.dumps({"iteration": iteration, f"{eval_split_name}_projection": metric}))
-
-        if dynamic_stop_iteration is not None and iteration >= dynamic_stop_iteration:
+    for r in range(max_rounds + 1):
+        final = controller.stopped or r == max_rounds
+        passes = int(solver_cfg["final_passes"] if final else solver_cfg["round_passes"])
+        group_passes = int(solver_cfg.get("first_group_passes", 4) if r == 0 else solver_cfg.get("group_passes", 2))
+        t0 = time.perf_counter()
+        _, hist = solve(model, dataset.train, detector_h=detector_h, detector_w=detector_w, passes=passes,
+                        groups=int(solver_cfg.get("groups", 24)), group_passes=group_passes,
+                        extrapolate=bool(solver_cfg.get("extrapolate", True)))
+        last = hist[-1] if hist else {}
+        entry = {
+            "round": r,
+            "final": final,
+            "passes": passes,
+            "solve_seconds": time.perf_counter() - t0,
+            "objective": last.get("objective_at_eval_point"),
+            "optimality_residual": last.get("optimality_residual"),
+            "leaves": int(model.leaf_levels.shape[0]),
+            "codec_bytes": codec_bytes(model, controller.codec),
+            "held_out_projection": held_out_metric(),
+        }
+        history.extend({**h, "round": r} for h in hist)
+        rounds.append(entry)
+        print(json.dumps({"round": entry}, default=float), flush=True)
+        if final:
             break
+        _, event = controller.refine(model, weight_kwargs=weight_kwargs)
+        growth_events.append(event)
+        print(json.dumps({"grow": event}, default=float), flush=True)
 
     elapsed = time.perf_counter() - start_time
     trained_model = model
@@ -286,12 +141,12 @@ def run_training(config_path: str | Path) -> dict:
         model,
         dataset,
         config,
-        batch_rays=batch_rays,
+        batch_rays=int(((config.get("export", {}) or {}).get("codec") or {}).get("finetune_batch_rays", 65536)),
         detector_h=detector_h,
         detector_w=detector_w,
         samples_per_ray=samples_per_ray,
         materialize_points=materialize_ray_points,
-        weight_kwargs=projection_weight_kwargs(train_cfg, iteration=completed_iterations),
+        weight_kwargs=weight_kwargs,
     )
     stats = model.stats()
     metrics_cfg = config.get("metrics", {}) or {}
@@ -302,7 +157,7 @@ def run_training(config_path: str | Path) -> dict:
             detector_h=detector_h,
             detector_w=detector_w,
             samples_per_ray=samples_per_ray,
-            ray_chunk=int(train_cfg.get("eval_ray_chunk", 4096)),
+            ray_chunk=eval_chunk,
         )
         projection_test = projection_metrics(final_render, dataset.test.projections)
     else:
@@ -328,12 +183,12 @@ def run_training(config_path: str | Path) -> dict:
     )
 
     checkpoint_path = out_dir / "checkpoint.pt"
-    final_checkpoint = {"model": trained_model.state_dict(), "config": config, "iteration": completed_iterations}
+    final_checkpoint = {"model": trained_model.state_dict(), "config": config, "rounds": len(rounds)}
     torch.save(final_checkpoint, checkpoint_path)
     torch.save(final_checkpoint, out_dir / "checkpoint_latest.pt")
     if model is not trained_model:
         torch.save(
-            {"model": model.state_dict(), "config": config, "iteration": completed_iterations},
+            {"model": model.state_dict(), "config": config, "rounds": len(rounds)},
             out_dir / "checkpoint_codec.pt",
         )
     export_summary = {}
@@ -355,17 +210,13 @@ def run_training(config_path: str | Path) -> dict:
     report = {
         "config": str(Path(config_path).resolve()),
         "training_seed": training_seed,
-        "configured_iterations": iterations,
-        "completed_iterations": completed_iterations,
-        "dynamic_stop_iteration": dynamic_stop_iteration,
         "dataset": str(dataset.root),
         "evaluation_protocol": {
             "training_views": int(dataset.train.angles.numel()),
             "validation_views": int(dataset.validation.angles.numel()) if dataset.validation is not None else 0,
             "test_views": int(dataset.test.angles.numel()),
-            "intermediate_split": eval_split_name if eval_split is not None else None,
-            "test_used_during_training": eval_split is dataset.test,
-            "test_role": "final evaluation only" if eval_split is not dataset.test else "legacy intermediate and final evaluation",
+            "held_out_role": "per-round projection check only (not used for any decision)",
+            "test_role": "final evaluation only",
         },
         "elapsed_sec": elapsed,
         "total_elapsed_sec": time.perf_counter() - run_start_time,
@@ -381,34 +232,20 @@ def run_training(config_path: str | Path) -> dict:
             "mode": getattr(model, "integration_mode", "native_or_sampled"),
         },
         "training_objective": {
-            "global_objective": {
-                "form": "minimize D(y, A_T[f]) subject to codec_bytes(T, f) <= B_max",
-                "byte_budget": global_byte_budget,
-                "rate_bytes_source": "deterministic codec byte model",
-                "codec": controller.codec,
-            },
-            "noise_normalization": noise_info,
-            "projection_loss": "weighted_least_squares",
+            "form": "min_{c>=0} 1/2 ||A c - y||^2 per fixed tree; tree grows until codec_bytes <= byte_budget",
+            "byte_budget": int(ref_cfg["byte_budget"]),
+            "codec": controller.codec,
+            "solver": solver_cfg,
             "dense_volume_loaded_during_training": False,
-            "fixed_decision_rays": {
-                "ray_count": int(fixed_set.observation_count),
-                "interval": fixed_interval,
-                "last_mse": float(fixed_last["mse"]) if fixed_last is not None else None,
-                "selection_split": "train",
-                "note": "Frozen training rays are the plateau ruler; optimization still uses random rays.",
-            },
         },
-        "dorfler": {
+        "refinement": {
             "rounds": controller.round_index,
-            "stopped": controller.stopped,
             "stop_reasons": list(controller.stop_reasons),
-            "rollback_enabled": controller.rollback_enabled,
-            "theta": controller.theta,
-            "dev_role": "rollback verdict and diagnostics only",
+            "gain_share": controller.share,
         },
+        "rounds": rounds,
         "codec": codec_summary,
         "history": history,
-        "evaluation_history": evaluation_history,
         "growth_events": growth_events,
         # Kept for viewer compatibility with older reports.
         "adaptive_events": [],

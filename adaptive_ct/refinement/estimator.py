@@ -10,20 +10,19 @@ from adaptive_ct.data.rays import FixedDecisionRaySet, ray_batch
 
 
 @torch.no_grad()
-def attributed_excess_residual(
+def attributed_residual_energy(
     model,
     rays: FixedDecisionRaySet,
     *,
-    noise_variance: float,
     weight_kwargs: dict,
     max_buffer_mb: float = 512.0,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-    """Noise-corrected residual energy per leaf.
+    """Residual energy per leaf.
 
-    ``eta_K = sum_r w_r (res_r^2 - sigma^2) * l_rK / L_r`` with ``l_rK`` the exact
-    chord length of ray r inside leaf K and ``L_r`` its total length.  The sum
-    over leaves of ``eta`` equals the sampled excess residual energy.  Also
-    returns per-leaf exposure (total chord length) and a summary.
+    ``eta_K = sum_r w_r res_r^2 * l_rK / L_r``: each ray's squared residual is shared among the
+    leaves it crosses in proportion to the chord length ``l_rK`` inside leaf K (``L_r`` = total
+    length), so the leaf values add up to the sampled residual energy.  Also returns per-leaf
+    exposure (total chord length) and a summary.
     """
     leaf_count = int(model.leaf_levels.shape[0])
     device = model.leaf_levels.device
@@ -34,28 +33,23 @@ def attributed_excess_residual(
         bernstein_segment_ray_capacity(model.level_shapes, float(max_buffer_mb)),
     )
     rss = 0.0
-    excess_total = 0.0
     for start in range(0, rays.observation_count, chunk):
         stop = min(start + chunk, rays.observation_count)
         batch = ray_batch(rays, start, stop)
         residual = model.integrate_ray_batch(batch) - batch.target
         weights = projection_weights(batch.target, **weight_kwargs)
         energy = weights * torch.square(residual)
-        excess = energy - weights * float(noise_variance)
         ray_ids, leaf_ids, intervals = model._parallel_ray_segments(batch)
         segment = intervals[:, 1] - intervals[:, 0]
         path = torch.zeros((batch.num_rays,), dtype=segment.dtype, device=device)
         path.scatter_add_(0, ray_ids, segment)
         share = segment / path[ray_ids].clamp_min(1.0e-12)
-        eta.scatter_add_(0, leaf_ids, excess[ray_ids] * share)
+        eta.scatter_add_(0, leaf_ids, energy[ray_ids] * share)
         exposure.scatter_add_(0, leaf_ids, segment)
         rss += float(energy.sum().item())
-        excess_total += float(excess.sum().item())
     return eta, exposure, {
         "estimator_rays": int(rays.observation_count),
         "estimator_weighted_rss": rss,
-        "estimator_excess_total": excess_total,
-        "estimator_excess_fraction": excess_total / max(rss, 1.0e-30),
         "covered_fraction": float((exposure > 0).float().mean().item()) if leaf_count else 0.0,
     }
 

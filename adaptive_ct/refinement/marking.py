@@ -1,11 +1,11 @@
-"""Dorfler marking."""
+"""Batch selection: the smallest set of best-ranked leaves carrying a given share of the total gain."""
 
 from __future__ import annotations
 
 import torch
 
 
-def dorfler_mark(
+def mark_by_gain_share(
     eta: torch.Tensor,
     candidate_ids: torch.Tensor,
     *,

@@ -65,9 +65,8 @@ def _write_dataset(root: Path, train_views: int = 12) -> Path:
     return dataset_root
 
 
-def _config(dataset_root: Path, output_root: Path, *, codec: dict, degree, rollback: bool) -> dict:
+def _config(dataset_root: Path, output_root: Path, *, codec: dict, degree) -> dict:
     return {
-        "research": {"scope": "stage7_dorfler"},
         "device": "cpu",
         "dataset": {"root": str(dataset_root), "dev_views": 3, "dev_seed": 1},
         "geometry": {"samples_per_ray": 8},
@@ -83,47 +82,10 @@ def _config(dataset_root: Path, output_root: Path, *, codec: dict, degree, rollb
         },
         "training": {
             "seed": 3,
-            "iterations": 120,
-            "batch_rays": 64,
-            "lr": 0.05,
-            "tv_weight": 0.0,
-            "log_every": 50,
-            "compute_eval": False,
+            "eval_ray_chunk": 4096,
             "allow_test_during_training": False,
-            "noise_normalization": {"enabled": True, "air_quantile": 0.1, "min_variance": 1.0e-8},
-            "fixed_decision_rays": {
-                "enabled": True,
-                "use_for_plateau": True,
-                "ray_count": 128,
-                "interval": 1,
-                "chunk_rays": 128,
-            },
-            "progressive": {
-                "milestones": {},
-                "convergence_milestones": [
-                    {
-                        "operation": "dorfler_h_split",
-                        "repeat_until_stopped": True,
-                        "min_iteration": 6,
-                        "min_iterations_after_previous": 6,
-                        "window": 4,
-                        "ema_span": 2,
-                        "relative_improvement": 10.0,
-                        "max_relative_regression": 10.0,
-                        "final_finetune_iterations": 5,
-                        "theta": 0.5,
-                        "estimator_rays": 256,
-                        "dev_ray_count": 128,
-                        "diagnostic_rays": 64,
-                        "min_footprint_px": 1.0,
-                        "rollback": rollback,
-                        "max_halvings": 2,
-                        "byte_budget": 12000,
-                        "codec": codec,
-                    }
-                ],
-            },
-            "adaptive": {"enabled": False},
+            "solver": {"groups": 3, "first_group_passes": 2, "group_passes": 1, "round_passes": 6, "final_passes": 8},
+            "refinement": {"gain_share": 0.5, "estimator_rays": 256, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3, "codec": codec},
         },
         "metrics": {
             "compute_projection_metrics": True,
@@ -133,19 +95,17 @@ def _config(dataset_root: Path, output_root: Path, *, codec: dict, degree, rollb
         "export": {
             "codec": {**codec, "finetune_iterations": 5, "finetune_lr": 0.01},
             "compact_octree": {"enabled": True, "artifact_name": "ANVO.npz", "quantization": "float16", "topology": "packed_hierarchy"},
-            "mact": {"enabled": False},
-            "surface": {"enabled": False},
         },
         "output": {"dir": str(output_root)},
     }
 
 
 class DorflerTrainingTests(unittest.TestCase):
-    def _run(self, *, codec: dict, degree, rollback: bool):
+    def _run(self, *, codec: dict, degree):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             dataset_root = _write_dataset(root)
-            config = _config(dataset_root, root / "output", codec=codec, degree=degree, rollback=rollback)
+            config = _config(dataset_root, root / "output", codec=codec, degree=degree)
             config_path = root / "config.yaml"
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
             report = run_training(config_path)
@@ -159,30 +119,27 @@ class DorflerTrainingTests(unittest.TestCase):
         report, artifacts = self._run(
             codec={"type": "latent_p1", "latent_dim": 4, "quantization": "float16"},
             degree=[1, 1, 1],
-            rollback=True,
         )
-        events = [event for event in report["growth_events"] if event["operation"] == "dorfler_h_split"]
+        events = [event for event in report["growth_events"] if event.get("active_splits")]
         self.assertGreaterEqual(len(events), 1)
         self.assertGreater(events[0]["active_splits"], 0)
-        self.assertLess(events[0]["split_function_error"], 1e-4)
         self.assertEqual(report["evaluation_protocol"]["training_views"], 9)
         self.assertEqual(report["evaluation_protocol"]["validation_views"], 3)
         self.assertEqual(report["model"]["representation"], "latent_p1_octree")
         self.assertIn("projection_test_deployed", report["codec"])
         self.assertIn("projection_test_after_pca", report["codec"])
         self.assertTrue(report["codec"]["quantization_applied_in_eval"])
-        self.assertEqual(report["dorfler"]["rollback_enabled"], True)
+        self.assertGreaterEqual(len(report["rounds"]), 2)
+        self.assertTrue(report["rounds"][-1]["final"])
         self.assertTrue(all(artifacts.values()), artifacts)
 
-    def test_p0_control_without_rollback_runs(self):
+    def test_p0_control_runs(self):
         report, artifacts = self._run(
             codec={"type": "p0", "quantization": "float16"},
             degree=[0, 0, 0],
-            rollback=False,
         )
-        events = [event for event in report["growth_events"] if event["operation"] == "dorfler_h_split"]
+        events = [event for event in report["growth_events"] if event.get("active_splits")]
         self.assertGreaterEqual(len(events), 1)
-        self.assertFalse(report["dorfler"]["rollback_enabled"])
         self.assertEqual(report["model"]["representation"], "bernstein_octree")
         self.assertFalse(artifacts["checkpoint_codec.pt"])
         self.assertTrue(artifacts["ANVO.npz"])

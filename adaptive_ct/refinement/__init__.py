@@ -1,1 +1,1 @@
-"""Projection-driven Dorfler refinement."""
+"""Structure update on a solved tree: score leaves, select a batch, split it."""

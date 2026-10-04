@@ -18,14 +18,16 @@ diagram, module responsibilities, and the training protocol.
 
 ## Pipeline
 
-1. Start from the L0 root grid with coefficients set to the projection mean.
-2. Train with random exact-projected rays (weighted MSE, Adam).
-3. When the fixed-ray loss plateaus, the Dörfler controller estimates per-leaf
-   residual energy, marks the smallest set carrying a fraction `theta` of it
-   (rate-ranked, byte-budget truncated), and splits those leaves with exact
-   de Casteljau subdivision. A held-out dev check can roll a harmful batch back.
-4. Stop at the byte budget, when nothing is splittable, or when rollback is
-   exhausted; fine-tune, convert to the codec, round to fp16, and evaluate.
+1. Start from the 48³ root grid with every coefficient set to half the mean projection value.
+2. Each round, with the tree fixed, solve `min_{c>=0} 1/2 ||A c - y||^2` over the physical leaf
+   coefficients: residual `r = A c - y`, gradient `g = A^T r`, per-coefficient step `1/d` with
+   `d = A^T A 1`, update `c <- max(0, c - g/d)`; angle-interleaved grouped updates first, then
+   full-data updates with extrapolation. The optimality residual is reported per round.
+3. On the solved model, score leaves by residual energy shared along each ray in proportion to
+   chord length, split the best-scored batch carrying half the total score within the byte
+   budget; splits reproduce the parent function exactly, so the next solve continues from it.
+4. When the budget is spent, run a longer final solve, convert to the deployed codec, evaluate,
+   and write the compact artifact.
 
 ## Layout
 
@@ -37,10 +39,10 @@ adaptive_ct/
   codec/           byte model, fp16 quantization, fine-tuning, compact artifact
   refinement/      residual estimator, Dörfler marking, refinement controller
   evaluation/      metrics, rendering, ground-truth volume evaluation
-  training/        training loop, plateau detection, export, config checks
+  training/        rounds of fixed-tree solve + structure update, export, checks
   viewer/          Python server and Three.js frontend
 native/            CUDA extension sources
-configs/stage7/    p1, p0, p0_longft, p1_nogate configurations
+configs/stage7/    p1 (main) and p0 (constant-leaf control) configurations
 docs/              architecture.md
 tests/             mirrors adaptive_ct/ (core, data, representation, codec, refinement, training, viewer)
 ```
@@ -127,8 +129,7 @@ An optional `proj_val` list may define a validation split. Update
 .venv\Scripts\python.exe -m adaptive_ct.training --config configs\stage7\p1.yaml
 ```
 
-Controls: `p0.yaml` (P0 leaves), `p0_longft.yaml` (compute-matched P0),
-`p1_nogate.yaml` (no rollback). Edit `dataset.root` and `output.dir` first. A run
+Control: `p0.yaml` (constant leaves). Edit `dataset.root` and `output.dir` first. A run
 writes `checkpoint.pt` (trained octree), `checkpoint_codec.pt` (deployed codec
 model), `ANVO.npz` (compact export), `training_report.json`, and slice previews.
 
@@ -151,7 +152,7 @@ Start the viewer:
 ```powershell
 python -m adaptive_ct.viewer `
   --config configs\stage7\p1.yaml `
-  --checkpoint output\stage7_dorfler_p1_256v\checkpoint.pt `
+  --checkpoint output\main_p1_256v\checkpoint.pt `
   --host 127.0.0.1 `
   --port 8765 `
   --open

@@ -5,15 +5,13 @@ import torch
 
 from adaptive_ct.representation.octree import BernsteinOctree
 from adaptive_ct.data.dataset import ProjectionSplit
-from adaptive_ct.data.rays import fixed_rss
-from adaptive_ct.refinement.controller import DorflerController
-from adaptive_ct.refinement.estimator import attributed_excess_residual, resolvable_mask
+from adaptive_ct.refinement.controller import RefinementController
+from adaptive_ct.refinement.estimator import attributed_residual_energy, resolvable_mask
 from adaptive_ct.codec.budget import codec_bytes, split_delta_bytes
-from adaptive_ct.refinement.marking import dorfler_mark
+from adaptive_ct.refinement.marking import mark_by_gain_share
 from adaptive_ct.data.rays import sample_random_rays
 from adaptive_ct.core.geometry import detector_grid, make_parallel_ray_points
 from adaptive_ct.representation.latent import LatentP1Octree
-from adaptive_ct.representation.snapshot import clone_sparse_state, restore_sparse_state
 
 
 def _compact_raw_payload_bytes(model, quantization: str = "float16") -> int:
@@ -29,6 +27,12 @@ def _compact_raw_payload_bytes(model, quantization: str = "float16") -> int:
 
 
 DETECTOR = 8
+
+
+def _batch(rays):
+    from adaptive_ct.data.rays import ray_batch
+
+    return ray_batch(rays, 0, rays.observation_count)
 WEIGHT = {"mode": "uniform"}
 
 
@@ -82,19 +86,19 @@ class DorflerMarkTests(unittest.TestCase):
     def test_mark_is_minimal_prefix_reaching_theta(self):
         eta = torch.tensor([5.0, 1.0, 3.0, 1.0])
         ids = torch.tensor([10, 11, 12, 13])
-        marked, info = dorfler_mark(eta, ids, delta_bytes=10, theta=0.5, remaining_bytes=float("inf"))
+        marked, info = mark_by_gain_share(eta, ids, delta_bytes=10, theta=0.5, remaining_bytes=float("inf"))
         self.assertEqual(marked.tolist(), [10])
         self.assertAlmostEqual(info["eta_fraction"], 0.5)
-        marked, _ = dorfler_mark(eta, ids, delta_bytes=10, theta=0.51, remaining_bytes=float("inf"))
+        marked, _ = mark_by_gain_share(eta, ids, delta_bytes=10, theta=0.51, remaining_bytes=float("inf"))
         self.assertEqual(marked.tolist(), [10, 12])
 
     def test_mark_respects_byte_and_parent_caps(self):
         eta = torch.tensor([4.0, 3.0, 2.0, 1.0])
         ids = torch.arange(4)
-        marked, info = dorfler_mark(eta, ids, delta_bytes=10, theta=1.0, remaining_bytes=25.0)
+        marked, info = mark_by_gain_share(eta, ids, delta_bytes=10, theta=1.0, remaining_bytes=25.0)
         self.assertEqual(marked.tolist(), [0, 1])
         self.assertEqual(info["k_bytes"], 2)
-        marked, _ = dorfler_mark(eta, ids, delta_bytes=10, theta=1.0, remaining_bytes=float("inf"), max_parents=1)
+        marked, _ = mark_by_gain_share(eta, ids, delta_bytes=10, theta=1.0, remaining_bytes=float("inf"), max_parents=1)
         self.assertEqual(marked.tolist(), [0])
 
 
@@ -117,7 +121,7 @@ class ByteModelTests(unittest.TestCase):
 
 
 class EstimatorTests(unittest.TestCase):
-    def test_excess_residual_sums_to_sampled_energy(self):
+    def test_residual_energy_sums_to_sampled_energy(self):
         truth = _truth()
         split = _split_from(truth)
         model = _model()
@@ -131,15 +135,10 @@ class EstimatorTests(unittest.TestCase):
             chunk_rays=128,
             materialize_points=False,
         )
-        eta, exposure, summary = attributed_excess_residual(model, rays, noise_variance=0.0, weight_kwargs=WEIGHT)
+        eta, exposure, summary = attributed_residual_energy(model, rays, weight_kwargs=WEIGHT)
         self.assertAlmostEqual(float(eta.sum()), summary["estimator_weighted_rss"], places=3)
         self.assertGreater(float((exposure > 0).float().mean()), 0.0)
-        shifted, _, shifted_summary = attributed_excess_residual(model, rays, noise_variance=1e-3, weight_kwargs=WEIGHT)
-        self.assertAlmostEqual(
-            float(shifted.sum()),
-            summary["estimator_weighted_rss"] - 1e-3 * rays.observation_count,
-            places=2,
-        )
+
 
     def test_resolvable_mask_follows_pixel_footprint(self):
         model = _model(levels=(2, 4, 8), degree=0)
@@ -169,9 +168,9 @@ class SplitAndCodecTests(unittest.TestCase):
             chunk_rays=128,
             materialize_points=False,
         )
-        before = fixed_rss(model, rays)["rss"]
+        before = float(((model.integrate_ray_batch(_batch(rays)) - _batch(rays).target) ** 2).sum())
         model.split_leaves_batch(torch.tensor([0, 2, 5]))
-        after = fixed_rss(model, rays)["rss"]
+        after = float(((model.integrate_ray_batch(_batch(rays)) - _batch(rays).target) ** 2).sum())
         self.assertAlmostEqual(before, after, delta=1e-5 * max(before, 1.0))
 
     def test_latent_codec_is_lossless_at_full_rank(self):
@@ -183,80 +182,36 @@ class SplitAndCodecTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
-    def _controller(self, split, dev, **spec):
-        base = {
-            "theta": 0.5,
-            "estimator_rays": 512,
-            "dev_ray_count": 256,
-            "diagnostic_rays": 128,
-            "min_footprint_px": 1.0,
-            "max_halvings": 2,
-            "codec": {"type": "p1", "quantization": "float16"},
-        }
+    def _controller(self, split, **spec):
+        base = {"gain_share": 0.5, "estimator_rays": 512, "min_footprint_px": 1.0, "codec": {"type": "p1", "quantization": "float16"}}
         base.update(spec)
-        return DorflerController(
-            spec=base,
-            estimator_split=split,
-            dev_split=dev,
-            detector_h=DETECTOR,
-            detector_w=DETECTOR,
-            samples_per_ray=8,
-            materialize_points=False,
-            chunk_rays=128,
-            seed=5,
-            byte_budget=None,
-        )
+        return RefinementController(spec=base, estimator_split=split, detector_h=DETECTOR, detector_w=DETECTOR, samples_per_ray=8,
+                                    materialize_points=False, chunk_rays=128, seed=5, byte_budget=spec.get("byte_budget"))
 
-    def test_round_marks_splits_and_is_function_preserving(self):
+    def test_round_splits_a_batch_without_changing_projections(self):
         truth = _truth()
         split = _split_from(truth)
-        dev = _split_from(truth, views=3)
         model = _model()
-        controller = self._controller(split, dev)
-        leaves_before = int(model.leaf_levels.shape[0])
-        active, event = controller.on_trigger(model, iteration=1, noise_variance=0.0, weight_kwargs=WEIGHT)
+        rays = sample_random_rays(split, ray_count=256, detector_h=DETECTOR, detector_w=DETECTOR, samples_per_ray=8, seed=3, chunk_rays=128, materialize_points=False)
+        before = float(model.integrate_ray_batch(_batch(rays)).sum())
+        leaves = int(model.leaf_levels.shape[0])
+        active, event = self._controller(split).refine(model, weight_kwargs=WEIGHT)
         self.assertGreater(active, 0)
-        self.assertEqual(int(model.leaf_levels.shape[0]), leaves_before + 7 * active)
-        self.assertLess(event["split_function_error"], 1e-5)
+        self.assertEqual(int(model.leaf_levels.shape[0]), leaves + 7 * active)
+        self.assertAlmostEqual(float(model.integrate_ray_batch(_batch(rays)).sum()), before, delta=1e-4 * abs(before))
         self.assertFalse(event["stop"])
 
-    def test_no_excess_residual_stops_at_noise_floor(self):
+    def test_exact_model_has_nothing_to_split(self):
         truth = _truth()
-        split = _split_from(truth)
-        controller = self._controller(split, None, rollback=False)
-        _, event = controller.on_trigger(truth, iteration=1, noise_variance=1.0, weight_kwargs=WEIGHT)
+        _, event = self._controller(_split_from(truth)).refine(truth, weight_kwargs=WEIGHT)
         self.assertTrue(event["stop"])
-        self.assertIn("noise_floor_reached", event["stop_reasons"])
+        self.assertIn("no_splittable_leaf", event["stop_reasons"])
 
-    def test_noise_scale_zero_disables_noise_floor_stop(self):
+    def test_byte_budget_stops_growth(self):
         truth = _truth()
-        split = _split_from(truth)
-        controller = self._controller(split, None, rollback=False, noise_variance_scale=0.0)
-        active, event = controller.on_trigger(_model(), iteration=1, noise_variance=1.0, weight_kwargs=WEIGHT)
-        self.assertEqual(event["noise_variance_used"], 0.0)
-        self.assertFalse(event["stop"])
-        self.assertGreater(active, 0)
-
-    def test_harmful_batch_is_rolled_back_with_halved_prefix_then_stops(self):
-        truth = _truth()
-        split = _split_from(truth)
-        dev = _split_from(truth, views=3)
         model = _model()
-        controller = self._controller(split, dev)
-        pre_leaves = int(model.leaf_levels.shape[0])
-        marked, _ = controller.on_trigger(model, iteration=1, noise_variance=0.0, weight_kwargs=WEIGHT)
-        self.assertGreater(marked, 3)
-        # No training happens between triggers, so the dev error cannot improve.
-        active, event = controller.on_trigger(model, iteration=2, noise_variance=0.0, weight_kwargs=WEIGHT)
-        self.assertEqual(event["verdict"], "rolled_back")
-        self.assertEqual(active, marked // 2)
-        self.assertEqual(int(model.leaf_levels.shape[0]), pre_leaves + 7 * (marked // 2))
-        _, event = controller.on_trigger(model, iteration=3, noise_variance=0.0, weight_kwargs=WEIGHT)
-        self.assertEqual(event["verdict"], "rolled_back")
-        _, event = controller.on_trigger(model, iteration=4, noise_variance=0.0, weight_kwargs=WEIGHT)
-        self.assertTrue(event["stop"])
-        self.assertIn("rollback_exhausted", event["stop_reasons"])
-        self.assertEqual(int(model.leaf_levels.shape[0]), pre_leaves)
+        _, event = self._controller(_split_from(truth), byte_budget=1).refine(model, weight_kwargs=WEIGHT)
+        self.assertIn("byte_budget_exhausted", event["stop_reasons"])
 
 
 if __name__ == "__main__":
