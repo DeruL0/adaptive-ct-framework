@@ -54,6 +54,21 @@ def save(key, value):
     print(key, json.dumps(value, default=float), flush=True)
 
 
+_REFERENCE = {}
+
+
+def report(key, model, value):
+    """Every model-producing stage: save checkpoint + median slice figure, then the metrics."""
+    torch.save({"model": model.state_dict(), "config": CFG}, OUT / f"{key}.pt")
+    if "ours" not in _REFERENCE:
+        _REFERENCE["ours"] = our_tree_model(None).eval()
+    value = dict(value)
+    value.update(slice_figure([model, _REFERENCE["ours"]], OUT / f"{key}_slice.png"))
+    value["checkpoint"] = str(OUT / f"{key}.pt")
+    value["slice_png"] = str(OUT / f"{key}_slice.png")
+    save(key, value)
+
+
 def trilinear(u):
     a = torch.stack([1 - u[:, 0], u[:, 0]], -1)
     b = torch.stack([1 - u[:, 1], u[:, 1]], -1)
@@ -212,7 +227,7 @@ def stage_ls_eval(ds):
     coef, _ = ls_solve(A, B, s2)
     save("our_tree_current", evaluate_volume(m))
     set_coefficients(m, coef)
-    save("our_tree_gt_ls", evaluate_volume(m))
+    report("our_tree_gt_ls", m, evaluate_volume(m))
 
 
 @torch.no_grad()
@@ -286,7 +301,7 @@ def stage_oracle(ds):
     set_coefficients(m, coef)
     ev = evaluate_volume(m)
     ev.update(splits_L0=int(s0.numel()), splits_L1=int(s1.numel()), level_leaves=torch.bincount(m.leaf_levels, minlength=4).tolist(), lambda_=hi)
-    save("oracle_tree_gt_ls", ev)
+    report("oracle_tree_gt_ls", m, ev)
     torch.save({"s0": s0.cpu(), "s1": s1.cpu(), "coef": coef.cpu()}, OUT / "oracle_tree.pt")
 
 
@@ -324,17 +339,18 @@ def oracle_tree_for(ds):
 
 
 def stage_train(ds, iters=30000):
-    save("train_oracle_tree", train_fixed(oracle_tree_for(ds), ds.train, iters, "oracle", ds))
+    m0 = oracle_tree_for(ds)
+    report("train_oracle_tree", m0, train_fixed(m0, ds.train, iters, "oracle", ds))
     m = our_tree_model(ds.train)
     _initialize_constant_mu(m, (ds.train.projections.mean() * 0.5).clamp_min(1e-8))
-    save("train_our_tree", train_fixed(m, ds.train, iters, "ourtree", ds))
+    report("train_our_tree", m, train_fixed(m, ds.train, iters, "ourtree", ds))
 
 
 def stage_warm(ds, iters=10000):
     """Start the oracle tree at its GT least-squares coefficients, then train from projections only."""
     m = oracle_tree_for(ds)
     set_coefficients(m, torch.load(OUT / "oracle_tree.pt")["coef"].to(dev))
-    save("warm_oracle_tree", train_fixed(m, ds.train, iters, "warm", ds, eval_every=2000))
+    report("warm_oracle_tree", m, train_fixed(m, ds.train, iters, "warm", ds, eval_every=2000))
 
 
 def stage_solve(ds, variants=None):
@@ -364,11 +380,45 @@ def stage_solve(ds, variants=None):
         with torch.no_grad():
             pm = projection_metrics(render_split(m, ds.test, detector_h=dh, detector_w=dw, samples_per_ray=1024, ray_chunk=4096), ds.test.projections)
         final = evaluate_volume(m)
-        save(f"solve_{name}", {**final, "test_projection_psnr": pm["psnr"], "seconds": time.time() - t0, "history": hist})
+        report(f"solve_{name}", m, {**final, "test_projection_psnr": pm["psnr"], "seconds": time.time() - t0, "history": hist})
 
 
 def stage_solve_long(ds):
     stage_solve(ds, {"C_groups24_then_extrapolated_80": dict(passes=80, groups=24, group_passes=4)})
+
+
+def slice_figure(models, path, z=None, crop=(440, 560, 256)):
+    """Median axial slice: GT | each model | |GT - first model|, full slice (downsampled) + zoomed crop."""
+    from PIL import Image
+    z = D // 2 if z is None else z
+    gt = np.asarray(GT[z], dtype=np.float32)
+    pts = torch.stack([torch.full((H, W), -1 + (z + 0.5) * 2 / D, device=dev), -1 + (YS.float() + 0.5) * 2 / H, -1 + (XS.float() + 0.5) * 2 / W], -1).reshape(-1, 3)
+    preds = []
+    with torch.no_grad():
+        for m in models:
+            preds.append(m.eval().forward_mu(pts).reshape(H, W).cpu().numpy())
+    img = lambda a, hi=0.8: (np.clip(a / hi, 0, 1) * 255).astype(np.uint8)
+    cy, cx, s = crop
+    sl = (slice(cy - s // 2, cy + s // 2), slice(cx - s // 2, cx + s // 2))
+    full = [img(gt)] + [img(p) for p in preds] + [img(np.abs(preds[0] - gt), 0.2)]
+    zoom = [np.kron(img(a[sl]) if i < len(full) - 1 else img(np.abs(preds[0] - gt)[sl], 0.2), np.ones((4, 4), np.uint8)) for i, a in enumerate([gt] + preds + [gt])]
+    top = np.concatenate([f[::1, ::1] for f in full], 1)
+    bottom = np.concatenate(zoom, 1)
+    Image.fromarray(np.concatenate([top, bottom], 0)).save(path)
+    return {"slice_z": z, "crop_rows_cols": [cy - s // 2, cy + s // 2, cx - s // 2, cx + s // 2]}
+
+
+def stage_solve_c_save(ds):
+    from adaptive_ct.training.solve import solve
+    dh, dw = ds.detector_shape
+    m = oracle_tree_for(ds)
+    t0 = time.time()
+    c, _ = solve(m, ds.train, detector_h=dh, detector_w=dw, passes=80, groups=24, group_passes=4)
+    torch.save({"model": m.state_dict(), "config": CFG}, OUT / "solve_C_80.pt")
+    ev = evaluate_volume(m)
+    ours = our_tree_model(ds.train)
+    ev.update(slice_figure([m, ours], OUT / "slice_C.png"), seconds=time.time() - t0)
+    save("solve_C_80_saved", ev)
 
 
 def stage_views(ds, iters=30000, extra=480):
@@ -379,10 +429,11 @@ def stage_views(ds, iters=30000, extra=480):
     del vol
     torch.cuda.empty_cache()
     big = ProjectionSplit(angles=torch.cat([ds.train.angles, angles]), projections=torch.cat([ds.train.projections, projs]), paths=[])
-    save("train_oracle_tree_3x_views", {**train_fixed(oracle_tree_for(ds), big, iters, "views", ds), "train_views": int(big.angles.numel())})
+    mv = oracle_tree_for(ds)
+    report("train_oracle_tree_3x_views", mv, {**train_fixed(mv, big, iters, "views", ds), "train_views": int(big.angles.numel())})
 
 
 if __name__ == "__main__":
     ds = get_dataset()
     for st in STAGES:
-        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm, "solve": stage_solve, "solve_long": stage_solve_long}[st](ds)
+        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm, "solve": stage_solve, "solve_long": stage_solve_long, "solve_c_save": stage_solve_c_save}[st](ds)
