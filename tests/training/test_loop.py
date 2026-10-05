@@ -84,7 +84,7 @@ def _config(dataset_root: Path, output_root: Path, *, codec: dict, degree) -> di
             "seed": 3,
             "eval_ray_chunk": 4096,
             "allow_test_during_training": False,
-            "solver": {"groups": 3, "first_group_passes": 2, "group_passes": 1, "round_passes": 6, "final_passes": 8},
+            "solver": {"groups": 3, "first_group_passes": 2, "group_passes": 1, "round_tol": 1e-3, "round_passes": 6, "final_tol": 1e-4, "final_passes": 8},
             "refinement": {"gain_share": 0.5, "estimator_rays": 256, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3, "codec": codec},
         },
         "metrics": {

@@ -30,10 +30,12 @@ class FixedTreeSolverTests(unittest.TestCase):
         model = _tree()
         with torch.no_grad():
             model.coefficient_logits.copy_(model._coefficients_to_logits(torch.full_like(c_true, 0.2)))
-        c, hist = solve(model, split, detector_h=8, detector_w=8, passes=120, groups=4, group_passes=5)
+        c, hist, converged = solve(model, split, passes=200, tol=1e-4, groups=4, group_passes=5)
         self.assertGreaterEqual(float(c.min()), 0.0)
+        self.assertTrue(converged)
+        self.assertLess(hist[-1]["pass"], 200)  # stopped by the tolerance, not the pass cap
         self.assertLess(hist[-1]["objective_at_eval_point"], 1e-3 * hist[0]["objective_at_eval_point"])
-        self.assertLess(hist[-1]["optimality_residual"], 1e-3)
+        self.assertLessEqual(hist[-1]["optimality_residual"], 1e-4)
 
 
 if __name__ == "__main__":

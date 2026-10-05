@@ -109,16 +109,23 @@ def run_training(config_path: str | Path) -> dict:
     for r in range(max_rounds + 1):
         final = controller.stopped or r == max_rounds
         passes = int(solver_cfg["final_passes"] if final else solver_cfg["round_passes"])
+        tol = float(solver_cfg["final_tol"] if final else solver_cfg["round_tol"])
         group_passes = int(solver_cfg.get("first_group_passes", 4) if r == 0 else solver_cfg.get("group_passes", 2))
+        # Detector binning while the finest leaf still spans >= min_leaf_px binned pixels; the final solve is unbinned.
+        finest = model.level_shapes[int(model.leaf_levels.max())]
+        leaf_px = min(detector_h / finest[2], detector_w / finest[0])
+        detector_bin = 1 if final else max([1] + [b for b in (2, 4) if leaf_px / b >= float(solver_cfg.get("min_leaf_px", 2.5))])
         t0 = time.perf_counter()
-        _, hist = solve(model, dataset.train, detector_h=detector_h, detector_w=detector_w, passes=passes,
-                        groups=int(solver_cfg.get("groups", 24)), group_passes=group_passes,
-                        extrapolate=bool(solver_cfg.get("extrapolate", True)))
+        _, hist, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg.get("groups", 24)),
+                                   group_passes=group_passes, extrapolate=bool(solver_cfg.get("extrapolate", True)),
+                                   detector_bin=detector_bin)
         last = hist[-1] if hist else {}
         entry = {
             "round": r,
             "final": final,
-            "passes": passes,
+            "passes": int(last.get("pass", 0)),
+            "converged": converged,
+            "detector_bin": detector_bin,
             "solve_seconds": time.perf_counter() - t0,
             "objective": last.get("objective_at_eval_point"),
             "optimality_residual": last.get("optimality_residual"),

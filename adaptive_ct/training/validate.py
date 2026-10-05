@@ -14,7 +14,7 @@ def validate_config(config: dict) -> None:
     if bool(train_cfg.get("allow_test_during_training", False)):
         errors.append("test views must not be used during training")
     if not isinstance(train_cfg.get("solver"), dict):
-        errors.append("training.solver is required (round_passes, final_passes, groups, group_passes)")
+        errors.append("training.solver is required (round_tol, round_passes, final_tol, final_passes, groups, group_passes)")
     ref = train_cfg.get("refinement")
     if not isinstance(ref, dict) or ref.get("byte_budget") is None:
         errors.append("training.refinement with a byte_budget is required")

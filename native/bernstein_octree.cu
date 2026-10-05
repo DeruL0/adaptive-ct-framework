@@ -3,12 +3,16 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 #include <cmath>
 #include <cstdint>
 #include <vector>
 
 namespace {
+
+namespace cg = cooperative_groups;
 
 void check_cuda_float(const at::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor.");
@@ -292,31 +296,41 @@ __device__ __forceinline__ void segment_backward(
     const int64_t coefficient_start = coefficient_offsets[leaf];
     const float half = 0.5f * (t1 - t0);
     const float centre = 0.5f * (t1 + t0);
+    // Basis values at each quadrature node, evaluated once per segment (weight folded into bx).
+    float bx[5][4], by[5][4], bz[5][4];
+    for (int quadrature_id = 0; quadrature_id < quadrature_order; ++quadrature_id) {
+        float node = 0.0f;
+        float weight = 0.0f;
+        gauss_legendre(quadrature_order, quadrature_id, &node, &weight);
+        const float t = centre + half * node;
+        const float x = base_x + dir_x * t;
+        const float y = base_y + dir_y * t;
+        bernstein_basis(px, (x + 1.0f) * 0.5f * static_cast<float>(rx) - static_cast<float>(ix), bx[quadrature_id]);
+        bernstein_basis(py, (y + 1.0f) * 0.5f * static_cast<float>(ry) - static_cast<float>(iy), by[quadrature_id]);
+        bernstein_basis(pz, (z + 1.0f) * 0.5f * static_cast<float>(rz) - static_cast<float>(iz), bz[quadrature_id]);
+        for (int i = 0; i < 4; ++i) {
+            bx[quadrature_id][i] *= weight;
+        }
+    }
+    // Neighbouring rays of a warp usually cross the same leaf: sum their contributions in the
+    // warp and let one thread do the global atomic add (atomic throughput is the bottleneck).
+    const cg::coalesced_group peers = cg::labeled_partition(cg::coalesced_threads(), static_cast<unsigned int>(leaf));
     int local_id = 0;
     for (int i = 0; i <= px; ++i) {
         for (int j = 0; j <= py; ++j) {
             for (int k = 0; k <= pz; ++k, ++local_id) {
                 float integrated_basis = 0.0f;
                 for (int quadrature_id = 0; quadrature_id < quadrature_order; ++quadrature_id) {
-                    float node = 0.0f;
-                    float weight = 0.0f;
-                    gauss_legendre(quadrature_order, quadrature_id, &node, &weight);
-                    const float t = centre + half * node;
-                    const float x = base_x + dir_x * t;
-                    const float y = base_y + dir_y * t;
-                    const float local_x = (x + 1.0f) * 0.5f * static_cast<float>(rx) - static_cast<float>(ix);
-                    const float local_y = (y + 1.0f) * 0.5f * static_cast<float>(ry) - static_cast<float>(iy);
-                    const float local_z = (z + 1.0f) * 0.5f * static_cast<float>(rz) - static_cast<float>(iz);
-                    float bx[4], by[4], bz[4];
-                    bernstein_basis(px, local_x, bx);
-                    bernstein_basis(py, local_y, by);
-                    bernstein_basis(pz, local_z, bz);
-                    integrated_basis += weight * bx[i] * by[j] * bz[k];
+                    integrated_basis += bx[quadrature_id][i] * by[quadrature_id][j] * bz[quadrature_id][k];
                 }
                 const float shifted = coefficient_logits[coefficient_start + local_id] + attenuation_shift;
-                atomicAdd(
-                    &grad_coefficient_logits[coefficient_start + local_id],
-                    grad_output * half * integrated_basis * sigmoid_stable(shifted));
+                float value = grad_output * half * integrated_basis * sigmoid_stable(shifted);
+                if (peers.size() > 1) {
+                    value = cg::reduce(peers, value, cg::plus<float>());
+                }
+                if (peers.thread_rank() == 0) {
+                    atomicAdd(&grad_coefficient_logits[coefficient_start + local_id], value);
+                }
             }
         }
     }
