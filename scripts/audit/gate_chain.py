@@ -545,6 +545,76 @@ def stage_continuity(ds):
     save("continuity_capacity", out)
 
 
+@torch.no_grad()
+def leaf_normal_equations(m):
+    """Per-leaf trilinear normal equations against GT: A (N, 64), B (N, 8), s2 (N,)."""
+    N = int(m.leaf_levels.shape[0])
+    A = torch.zeros(N, 64, device=dev)
+    B = torch.zeros(N, 8, device=dev)
+    s2 = torch.zeros(N, dtype=torch.float64, device=dev)
+    shapes = torch.tensor(m.level_shapes, dtype=torch.float32, device=dev)
+    for z0 in range(0, D, 2):
+        z1 = min(D, z0 + 2)
+        gt = torch.from_numpy(np.ascontiguousarray(GT[z0:z1])).to(dev).reshape(-1)
+        pts = slab_points(z0, z1)
+        for s0 in range(0, pts.shape[0], 2_000_000):
+            p, v = pts[s0 : s0 + 2_000_000], gt[s0 : s0 + 2_000_000]
+            _, ids = m.forward_mu_with_leaf_ids(p)
+            size = 2.0 / shapes[m.leaf_levels[ids]]
+            u = (((p + 1.0) - m.leaf_coords[ids].float() * size) / size).clamp(0, 1)
+            b = trilinear(u)
+            A.index_add_(0, ids, (b[:, :, None] * b[:, None, :]).reshape(-1, 64))
+            B.index_add_(0, ids, b * v[:, None])
+            s2.index_add_(0, ids, (v * v).double())
+    return A, B, s2
+
+
+def stage_nodal_octree(ds):
+    """Same (oracle) tree: GT least-squares fit with shared corners vs independent corners."""
+    from adaptive_ct.representation.nodal import build_nodal_map
+    indep = oracle_tree_for(ds)
+    t0 = time.time()
+    nm = build_nodal_map(indep)
+    build_s = time.time() - t0
+    A, B, s2 = leaf_normal_equations(indep)
+    N = int(indep.leaf_levels.shape[0])
+    coef, _ = ls_solve(A, B, s2)
+    set_coefficients(indep, coef)
+    M = A.view(N, 8, 8)
+
+    def H(n):
+        c = nm.to_corners(n).view(N, 8, 1)
+        return nm.to_nodes(torch.bmm(M, c).view(-1))
+
+    b = nm.to_nodes(B.reshape(-1))
+    n = torch.zeros(nm.free_nodes, device=dev)
+    r = b.clone()
+    pdir = r.clone()
+    rs = float(r @ r)
+    for it in range(300):
+        hp = H(pdir)
+        alpha = rs / float(pdir @ hp)
+        n += alpha * pdir
+        r -= alpha * hp
+        rs_new = float(r @ r)
+        if (rs_new / float(b @ b)) ** 0.5 < 1e-6:
+            break
+        pdir = r + (rs_new / rs) * pdir
+        rs = rs_new
+    shared = oracle_tree_for(ds)
+    set_coefficients(shared, nm.to_corners(n).view(N, 8))
+    out = {
+        "leaves": N,
+        "shared_corners": {**evaluate_volume(shared), "stored_values": nm.free_nodes, "cg_iterations": it + 1, "map_build_seconds": build_s},
+        "independent_corners": {**evaluate_volume(indep), "stored_values": N * 8},
+    }
+    torch.save({"model": shared.state_dict(), "config": CFG}, OUT / "nodal_octree_shared.pt")
+    out.update(slice_figure([shared, indep], OUT / "nodal_octree_slice.png"))
+    out["slice_png"] = str(OUT / "nodal_octree_slice.png")
+    out["panel_order"] = "GT | shared corners | independent corners | |error of shared corners|"
+    save("nodal_octree_gt_ls", out)
+
+
 def stage_views(ds, iters=30000, extra=480):
     dh, dw = ds.detector_shape
     angles = torch.tensor([math.pi * (i + 0.37) / extra for i in range(extra)], dtype=torch.float32, device=dev)
@@ -560,4 +630,4 @@ def stage_views(ds, iters=30000, extra=480):
 if __name__ == "__main__":
     ds = get_dataset()
     for st in STAGES:
-        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm, "solve": stage_solve, "solve_long": stage_solve_long, "solve_c_save": stage_solve_c_save, "main_eval": stage_main_eval, "continuity": stage_continuity}[st](ds)
+        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm, "solve": stage_solve, "solve_long": stage_solve_long, "solve_c_save": stage_solve_c_save, "main_eval": stage_main_eval, "continuity": stage_continuity, "nodal_octree": stage_nodal_octree}[st](ds)

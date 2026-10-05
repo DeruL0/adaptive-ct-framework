@@ -69,29 +69,37 @@ def gradient(model, c, split, views, detector_h, detector_w):
     return _physical_grad(model).clone(), J
 
 
-def solve(model, split, *, detector_h, detector_w, passes, groups=1, group_passes=0, extrapolate=True, on_pass=None):
+def solve(model, split, *, detector_h, detector_w, passes, groups=1, group_passes=0, extrapolate=True, on_pass=None, nodal=None):
     """Run `group_passes` passes of grouped updates, then full-data (optionally extrapolated) updates
-    until `passes` full-data-equivalent passes are spent. Returns (c, history)."""
+    until `passes` full-data-equivalent passes are spent. Returns (leaf corner coefficients, history).
+
+    With `nodal` (representation.nodal.NodalMap) the unknowns are the shared-corner node values n,
+    corners c = P n, gradient P^T g, step denominator P^T d (P has nonnegative weights).
+    """
+    to_c = nodal.to_corners if nodal is not None else (lambda x: x)
+    to_x = nodal.to_nodes if nodal is not None else (lambda g: g)
     views = list(range(int(split.angles.numel())))
     order = sorted(views, key=lambda v: float(split.angles[v]))
     view_groups = [order[g::groups] for g in range(groups)]
     model.coefficient_logits.requires_grad_(True)
-    d = curvature(model, split, views, detector_h, detector_w)
+    d = to_x(curvature(model, split, views, detector_h, detector_w)).clamp_min(1e-12)
     c = model.coefficients().detach().clone()
+    if nodal is not None:
+        c = c[nodal.rep_slot]
     history, spent, t0 = [], 1.0, time.time()  # the curvature pass counts as one pass
 
     while spent < 1 + group_passes:
         for grp in view_groups:
-            g, _ = gradient(model, c, split, grp, detector_h, detector_w)
-            c = (c - groups * g / d).clamp_min(0)
+            g, _ = gradient(model, to_c(c), split, grp, detector_h, detector_w)
+            c = (c - groups * to_x(g) / d).clamp_min(0)
         spent += 1
         if on_pass:
-            history.append({"pass": spent, "phase": "grouped", "seconds": time.time() - t0, **on_pass(c)})
+            history.append({"pass": spent, "phase": "grouped", "seconds": time.time() - t0, **on_pass(to_c(c))})
 
     t_k, z = 1.0, c.clone()
     while spent < passes:
-        g, J = gradient(model, z, split, views, detector_h, detector_w)
-        c_new = (z - g / d).clamp_min(0)
+        g, J = gradient(model, to_c(z), split, views, detector_h, detector_w)
+        c_new = (z - to_x(g) / d).clamp_min(0)
         resid = float((z - c_new).norm() / c_new.norm().clamp_min(1e-30))
         if extrapolate:
             if float(((z - c_new) * (c_new - c)).sum()) > 0:  # the step turned against the last move
@@ -105,9 +113,10 @@ def solve(model, split, *, detector_h, detector_w, passes, groups=1, group_passe
         spent += 1
         row = {"pass": spent, "phase": "full", "objective_at_eval_point": J, "optimality_residual": resid, "seconds": time.time() - t0}
         if on_pass:
-            row.update(on_pass(c))
+            row.update(on_pass(to_c(c)))
         history.append(row)
         print(row, flush=True)
+    c = to_c(c)
     _set(model, c)
     model.coefficient_logits.requires_grad_(False)
     return c, history
