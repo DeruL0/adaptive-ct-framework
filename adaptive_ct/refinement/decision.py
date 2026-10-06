@@ -9,10 +9,10 @@ Gain = objective(keep) - objective(option).  A leaf whose type changed in the pr
 kept or split (no immediate change back).
 
 Choice: each leaf takes the option maximising  gain - lambda * extra_bytes ; lambda >= 0 is the smallest
-price of a byte that keeps the model within the byte budget (byte-saving options are taken when the lost
-gain is below the bytes they free).  Per round, in order of net benefit, byte-saving actions are executed
-and byte-adding ones until they spend `action_share` of the remaining bytes; the tree is re-solved before
-the next decision.
+price of a byte that keeps this round's additions within `action_share` of the remaining budget (byte-saving
+options are taken when the lost gain is below the bytes they free, and pay for this round's additions).
+All chosen actions are executed; the budget fills geometrically over the rounds, and the tree is re-solved
+before the next decision.
 """
 
 from __future__ import annotations
@@ -192,8 +192,9 @@ def evaluate_options(acc: dict) -> tuple[torch.Tensor, dict]:
     return torch.stack(gains, 1), values
 
 
-def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, remaining: float, share: float):
-    """Per leaf option index (-1 keep) under the byte price lambda, then the executed batch."""
+def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, allowance: float):
+    """Leaves and options (index into OPTIONS) taking the best net benefit under the smallest byte price lambda
+    whose total extra bytes stay within `allowance`."""
     net_at = lambda lam: torch.where(allowed, gains - lam * extra, torch.full_like(gains, -math.inf))
 
     def pick(lam):
@@ -204,26 +205,18 @@ def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, rema
 
     lam = 0.0
     idx, best, spent = pick(0.0)
-    if spent > remaining:
+    if spent > allowance:
         lo, hi = 0.0, float(gains.clamp_min(0).max()) + 1.0
         for _ in range(60):
             mid = 0.5 * (lo + hi)
-            if pick(mid)[2] > remaining:
+            if pick(mid)[2] > allowance:
                 lo = mid
             else:
                 hi = mid
         lam = hi
         idx, best, spent = pick(lam)
     chosen = torch.nonzero(idx >= 0).flatten()
-    if chosen.numel() == 0:
-        return chosen, idx[chosen], lam
-    # Executed batch: in order of net benefit, byte-saving actions always, byte-adding ones while they stay
-    # within `share` of the remaining bytes (the budget fills geometrically over the rounds).
-    order = chosen[torch.argsort(best[chosen], descending=True)]
-    added = extra[order, idx[order]]
-    spent_so_far = torch.cumsum(added.clamp_min(0), 0)
-    order = order[(added <= 0) | (spent_so_far <= share * max(remaining, 0.0))]
-    return order, idx[order], lam
+    return chosen, idx[chosen], lam
 
 
 @torch.no_grad()
@@ -249,7 +242,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
     bytes_now = model_bytes(model, quantization)
     remaining = float(byte_budget - bytes_now)
-    ids, option, lam = choose(gains, extra, allowed, remaining, action_share)
+    ids, option, lam = choose(gains, extra, allowed, action_share * max(remaining, 0.0))
     if model.max_leaf_count is not None:  # leaf-count cap: drop splits beyond it
         room = (int(model.max_leaf_count) - N) // 7
         is_split = option == 3

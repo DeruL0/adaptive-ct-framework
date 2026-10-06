@@ -35,7 +35,7 @@ training:
     min_leaf_px: 2.5        # bin the detector 2x2 / 4x4 while the finest leaf spans >= this many binned pixels
     extrapolate: true
   refinement:
-    action_share: 0.7       # each round may spend at most this share of the remaining bytes
+    action_share: 0.7       # each round's net added bytes stay within this share of the remaining budget
     stop_below_remaining: 0.01  # stop refining when less than this share of the budget is left
     decision_views: 16      # all pixels of 16 evenly spaced training views; alternate views = the two halves
     min_footprint_px: 1.0   # children must span >= 1 detector pixel
