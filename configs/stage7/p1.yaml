@@ -37,7 +37,7 @@ training:
   refinement:
     action_share: 0.7       # each round's net added bytes stay within this share of the remaining budget
     stop_below_remaining: 0.01  # stop refining when less than this share of the budget is left
-    decision_views: 16      # all pixels of 16 evenly spaced training views; alternate views = the two halves
+    decision_views: 240     # all pixels of all training views; alternate views (by angle) = the two halves
     min_footprint_px: 1.0   # children must span >= 1 detector pixel
     byte_budget: 8388608
     max_rounds: 32
