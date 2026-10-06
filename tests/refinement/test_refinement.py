@@ -103,6 +103,20 @@ class DecisionTests(unittest.TestCase):
         self.assertLessEqual(report["bytes_after"], budget)
         self.assertEqual(report["bytes_after"], model_bytes(model))
 
+    def test_no_split_gain_that_needs_negative_attenuation(self):
+        truth = _model(levels=(2, 4, 8), trilinear=False)
+        with torch.no_grad():
+            truth.coefficient_logits.copy_(truth._coefficients_to_logits(torch.full_like(truth.coefficient_logits, 1e-12)))
+        split = _split_from(truth)  # empty object: all projections ~0
+        model = _model(levels=(2, 4, 8), trilinear=False)
+        with torch.no_grad():
+            values = torch.full_like(model.coefficient_logits, 1e-12)
+            values[0] = 0.3  # one wrong leaf; every other leaf already sits at the bound 0
+            model.coefficient_logits.copy_(model._coefficients_to_logits(values))
+        report = _decide(model, split, byte_budget=10**9, action_share=1.0)
+        # only the wrong leaf can improve; its zero-valued neighbours would need negative values
+        self.assertLessEqual(sum(report["actions"].values()), 1)
+
     def test_frozen_leaves_cannot_change_type(self):
         truth = _model(levels=(1, 2, 4), trilinear=False)
         truth.set_types([0], [2], torch.tensor([0.1, 0.5]), torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]]))

@@ -5,7 +5,8 @@ For every leaf the options are refitted in the same background (all other leaves
 Rays: every pixel of a set of evenly spaced training views; alternate views form two halves.  Each option's
 values are fitted on one half and its objective  sum (prediction - data)^2  is measured on the other half
 (and the other way round), so extra parameters only win when they predict unseen view directions better.
-Gain = objective(keep) - objective(option).  A leaf whose type changed in the previous round may only be
+Gain = objective(keep) - objective(option); every refit respects the constraint of the solve (attenuation >= 0),
+so gains that would need negative values are not counted.  A leaf whose type changed in the previous round may only be
 kept or split (no immediate change back).  Trilinear and step leaves are never downgraded to constant: the
 detail it drops is largely invisible in held-out projections but not in the volume (run fabed08: projections
 +0.7 dB, volume -0.6 dB with 472k downgrades).
@@ -170,21 +171,19 @@ def local_statistics(model, split, views: list[int], candidate: torch.Tensor) ->
     return out
 
 
-def _fit(G: torch.Tensor, h: torch.Tensor, nonneg: bool, iterations: int = 100, chunk: int = 65536) -> torch.Tensor:
-    """Least squares G c = h per leaf (tiny ridge); nonnegative by projected gradient when asked.
-    Processed in chunks of leaves to keep the GPU memory peak small."""
+def _fit(G: torch.Tensor, h: torch.Tensor, lower: torch.Tensor, iterations: int = 100, chunk: int = 65536) -> torch.Tensor:
+    """Least squares G c = h per leaf (tiny ridge) subject to c >= lower (per leaf and unknown), by projected
+    gradient.  Processed in chunks of leaves to keep the GPU memory peak small."""
     if h.shape[0] > chunk:
-        return torch.cat([_fit(G[a : a + chunk], h[a : a + chunk], nonneg, iterations, chunk) for a in range(0, h.shape[0], chunk)])
+        return torch.cat([_fit(G[a : a + chunk], h[a : a + chunk], lower[a : a + chunk], iterations, chunk) for a in range(0, h.shape[0], chunk)])
     m = h.shape[1]
     A = G.reshape(-1, m, m).double()
     A = A + 1e-6 * A.diagonal(dim1=1, dim2=2).mean(1).clamp_min(1e-12)[:, None, None] * torch.eye(m, dtype=A.dtype, device=A.device)
-    hd = h.double()
-    c = torch.linalg.solve(A, hd)
-    if nonneg:
-        step = 1.0 / torch.linalg.eigvalsh(A).amax(1).clamp_min(1e-30)
-        c = c.clamp_min(0)
-        for _ in range(iterations):
-            c = (c - step[:, None] * (torch.bmm(A, c[:, :, None])[:, :, 0] - hd)).clamp_min(0)
+    hd, lo = h.double(), lower.double()
+    step = 1.0 / torch.linalg.eigvalsh(A).amax(1).clamp_min(1e-30)
+    c = torch.maximum(torch.linalg.solve(A, hd), lo)
+    for _ in range(iterations):
+        c = torch.maximum(c - step[:, None] * (torch.bmm(A, c[:, :, None])[:, :, 0] - hd), lo)
     return c.float()
 
 
@@ -194,18 +193,43 @@ def _objective(G, h, base, c):
 
 
 @torch.no_grad()
-def evaluate_options(acc: dict) -> torch.Tensor:
-    """Held-out gains (N, 4) for OPTIONS."""
+def child_minimum(model, inset: float = 1e-4) -> torch.Tensor:
+    """(N, 8) minimum of the current leaf function over each child cell (over its 8 corners: exact for constant
+    and trilinear leaves)."""
+    device = model.leaf_levels.device
+    N = int(model.leaf_levels.numel())
+    g = torch.tensor([inset, 0.5, 1.0 - inset], device=device)
+    lattice = torch.stack(torch.meshgrid(g, g, g, indexing="ij"), -1).reshape(-1, 3)  # 3 x 3 x 3 points, i-major
+    shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=device)[model.leaf_levels]
+    size = 2.0 / shapes
+    out = torch.empty((N, 8), device=device)
+    child_corners = torch.tensor([[(cx + i) * 9 + (cy + j) * 3 + (cz + k) for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+                                  for cx in (0, 1) for cy in (0, 1) for cz in (0, 1)], device=device)  # (8 children, 8 corners)
+    for a in range(0, N, 100000):
+        b = min(N, a + 100000)
+        pts = (-1 + model.leaf_coords[a:b].float() * size[a:b])[:, None, :] + lattice[None] * size[a:b, None, :]
+        f = model.forward_mu(pts.reshape(-1, 3)).reshape(b - a, 27)
+        out[a:b] = f[:, child_corners].min(-1).values
+    return out
+
+
+def evaluate_options(acc: dict, split_lower: torch.Tensor) -> torch.Tensor:
+    """Held-out gains (N, 4) for OPTIONS.  Every fit respects what the solve can reach: type values >= 0, and
+    split corrections >= split_lower (= -child minimum, so the children stay nonnegative)."""
     gains = []
     for o in OPTIONS:
         G, h = acc[f"G_{o}"], acc[f"h_{o}"]
         base = acc["r2"] if o == "split" else acc["b2"]
+        lower = split_lower if o == "split" else torch.zeros_like(h[0])
         gain = torch.zeros_like(acc["r2"][0])
         for fit_half, eval_half in ((0, 1), (1, 0)):
-            c = _fit(G[fit_half], h[fit_half], nonneg=o != "split")
+            c = _fit(G[fit_half], h[fit_half], lower)
             gain += acc["r2"][eval_half] - _objective(G[eval_half], h[eval_half], base[eval_half], c)
         gains.append(gain)
-    return torch.stack(gains, 1)
+    gains = torch.stack(gains, 1)
+    # gains within floating-point noise of the residual energy (the leaf's, or the average leaf's) count as zero
+    r2 = acc["r2"][0] + acc["r2"][1]
+    return torch.where(gains.abs() <= 1e-6 * (r2 + r2.mean())[:, None], torch.zeros_like(gains), gains)
 
 
 def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, allowance: float):
@@ -264,7 +288,7 @@ def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: 
             B = (torch.ones((samples ** 3, 1), device=device) if t == 0 else tri)[None].expand(sel.numel(), -1, -1)
         G = torch.einsum("npi,npj->nij", B, B).reshape(sel.numel(), -1)
         h = torch.einsum("npi,np->ni", B, f[sel])
-        c = _fit(G, h, nonneg=True)
+        c = _fit(G, h, torch.zeros_like(h))
         out[(starts[sel, None] + torch.arange(c.shape[1], device=device)).reshape(-1)] = c.reshape(-1)
     return out
 
@@ -279,7 +303,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     kind = type_ids(model.leaf_degrees)
     candidate = candidate_step_geometry(model, detector_w=detector_w)
     acc = local_statistics(model, split, views, candidate)
-    gains = evaluate_options(acc)
+    gains = evaluate_options(acc, -child_minimum(model))
     per_leaf = leaf_bytes(quantization).to(device)
     extra = torch.stack([per_leaf[0] - per_leaf[kind], per_leaf[1] - per_leaf[kind], per_leaf[2] - per_leaf[kind],
                          split_bytes(kind, quantization)], 1).double()
