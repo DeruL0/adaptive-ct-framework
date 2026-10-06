@@ -333,8 +333,10 @@ def stage_main_eval(ds):
 
 def stage_edge_penalty(ds):
     """Strength of the edge-preserving penalty on the run's tree: strict solves from the deployed values with
-    weight = f * J / R (J, R: data term and penalty at the start), f in {0, 0.003, 0.03, 0.3}; chosen by the held-out
-    views (the GT volume metrics are reported only as diagnosis)."""
+    weight = f * J / R (J, R: data term and penalty at the start), f from EDGE_FACTORS (default 0,0.003,0.03,0.3);
+    chosen by the held-out views (the GT volume metrics are reported only as diagnosis)."""
+    import os
+    factors = [float(x) for x in os.environ.get("EDGE_FACTORS", "0,0.003,0.03,0.3").split(",")]
     from adaptive_ct.training.regularizer import EdgePenalty
     from adaptive_ct.training.solve import gradient, solve
     dh, dw = ds.detector_shape
@@ -346,7 +348,7 @@ def stage_edge_penalty(ds):
     R, _ = EdgePenalty(m0, delta).value_and_gradient(c0)
     print(f"start: data term {J:.4g}, penalty {R:.4g}", flush=True)
     out = {"delta": delta, "data_term_start": J, "penalty_start": R}
-    for f in (0.0, 0.003, 0.03, 0.3):
+    for f in factors:
         m = load_checkpoint(ROOT / "output" / RUN / "checkpoint.pt")
         weight = f * J / max(R, 1e-30)
         penalty = EdgePenalty(m, delta) if weight > 0 else None
@@ -358,7 +360,7 @@ def stage_edge_penalty(ds):
                "converged": conv, "seconds": time.time() - t0, "penalty_end": hist[-1]["penalty"]}
         report(f"edge_penalty_f{f:g}", m, res)
         out[f"f{f:g}"] = {k: res[k] for k in ("weight", "held_out_projection_psnr", "volume_psnr_db", "band_rmse", "far_rmse", "passes", "converged")}
-    save("edge_penalty_selection", out)
+    save("edge_penalty_selection_" + "_".join(f"{f:g}" for f in factors), out)
 
 
 def stage_speed(ds):
