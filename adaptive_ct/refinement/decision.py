@@ -177,9 +177,9 @@ def _objective(G, h, base, c):
 
 
 @torch.no_grad()
-def evaluate_options(acc: dict) -> tuple[torch.Tensor, dict]:
-    """Held-out gains (N, 4) for OPTIONS and the values refitted on all rays (split: per-child offsets)."""
-    gains, values = [], {}
+def evaluate_options(acc: dict) -> torch.Tensor:
+    """Held-out gains (N, 4) for OPTIONS."""
+    gains = []
     for o in OPTIONS:
         G, h = acc[f"G_{o}"], acc[f"h_{o}"]
         base = acc["r2"] if o == "split" else acc["b2"]
@@ -188,8 +188,7 @@ def evaluate_options(acc: dict) -> tuple[torch.Tensor, dict]:
             c = _fit(G[fit_half], h[fit_half], nonneg=o != "split")
             gain += acc["r2"][eval_half] - _objective(G[eval_half], h[eval_half], base[eval_half], c)
         gains.append(gain)
-        values[o] = _fit(G[0] + G[1], h[0] + h[1], nonneg=o != "split")
-    return torch.stack(gains, 1), values
+    return torch.stack(gains, 1)
 
 
 def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, allowance: float):
@@ -220,6 +219,40 @@ def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, allo
 
 
 @torch.no_grad()
+def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: torch.Tensor, samples: int = 4) -> torch.Tensor:
+    """Values (concatenated in leaf order) of the new-type functions closest, in least squares over
+    samples^3 points inside each leaf, to the current leaf functions; nonnegative."""
+    device = model.leaf_levels.device
+    g = (torch.arange(samples, device=device, dtype=torch.float32) + 0.5) / samples
+    u = torch.stack(torch.meshgrid(g, g, g, indexing="ij"), -1).reshape(-1, 3)  # (P, 3) leaf-local
+    shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=device)[model.leaf_levels[ids]]
+    size = 2.0 / shapes
+    points = (-1.0 + model.leaf_coords[ids].float() * size)[:, None, :] + u[None] * size[:, None, :]
+    f = model.forward_mu(points.reshape(-1, 3)).reshape(ids.numel(), -1)  # (n, P)
+    p = torch.stack([1 - u, u], -1)
+    tri = (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(-1, 8)
+    counts = torch.tensor([1, 8, 2], device=device)[types]
+    starts = torch.cumsum(counts, 0) - counts
+    out = torch.zeros(int(counts.sum()), device=device)
+    for t in range(3):
+        sel = torch.nonzero(types == t).flatten()
+        if sel.numel() == 0:
+            continue
+        if t == 2:
+            gs = geometry[sel]
+            s = ((u[None] - 0.5) * gs[:, None, :3]).sum(-1) - gs[:, 3:4]
+            H = torch.sigmoid(s / gs[:, 4:5].clamp_min(1e-30))
+            B = torch.stack([1 - H, H], -1)  # (n, P, 2)
+        else:
+            B = (torch.ones((samples ** 3, 1), device=device) if t == 0 else tri)[None].expand(sel.numel(), -1, -1)
+        G = torch.einsum("npi,npj->nij", B, B).reshape(sel.numel(), -1)
+        h = torch.einsum("npi,np->ni", B, f[sel])
+        c = _fit(G, h, nonneg=True)
+        out[(starts[sel, None] + torch.arange(c.shape[1], device=device)).reshape(-1)] = c.reshape(-1)
+    return out
+
+
+@torch.no_grad()
 def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, quantization="float16",
                      action_share=0.5, min_footprint_px=1.0, frozen=None) -> tuple[dict, torch.Tensor]:
     """One structure / type decision on a solved model; applies the chosen batch.  `frozen` (N,) marks leaves
@@ -229,7 +262,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     kind = type_ids(model.leaf_degrees)
     candidate = candidate_step_geometry(model, detector_w=detector_w)
     acc = local_statistics(model, split, views, candidate)
-    gains, values = evaluate_options(acc)
+    gains = evaluate_options(acc)
     per_leaf = leaf_bytes(quantization).to(device)
     extra = torch.stack([per_leaf[0] - per_leaf[kind], per_leaf[1] - per_leaf[kind], per_leaf[2] - per_leaf[kind],
                          split_bytes(kind, quantization)], 1).double()
@@ -258,20 +291,14 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     if ids.numel() == 0:
         report["bytes_after"] = bytes_now
         return report, torch.zeros((0, 4), dtype=torch.long, device=device)
-    # 1. type changes, initialised with the refitted values
+    # 1. type changes, initialised with the closest function of the new type to the current leaf function
+    #    (refits of many leaves made in isolation do not fit together; the next solve starts near the solved state)
     change = option < 3
     t_ids, t_new = ids[change], option[change]
     changed_cells = torch.cat([model.leaf_levels[t_ids, None], model.leaf_coords[t_ids]], 1)
     if t_ids.numel():
-        counts = torch.tensor([1, 8, 2], device=device)[t_new]
-        starts = torch.cumsum(counts, 0) - counts
-        vals = torch.zeros(int(counts.sum()), device=device)  # concatenated in leaf order
-        for t in range(3):
-            sel = t_new == t
-            if sel.any():
-                v = values[TYPE_NAMES[t]][t_ids[sel]]
-                vals[(starts[sel, None] + torch.arange(v.shape[1], device=device)).reshape(-1)] = v.reshape(-1)
         geometry = torch.where((t_new == 2)[:, None], candidate[t_ids], torch.zeros_like(candidate[t_ids]))
+        vals = project_onto_types(model, t_ids, t_new, geometry)
         model.set_types(t_ids, t_new, vals, geometry)
     # 2. splits (function preserving); leaf ids shifted by the replaced leaves
     s_ids = ids[~change]
