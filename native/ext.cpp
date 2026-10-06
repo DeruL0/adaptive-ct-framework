@@ -63,6 +63,28 @@ std::vector<at::Tensor> bernstein_octree_segments_forward_cuda(
     int64_t root_z,
     double attenuation_shift);
 
+at::Tensor bernstein_octree_decision_accumulate_cuda(
+    at::Tensor coefficient_logits,
+    at::Tensor leaf_degrees,
+    at::Tensor coefficient_offsets,
+    at::Tensor step_geometry,
+    at::Tensor candidate_geometry,
+    at::Tensor node_child_base,
+    at::Tensor node_leaf_id,
+    at::Tensor angles,
+    at::Tensor rows,
+    at::Tensor cols,
+    at::Tensor residual,
+    at::Tensor fold,
+    at::Tensor accum,
+    int64_t detector_h,
+    int64_t detector_w,
+    int64_t num_levels,
+    int64_t root_x,
+    int64_t root_y,
+    int64_t root_z,
+    double attenuation_shift);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "project_dense_parallel_forward",
@@ -80,4 +102,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "bernstein_octree_segments_forward",
         &bernstein_octree_segments_forward_cuda,
         "Return per-ray Bernstein octree leaf contributions (CUDA)");
+    m.def(
+        "bernstein_octree_decision_accumulate",
+        &bernstein_octree_decision_accumulate_cuda,
+        "Accumulate per-leaf refit statistics of every decision option along parallel rays (CUDA)");
 }

@@ -1,10 +1,12 @@
 """Structure and leaf-type decision on a solved tree.
 
-For every leaf the options are refitted in the same background (all other leaves fixed) on sampled rays:
+For every leaf the options are refitted in the same background (all other leaves fixed):
   keep · change type (constant / trilinear / step) · split into 8 children of the same type.
-Each option's values are fitted on one half of the rays and its objective  sum (prediction - data)^2  is
-measured on the other half (and the other way round), so extra parameters only win when they predict
-unseen rays better.  Gain = objective(keep) - objective(option).
+Rays: every pixel of a set of evenly spaced training views; alternate views form two halves.  Each option's
+values are fitted on one half and its objective  sum (prediction - data)^2  is measured on the other half
+(and the other way round), so extra parameters only win when they predict unseen view directions better.
+Gain = objective(keep) - objective(option).  A leaf whose type changed in the previous round may only be
+kept or split (no immediate change back).
 
 Choice: each leaf takes the option maximising  gain - lambda * extra_bytes ; lambda >= 0 is the smallest
 price of a byte that keeps the model within the byte budget (byte-saving options are taken when the lost
@@ -20,12 +22,16 @@ import math
 import torch
 
 from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
-from adaptive_ct.core.projector import bernstein_segment_ray_capacity
-from adaptive_ct.data.rays import ray_batch
+from adaptive_ct.core.geometry import detector_grid, parallel_rays
+from adaptive_ct.core.projector import bernstein_octree_decision_accumulate
 from adaptive_ct.representation.octree import TYPE_NAMES, step_integral, type_ids
 
 OPTIONS = ("constant", "trilinear", "step", "split")  # column order of gains / extra bytes
 _DIMS = {"constant": 1, "trilinear": 8, "step": 2, "split": 8}
+# Accumulated statistics per leaf and ray half (same layout as segment_decision in native/bernstein_octree.cu):
+# G upper triangle (row major) and h per option, then sum b^2 and sum residual^2.
+_SLOTS = {"constant": (0, 1, 2), "trilinear": (2, 38, 46), "step": (46, 49, 51), "split": (51, 87, 95)}  # G, h, end
+STRIDE = 97
 
 
 def resolvable_mask(model, *, detector_h: int, detector_w: int, min_footprint_px: float) -> torch.Tensor:
@@ -63,73 +69,91 @@ def candidate_step_geometry(model, *, detector_w: int, grid: int = 5, chunk: int
     return out
 
 
-@torch.no_grad()
-def local_statistics(model, rays, candidate: torch.Tensor, *, chunk_rays: int = 8192) -> dict:
-    """Per leaf and per ray half f (ray index parity): normal equations G[f] (N, m, m), h[f] (N, m) of every
-    option, b2[f] = sum b^2 with b = data minus the other leaves (target of a type refit), r2[f] = sum residual^2."""
+def decision_views(split, count: int, offset: int) -> list[int]:
+    """`count` training views evenly spread in angle (shifted by `offset` from round to round)."""
+    order = sorted(range(int(split.angles.numel())), key=lambda v: float(split.angles[v]))
+    step = max(1, len(order) // max(1, count))
+    return order[offset % step :: step][:count]
+
+
+def _pack(L, tri, step, child, contribution, residual) -> torch.Tensor:
+    """(P, STRIDE) statistics of (ray, leaf) pairs (PyTorch reference of segment_decision)."""
+    iu, ju = torch.triu_indices(8, 8, device=L.device)
+    b = contribution - residual
+    return torch.cat([(L * L)[:, None], (L * b)[:, None], tri[:, iu] * tri[:, ju], tri * b[:, None],
+                      (step[:, 0] * step[:, 0])[:, None], (step[:, 0] * step[:, 1])[:, None], (step[:, 1] * step[:, 1])[:, None],
+                      step * b[:, None], child[:, iu] * child[:, ju], -child * residual[:, None], (b * b)[:, None],
+                      (residual * residual)[:, None]], 1)
+
+
+def _accumulate_reference(model, batch, residual, fold, candidate, acc):
+    """PyTorch reference of the CUDA accumulation (used on CPU)."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     kind = type_ids(model.leaf_degrees)
     coeff = model.coefficients().detach()
     offs = model.coefficient_offsets
-    acc = {f"G_{o}": torch.zeros((2, N, _DIMS[o] ** 2), device=device) for o in OPTIONS}
-    acc.update({f"h_{o}": torch.zeros((2, N, _DIMS[o]), device=device) for o in OPTIONS})
-    acc["b2"] = torch.zeros((2, N), dtype=torch.float64, device=device)
-    acc["r2"] = torch.zeros((2, N), dtype=torch.float64, device=device)
-    q = (0.5 - 0.5 / math.sqrt(3.0), 0.5 + 0.5 / math.sqrt(3.0))  # 2-point Gauss on [0, 1]
-    chunk = min(int(chunk_rays), bernstein_segment_ray_capacity(model.level_shapes, 256.0))
-    for start in range(0, rays.observation_count, chunk):
-        batch = ray_batch(rays, start, min(start + chunk, rays.observation_count))
-        res = model.integrate_ray_batch(batch).detach() - batch.target
-        ray_ids, leaf_ids, iv = model._parallel_ray_segments(batch)
-        u0 = model.segment_local_coords(batch, ray_ids, leaf_ids, iv[:, 0])
-        u1 = model.segment_local_coords(batch, ray_ids, leaf_ids, iv[:, 1])
-        L = iv[:, 1] - iv[:, 0]
-        S = L.numel()
-        tri = torch.zeros((S, 8), device=device)
-        for qq in q:  # exact: the trilinear basis along a straight segment is cubic
-            u = u0 + (u1 - u0) * qq
-            p = torch.stack([1 - u, u], -1)
-            tri += 0.5 * L[:, None] * (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(S, 8)
+    ray_ids, leaf_ids, iv = model._parallel_ray_segments(batch)
+    u0 = model.segment_local_coords(batch, ray_ids, leaf_ids, iv[:, 0])
+    u1 = model.segment_local_coords(batch, ray_ids, leaf_ids, iv[:, 1])
+    L = iv[:, 1] - iv[:, 0]
+    S = L.numel()
+    tri = torch.zeros((S, 8), device=device)
+    for qq in (0.5 - 0.5 / math.sqrt(3.0), 0.5 + 0.5 / math.sqrt(3.0)):  # exact: cubic along the segment
+        u = u0 + (u1 - u0) * qq
+        p = torch.stack([1 - u, u], -1)
+        tri += 0.5 * L[:, None] * (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(S, 8)
 
-        def step_weights(g):
-            I = step_integral(g, ((u0 - 0.5) * g[:, :3]).sum(1), ((u1 - 0.5) * g[:, :3]).sum(1), L)
-            return torch.stack([L - I, I], 1)
+    def step_weights(g):
+        I = step_integral(g, ((u0 - 0.5) * g[:, :3]).sum(1), ((u1 - 0.5) * g[:, :3]).sum(1), L)
+        return torch.stack([L - I, I], 1)
 
-        step = step_weights(candidate[leaf_ids])
-        # Segments are cut at every finest-level boundary, so none crosses its leaf's mid-planes.
-        um = 0.5 * (u0 + u1)
-        child = ((um[:, 0] > 0.5).long() * 4 + (um[:, 1] > 0.5).long() * 2 + (um[:, 2] > 0.5).long())
-        split = torch.zeros((S, 8), device=device)
-        split[torch.arange(S, device=device), child] = L
-        k = kind[leaf_ids]
-        cur = torch.zeros(S, device=device)
-        m = k == 0
-        cur[m] = coeff[offs[leaf_ids[m]]] * L[m]
-        m = k == 1
-        cur[m] = (tri[m] * coeff[offs[leaf_ids[m], None] + torch.arange(8, device=device)]).sum(1)
-        m = k == 2
-        cur[m] = (step_weights(model.step_geometry[leaf_ids])[m] * coeff[offs[leaf_ids[m], None] + torch.arange(2, device=device)]).sum(1)
+    # Segments are cut at every finest-level boundary, so none crosses its leaf's mid-planes.
+    um = 0.5 * (u0 + u1)
+    child = torch.zeros((S, 8), device=device)
+    child[torch.arange(S, device=device), (um[:, 0] > 0.5).long() * 4 + (um[:, 1] > 0.5).long() * 2 + (um[:, 2] > 0.5).long()] = L
+    k = kind[leaf_ids]
+    cur = torch.zeros(S, device=device)
+    m = k == 0
+    cur[m] = coeff[offs[leaf_ids[m]]] * L[m]
+    m = k == 1
+    cur[m] = (tri[m] * coeff[offs[leaf_ids[m], None] + torch.arange(8, device=device)]).sum(1)
+    m = k == 2
+    cur[m] = (step_weights(model.step_geometry[leaf_ids])[m] * coeff[offs[leaf_ids[m], None] + torch.arange(2, device=device)]).sum(1)
+    uniq, inv = torch.unique(ray_ids * N + leaf_ids, return_inverse=True)
+    feat = torch.zeros((uniq.numel(), 20), device=device).index_add_(
+        0, inv, torch.cat([L[:, None], tri, step_weights(candidate[leaf_ids]), child, cur[:, None]], 1))
+    pair_ray, pair_leaf = uniq // N, uniq % N
+    acc[fold].index_add_(0, pair_leaf, _pack(feat[:, 0], feat[:, 1:9], feat[:, 9:11], feat[:, 11:19], feat[:, 19], residual[pair_ray]))
 
-        keys = ray_ids * N + leaf_ids
-        uniq, inv = torch.unique(keys, return_inverse=True)
-        pair_ray, pair_leaf = uniq // N, uniq % N
-        feat = torch.zeros((uniq.numel(), 20), device=device).index_add_(
-            0, inv, torch.cat([L[:, None], tri, step, split, cur[:, None]], 1))
-        basis = {"constant": feat[:, :1], "trilinear": feat[:, 1:9], "step": feat[:, 9:11], "split": feat[:, 11:19]}
-        r = res[pair_ray]
-        b = feat[:, 19] - r
-        fold = (start + pair_ray) % 2
-        for f in (0, 1):
-            sel = fold == f
-            leaves = pair_leaf[sel]
-            for o, a in basis.items():
-                a = a[sel]
-                acc[f"G_{o}"][f].index_add_(0, leaves, (a[:, :, None] * a[:, None, :]).reshape(a.shape[0], -1))
-                acc[f"h_{o}"][f].index_add_(0, leaves, a * (-r[sel] if o == "split" else b[sel])[:, None])
-            acc["b2"][f].index_add_(0, leaves, (b[sel] ** 2).double())
-            acc["r2"][f].index_add_(0, leaves, (r[sel] ** 2).double())
-    return acc
+
+@torch.no_grad()
+def local_statistics(model, split, views: list[int], candidate: torch.Tensor) -> dict:
+    """Per leaf and ray half f (alternate views): normal equations G[f] (N, m, m), h[f] (N, m) of every option,
+    b2[f] = sum b^2 with b = data minus the other leaves (target of a type refit), r2[f] = sum residual^2."""
+    device = model.leaf_levels.device
+    N = int(model.leaf_levels.shape[0])
+    acc = torch.zeros((2, N, STRIDE), device=device)
+    h, w = split.projections.shape[1:]
+    rows, cols = detector_grid(h, w, device)
+    for position, v in enumerate(views):
+        batch = parallel_rays(split.angles[v].expand(rows.numel()), rows, cols, detector_h=h, detector_w=w,
+                              targets=split.projections[v].reshape(-1))
+        residual = model.integrate_ray_batch(batch).detach() - batch.target
+        if model._can_use_cuda_integrator(batch):
+            bernstein_octree_decision_accumulate(**model._cuda_integrator_arguments(batch), candidate_geometry=candidate, residual=residual,
+                                                 fold=torch.full((rows.numel(),), position % 2, device=device), accum=acc)
+        else:
+            _accumulate_reference(model, batch, residual, position % 2, candidate, acc)
+    out = {"b2": acc[:, :, 95].double(), "r2": acc[:, :, 96].double()}
+    for o, (g0, h0, end) in _SLOTS.items():
+        m = _DIMS[o]
+        iu, ju = torch.triu_indices(m, m, device=device)
+        G = torch.zeros((2, N, m, m), device=device)
+        G[:, :, iu, ju] = acc[:, :, g0:h0]
+        G[:, :, ju, iu] = acc[:, :, g0:h0]
+        out[f"G_{o}"], out[f"h_{o}"] = G.reshape(2, N, m * m), acc[:, :, h0:end]
+    return out
 
 
 def _fit(G: torch.Tensor, h: torch.Tensor, nonneg: bool, iterations: int = 100) -> torch.Tensor:
@@ -203,14 +227,15 @@ def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, rema
 
 
 @torch.no_grad()
-def decide_and_apply(model, rays, *, detector_h, detector_w, byte_budget, quantization="float16",
-                     action_share=0.5, min_footprint_px=1.0, chunk_rays=8192) -> dict:
-    """One structure / type decision on a solved model; applies the chosen batch and returns a report."""
+def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, quantization="float16",
+                     action_share=0.5, min_footprint_px=1.0, frozen=None) -> tuple[dict, torch.Tensor]:
+    """One structure / type decision on a solved model; applies the chosen batch.  `frozen` (N,) marks leaves
+    that may not change type.  Returns a report and the cells (level, x, y, z) whose type changed."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     kind = type_ids(model.leaf_degrees)
     candidate = candidate_step_geometry(model, detector_w=detector_w)
-    acc = local_statistics(model, rays, candidate, chunk_rays=chunk_rays)
+    acc = local_statistics(model, split, views, candidate)
     gains, values = evaluate_options(acc)
     per_leaf = leaf_bytes(quantization).to(device)
     extra = torch.stack([per_leaf[0] - per_leaf[kind], per_leaf[1] - per_leaf[kind], per_leaf[2] - per_leaf[kind],
@@ -219,6 +244,8 @@ def decide_and_apply(model, rays, *, detector_h, detector_w, byte_budget, quanti
     allowed = torch.zeros((N, 4), dtype=torch.bool, device=device)
     allowed[:, :3] = type_allowed[None, :] & (torch.arange(3, device=device)[None, :] != kind[:, None])
     allowed[:, 2] |= type_allowed[2] & (kind == 2)  # a step leaf may take the newly estimated geometry
+    if frozen is not None:
+        allowed[:, :3] &= ~frozen[:, None]
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
     bytes_now = model_bytes(model, quantization)
     remaining = float(byte_budget - bytes_now)
@@ -237,10 +264,11 @@ def decide_and_apply(model, rays, *, detector_h, detector_w, byte_budget, quanti
     }
     if ids.numel() == 0:
         report["bytes_after"] = bytes_now
-        return report
+        return report, torch.zeros((0, 4), dtype=torch.long, device=device)
     # 1. type changes, initialised with the refitted values
     change = option < 3
     t_ids, t_new = ids[change], option[change]
+    changed_cells = torch.cat([model.leaf_levels[t_ids, None], model.leaf_coords[t_ids]], 1)
     if t_ids.numel():
         counts = torch.tensor([1, 8, 2], device=device)[t_new]
         starts = torch.cumsum(counts, 0) - counts
@@ -259,4 +287,4 @@ def decide_and_apply(model, rays, *, detector_h, detector_w, byte_budget, quanti
         model.split_leaves_batch(s_ids - torch.searchsorted(removed, s_ids))
     report["bytes_after"] = model_bytes(model, quantization)
     report["leaf_type_counts"] = dict(zip(TYPE_NAMES, torch.bincount(type_ids(model.leaf_degrees), minlength=3).tolist()))
-    return report
+    return report, changed_cells

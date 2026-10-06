@@ -342,6 +342,94 @@ __device__ __forceinline__ void segment_backward(
     }
 }
 
+// Decision statistics (refinement/decision.py): per (ray, leaf) segment the basis integrals of every option
+//   constant: L · trilinear: 8 corner basis integrals · step: (L - I, I) with the candidate geometry ·
+//   split: length inside each of the 8 children (current function + one constant per child)
+// and b = (this leaf's current contribution) - (ray residual), the data seen by a refit of this leaf with all
+// other leaves fixed.  Accumulated per leaf and ray half (fold) into DECISION_STRIDE floats:
+//   0 L*L, 1 L*b | 2..37 trilinear G (upper, row major), 38..45 trilinear*b | 46..48 step G (00, 01, 11),
+//   49..50 step*b | 51..86 split G (upper), 87..94 split*(-residual) | 95 b*b | 96 residual^2
+constexpr int DECISION_STRIDE = 97;
+
+__device__ __forceinline__ void decision_add(const cg::coalesced_group& peers, float* slot, float value) {
+    if (peers.size() > 1) {
+        value = cg::reduce(peers, value, cg::plus<float>());
+    }
+    if (peers.thread_rank() == 0) {
+        atomicAdd(slot, value);
+    }
+}
+
+__device__ __forceinline__ void segment_decision(
+    const float* candidate_geometry, float* accum, int64_t leaf_count, int fold, float residual, float contribution,
+    int64_t leaf, int rx, int ry, int rz, int ix, int iy, int iz,
+    float base_x, float base_y, float dir_x, float dir_y, float z, float t0, float t1) {
+    const float length = t1 - t0;
+    const float b = contribution - residual;
+    const float uz = fminf(fmaxf((z + 1.0f) * 0.5f * static_cast<float>(rz) - static_cast<float>(iz), 0.0f), 1.0f);
+    float tri[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int q = 0; q < 2; ++q) {  // 2-point Gauss: exact, the trilinear basis is cubic along the segment
+        const float t = 0.5f * (t0 + t1) + 0.5f * length * (q == 0 ? -0.5773502691896257f : 0.5773502691896257f);
+        const float ux = fminf(fmaxf((base_x + dir_x * t + 1.0f) * 0.5f * static_cast<float>(rx) - static_cast<float>(ix), 0.0f), 1.0f);
+        const float uy = fminf(fmaxf((base_y + dir_y * t + 1.0f) * 0.5f * static_cast<float>(ry) - static_cast<float>(iy), 0.0f), 1.0f);
+        const float bx[2] = {1.0f - ux, ux};
+        const float by[2] = {1.0f - uy, uy};
+        const float bz[2] = {1.0f - uz, uz};
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 2; ++j)
+                for (int k = 0; k < 2; ++k)
+                    tri[(i * 2 + j) * 2 + k] += 0.5f * length * bx[i] * by[j] * bz[k];
+    }
+    const float I = step_integral(candidate_geometry + leaf * 5, rx, ry, rz, ix, iy, iz, base_x, base_y, dir_x, dir_y, z, t0, t1);
+    const float st[2] = {length - I, I};
+    // Child lengths: cut the segment at the leaf's mid-planes in x and y (z is constant along the ray).
+    float cuts[4];
+    int n = 0;
+    cuts[n++] = t0;
+    if (fabsf(dir_x) > 1.0e-8f) {
+        const float tc = (-1.0f + 2.0f * (static_cast<float>(ix) + 0.5f) / static_cast<float>(rx) - base_x) / dir_x;
+        if (tc > t0 && tc < t1) cuts[n++] = tc;
+    }
+    if (fabsf(dir_y) > 1.0e-8f) {
+        const float tc = (-1.0f + 2.0f * (static_cast<float>(iy) + 0.5f) / static_cast<float>(ry) - base_y) / dir_y;
+        if (tc > t0 && tc < t1) cuts[n++] = tc;
+    }
+    cuts[n++] = t1;
+    if (n == 4 && cuts[1] > cuts[2]) {
+        const float tmp = cuts[1];
+        cuts[1] = cuts[2];
+        cuts[2] = tmp;
+    }
+    float child[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const int cz = uz > 0.5f ? 1 : 0;
+    for (int c = 0; c + 1 < n; ++c) {
+        const float tm = 0.5f * (cuts[c] + cuts[c + 1]);
+        const int cx = (base_x + dir_x * tm + 1.0f) * 0.5f * static_cast<float>(rx) - static_cast<float>(ix) > 0.5f ? 1 : 0;
+        const int cy = (base_y + dir_y * tm + 1.0f) * 0.5f * static_cast<float>(ry) - static_cast<float>(iy) > 0.5f ? 1 : 0;
+        child[cx * 4 + cy * 2 + cz] += cuts[c + 1] - cuts[c];
+    }
+    const cg::coalesced_group peers = cg::labeled_partition(cg::coalesced_threads(), static_cast<unsigned int>(leaf * 2 + fold));
+    float* slot = accum + (static_cast<int64_t>(fold) * leaf_count + leaf) * DECISION_STRIDE;
+    int k = 0;
+    decision_add(peers, slot + k++, length * length);
+    decision_add(peers, slot + k++, length * b);
+    for (int i = 0; i < 8; ++i)
+        for (int j = i; j < 8; ++j)
+            decision_add(peers, slot + k++, tri[i] * tri[j]);
+    for (int i = 0; i < 8; ++i) decision_add(peers, slot + k++, tri[i] * b);
+    decision_add(peers, slot + k++, st[0] * st[0]);
+    decision_add(peers, slot + k++, st[0] * st[1]);
+    decision_add(peers, slot + k++, st[1] * st[1]);
+    decision_add(peers, slot + k++, st[0] * b);
+    decision_add(peers, slot + k++, st[1] * b);
+    for (int i = 0; i < 8; ++i)
+        for (int j = i; j < 8; ++j)
+            decision_add(peers, slot + k++, child[i] * child[j]);
+    for (int i = 0; i < 8; ++i) decision_add(peers, slot + k++, -child[i] * residual);
+    decision_add(peers, slot + k++, b * b);
+    decision_add(peers, slot + k++, residual * residual);
+}
+
 __device__ __forceinline__ float traverse_bernstein_octree(
     const float* coefficient_logits,
     const int64_t* leaf_degrees,
@@ -353,6 +441,11 @@ __device__ __forceinline__ float traverse_bernstein_octree(
     float grad_output,
     int64_t* segment_leaf_ids,
     float* segment_contributions,
+    const float* candidate_geometry,
+    float* decision_accum,
+    int64_t leaf_count,
+    int fold,
+    float ray_residual,
     int max_segments,
     float angle,
     int64_t row,
@@ -493,6 +586,10 @@ __device__ __forceinline__ float traverse_bernstein_octree(
                 next_t,
                 attenuation_shift);
             total += contribution;
+            if (decision_accum != nullptr) {
+                segment_decision(candidate_geometry, decision_accum, leaf_count, fold, ray_residual, contribution,
+                                 leaf, rx, ry, rz, ix, iy, iz, base_x, base_y, dir_x, dir_y, z, t, next_t);
+            }
             if (segment_leaf_ids != nullptr && segment_contributions != nullptr) {
                 segment_leaf_ids[segment_id] = leaf;
                 segment_contributions[segment_id] = contribution;
@@ -538,6 +635,11 @@ __global__ void bernstein_forward_kernel(
         0.0f,
         nullptr,
         nullptr,
+        nullptr,
+        nullptr,
+        0,
+        0,
+        0.0f,
         max_segments,
         angles[ray_id],
         rows[ray_id],
@@ -587,6 +689,11 @@ __global__ void bernstein_backward_kernel(
         grad_output[ray_id],
         nullptr,
         nullptr,
+        nullptr,
+        nullptr,
+        0,
+        0,
+        0.0f,
         max_segments,
         angles[ray_id],
         rows[ray_id],
@@ -636,6 +743,11 @@ __global__ void bernstein_segments_kernel(
         0.0f,
         leaf_ids + static_cast<int64_t>(ray_id) * max_segments,
         contributions + static_cast<int64_t>(ray_id) * max_segments,
+        nullptr,
+        nullptr,
+        0,
+        0,
+        0.0f,
         max_segments,
         angles[ray_id],
         rows[ray_id],
@@ -647,6 +759,41 @@ __global__ void bernstein_segments_kernel(
         root_y,
         root_z,
         attenuation_shift);
+}
+
+__global__ void bernstein_decision_kernel(
+    const float* coefficient_logits,
+    const int64_t* leaf_degrees,
+    const int64_t* coefficient_offsets,
+    const float* step_geometry,
+    const float* candidate_geometry,
+    const int32_t* node_child_base,
+    const int32_t* node_leaf_id,
+    const float* angles,
+    const int64_t* rows,
+    const int64_t* cols,
+    const float* residual,
+    const int32_t* fold,
+    float* accum,
+    int64_t leaf_count,
+    int num_rays,
+    int detector_h,
+    int detector_w,
+    int num_levels,
+    int root_x,
+    int root_y,
+    int root_z,
+    int max_segments,
+    float attenuation_shift) {
+    const int ray_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ray_id >= num_rays) {
+        return;
+    }
+    traverse_bernstein_octree(
+        coefficient_logits, leaf_degrees, coefficient_offsets, step_geometry, node_child_base, node_leaf_id,
+        nullptr, 0.0f, nullptr, nullptr, candidate_geometry, accum, leaf_count, fold[ray_id], residual[ray_id],
+        max_segments, angles[ray_id], rows[ray_id], cols[ray_id], detector_h, detector_w, num_levels,
+        root_x, root_y, root_z, attenuation_shift);
 }
 
 void validate_inputs(
@@ -851,4 +998,69 @@ std::vector<at::Tensor> bernstein_octree_segments_forward_cuda(
     const auto error = cudaGetLastError();
     TORCH_CHECK(error == cudaSuccess, "Bernstein segments kernel failed: ", cudaGetErrorString(error));
     return {leaf_ids, contributions};
+}
+
+at::Tensor bernstein_octree_decision_accumulate_cuda(
+    at::Tensor coefficient_logits,
+    at::Tensor leaf_degrees,
+    at::Tensor coefficient_offsets,
+    at::Tensor step_geometry,
+    at::Tensor candidate_geometry,
+    at::Tensor node_child_base,
+    at::Tensor node_leaf_id,
+    at::Tensor angles,
+    at::Tensor rows,
+    at::Tensor cols,
+    at::Tensor residual,
+    at::Tensor fold,
+    at::Tensor accum,
+    int64_t detector_h,
+    int64_t detector_w,
+    int64_t num_levels,
+    int64_t root_x,
+    int64_t root_y,
+    int64_t root_z,
+    double attenuation_shift) {
+    validate_inputs(coefficient_logits, leaf_degrees, coefficient_offsets, step_geometry, node_child_base, node_leaf_id, angles, rows, cols, num_levels);
+    check_cuda_float(candidate_geometry, "candidate_geometry");
+    check_cuda_float(residual, "residual");
+    check_cuda_float(accum, "accum");
+    check_cuda_int(fold, "fold");
+    const int64_t leaf_count = leaf_degrees.size(0);
+    TORCH_CHECK(candidate_geometry.sizes() == step_geometry.sizes(), "candidate_geometry must have shape (N, 5).");
+    TORCH_CHECK(residual.size(0) == angles.size(0) && fold.size(0) == angles.size(0), "residual / fold must match rays.");
+    TORCH_CHECK(accum.is_contiguous() && accum.numel() == 2 * leaf_count * DECISION_STRIDE, "accum must be a contiguous (2, N, 97) tensor.");
+    c10::cuda::CUDAGuard guard(coefficient_logits.device());
+    const int num_rays = static_cast<int>(angles.size(0));
+    constexpr int threads = 128;
+    const int blocks = (num_rays + threads - 1) / threads;
+    const int max_segments = max_segments_for_resolutions(root_x, root_y, num_levels);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    bernstein_decision_kernel<<<blocks, threads, 0, stream>>>(
+        coefficient_logits.contiguous().data_ptr<float>(),
+        leaf_degrees.contiguous().data_ptr<int64_t>(),
+        coefficient_offsets.contiguous().data_ptr<int64_t>(),
+        step_geometry.contiguous().data_ptr<float>(),
+        candidate_geometry.contiguous().data_ptr<float>(),
+        node_child_base.contiguous().data_ptr<int32_t>(),
+        node_leaf_id.contiguous().data_ptr<int32_t>(),
+        angles.contiguous().data_ptr<float>(),
+        rows.contiguous().data_ptr<int64_t>(),
+        cols.contiguous().data_ptr<int64_t>(),
+        residual.contiguous().data_ptr<float>(),
+        fold.contiguous().data_ptr<int32_t>(),
+        accum.data_ptr<float>(),
+        leaf_count,
+        num_rays,
+        static_cast<int>(detector_h),
+        static_cast<int>(detector_w),
+        static_cast<int>(num_levels),
+        static_cast<int>(root_x),
+        static_cast<int>(root_y),
+        static_cast<int>(root_z),
+        max_segments,
+        static_cast<float>(attenuation_shift));
+    const auto error = cudaGetLastError();
+    TORCH_CHECK(error == cudaSuccess, "Bernstein decision kernel failed: ", cudaGetErrorString(error));
+    return accum;
 }

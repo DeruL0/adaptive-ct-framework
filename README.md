@@ -24,10 +24,11 @@ diagram, module responsibilities, and the training protocol.
    `d = A^T A 1`, update `c <- max(0, c - g/d)`; angle-interleaved grouped updates first, then
    full-data updates with extrapolation. The optimality residual is reported per round.
 3. On the solved model, refit every leaf's options (keep / constant / trilinear / step / split)
-   with all other leaves fixed, on half of a random ray sample, and score them on the other
-   half; each leaf takes the option with the largest held-out gain minus a byte price that keeps
+   with all other leaves fixed, on half of 16 evenly spaced training views (alternate views),
+   and score them on the other half (statistics accumulated in the CUDA traversal); each leaf takes the option with the largest held-out gain minus a byte price that keeps
    the model within budget; per round, actions are executed in order of net benefit until they
-   spend half of the remaining bytes (byte-saving actions always).
+   spend 70% of the remaining bytes (byte-saving actions always); a leaf whose type just changed
+   may only be kept or split in the next round; refinement stops below 1% remaining budget.
    Each solve stops at an optimality-residual tolerance (1e-3 per round); while leaves are still
    coarse it uses 2x2 / 4x4 averaged detector pixels.
 4. When no action has a positive net benefit, solve strictly (tolerance 1e-4, full resolution), round the

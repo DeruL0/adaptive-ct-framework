@@ -3,11 +3,11 @@ from pathlib import Path
 
 import torch
 
+from adaptive_ct.core.projector import has_bernstein_native
 from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
 from adaptive_ct.data.dataset import ProjectionSplit
-from adaptive_ct.data.rays import sample_random_rays
-from adaptive_ct.refinement.decision import decide_and_apply, resolvable_mask
+from adaptive_ct.refinement.decision import candidate_step_geometry, decide_and_apply, decision_views, local_statistics, resolvable_mask
 from adaptive_ct.representation.octree import BernsteinOctree, type_ids
 from adaptive_ct.training.solve import solve
 
@@ -34,8 +34,9 @@ def _split_from(truth, views=16):
     return ProjectionSplit(angles=angles, projections=_render(truth, angles), paths=[Path(str(i)) for i in range(views)])
 
 
-def _rays(split, count=4096, seed=1):
-    return sample_random_rays(split, ray_count=count, detector_h=DETECTOR, detector_w=DETECTOR, seed=seed, chunk_rays=1024)
+def _decide(model, split, **kw):
+    report, _ = decide_and_apply(model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, **kw)
+    return report
 
 
 def _random_values(model, seed):
@@ -73,7 +74,7 @@ class DecisionTests(unittest.TestCase):
     def test_exact_model_has_no_beneficial_action(self):
         truth = _model()
         _random_values(truth, 3)
-        report = decide_and_apply(truth, _rays(_split_from(truth)), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=10**9)
+        report = _decide(truth, _split_from(truth), byte_budget=10**9)
         self.assertEqual(sum(report["actions"].values()), 0)
 
     def test_planar_step_inside_a_leaf_becomes_a_step_leaf(self):
@@ -82,7 +83,7 @@ class DecisionTests(unittest.TestCase):
         split = _split_from(truth)
         model = _model(levels=(1, 2, 4))
         solve(model, split, passes=60, tol=1e-6)  # trilinear fit: a ramp along x
-        report = decide_and_apply(model, _rays(split), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=10**9, action_share=1.0)
+        report = _decide(model, split, byte_budget=10**9, action_share=1.0)
         self.assertEqual(report["actions"]["step"], 1)
         self.assertEqual(type_ids(model.leaf_degrees).tolist(), [2])
         self.assertGreater(abs(float(model.step_geometry[0, 0])), 0.9)  # direction along x
@@ -97,10 +98,44 @@ class DecisionTests(unittest.TestCase):
         model = _model(levels=(2, 4, 8))
         solve(model, split, passes=30, tol=1e-4)
         budget = model_bytes(model) + 400
-        report = decide_and_apply(model, _rays(split), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=budget, action_share=1.0)
+        report = _decide(model, split, byte_budget=budget, action_share=1.0)
         self.assertGreater(sum(report["actions"].values()), 0)
         self.assertLessEqual(report["bytes_after"], budget)
         self.assertEqual(report["bytes_after"], model_bytes(model))
+
+    def test_frozen_leaves_cannot_change_type(self):
+        truth = _model(levels=(1, 2, 4), trilinear=False)
+        truth.set_types([0], [2], torch.tensor([0.1, 0.5]), torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]]))
+        split = _split_from(truth)
+        model = _model(levels=(1, 2, 4))
+        solve(model, split, passes=60, tol=1e-6)
+        report = _decide(model, split, byte_budget=10**9, action_share=1.0, frozen=torch.tensor([True]))
+        self.assertEqual(report["actions"]["constant"] + report["actions"]["trilinear"] + report["actions"]["step"], 0)
+
+
+@unittest.skipUnless(torch.cuda.is_available() and has_bernstein_native(), "Bernstein CUDA extension unavailable")
+class DecisionCudaTests(unittest.TestCase):
+    def test_cuda_statistics_match_reference(self):
+        from tests.representation.test_octree import make_step
+        model = BernsteinOctree(levels=[2, 4, 8], leaf_types=ALL, attenuation_shift=0.0)
+        model.to_trilinear([0, 3, 5, 6])
+        model.split_leaves_batch([model.find_leaf((0, 0, 0, 0)), model.find_leaf((0, 1, 1, 0))])
+        make_step(model, [model.find_leaf((1, 1, 1, 1)), model.find_leaf((0, 1, 0, 1))], seed=2)
+        make_step(model, [model.find_leaf((1, 2, 2, 0))], seed=3, width=0.0)
+        _random_values(model, 9)
+        model = model.cuda()
+        truth = _model(levels=(2, 4, 8))
+        _random_values(truth, 1)
+        split = _split_from(truth)
+        split = ProjectionSplit(angles=split.angles.cuda(), projections=split.projections.cuda(), paths=split.paths)
+        candidate = candidate_step_geometry(model, detector_w=DETECTOR)
+        views = decision_views(split, 16, 0)
+        cuda = local_statistics(model, split, views, candidate)
+        model.cuda_integrator = False
+        reference = local_statistics(model, split, views, candidate)
+        for key in reference:
+            scale = float(reference[key].abs().max()) + 1e-12
+            self.assertLess(float((cuda[key] - reference[key]).abs().max()) / scale, 2e-4, key)
 
 
 if __name__ == "__main__":

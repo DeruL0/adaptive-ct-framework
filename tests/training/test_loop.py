@@ -57,7 +57,7 @@ def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
             "seed": 3,
             "eval_ray_chunk": 4096,
             "solver": {"groups": 3, "first_group_passes": 2, "group_passes": 1, "round_tol": 1e-3, "round_passes": 6, "final_tol": 1e-4, "final_passes": 8},
-            "refinement": {"action_share": 0.5, "estimator_rays": 2048, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3, "quantization": "float16"},
+            "refinement": {"action_share": 0.5, "decision_views": 6, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3, "quantization": "float16"},
         },
         "metrics": {"compute_projection_metrics": True, "compute_volume_metrics": False, "compute_boundary_metrics": False},
         "export": {"compact_octree": {"enabled": True, "artifact_name": "ANVO.npz", "quantization": "float16"}},
