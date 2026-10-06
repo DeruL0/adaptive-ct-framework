@@ -34,6 +34,9 @@ training:
     final_passes: 150
     min_leaf_px: 2.5        # bin the detector 2x2 / 4x4 while the finest leaf spans >= this many binned pixels
     extrapolate: true
+    edge_penalty:           # neighbouring leaves: jumps <= delta penalised quadratically, larger ones linearly
+      weight: 2300          # chosen on the held-out views (f474847 tree: 0 / 23 / 231 / 2311 / 7704 -> 2311 best)
+      delta: 0.02
   refinement:
     action_share: 0.7       # each round's net added bytes stay within this share of the remaining budget
     stop_below_remaining: 0.01  # stop refining when less than this share of the budget is left
