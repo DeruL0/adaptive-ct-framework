@@ -1,0 +1,9 @@
+# Diagnostic: main pipeline with 3x the byte budget (24 MiB) - is the 8 MiB budget the bottleneck?
+extends: p1.yaml
+
+training:
+  refinement:
+    byte_budget: 25165824
+
+output:
+  dir: output\main_p1_24mib
