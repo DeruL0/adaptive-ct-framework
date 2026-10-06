@@ -51,6 +51,8 @@ class RefinementController:
             action_share=float(self.spec.get("action_share", 0.5)), min_footprint_px=float(self.spec.get("min_footprint_px", 1.0)))
         event.update(report)
         event["decision_seconds"] = time.perf_counter() - t0
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # hand the decision's temporary memory back before the next solve
         event["type_change_blocked"] = int(frozen.sum()) if frozen is not None else 0
         if sum(event["actions"].values()) == 0:
             return self._stop(event, "byte_budget_spent" if event["byte_price"] > 0 else "no_beneficial_action")

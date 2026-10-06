@@ -118,10 +118,13 @@ def run_training(config_path: str | Path) -> dict:
             "bytes": model_bytes(model, controller.quantization),
             "leaf_type_counts": list(model.stats().leaf_type_counts),
             "held_out_projection": held_out_metric(),
+            "gpu_peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0.0,
         }
         history.extend({**h, "round": r} for h in hist)
         rounds.append(entry)
         print(json.dumps({"round": entry}, default=float), flush=True)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         if final:
             break
         event = controller.refine(model)

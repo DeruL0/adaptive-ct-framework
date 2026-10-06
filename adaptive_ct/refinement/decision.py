@@ -168,8 +168,11 @@ def local_statistics(model, split, views: list[int], candidate: torch.Tensor) ->
     return out
 
 
-def _fit(G: torch.Tensor, h: torch.Tensor, nonneg: bool, iterations: int = 100) -> torch.Tensor:
-    """Least squares G c = h per leaf (tiny ridge); nonnegative by projected gradient when asked."""
+def _fit(G: torch.Tensor, h: torch.Tensor, nonneg: bool, iterations: int = 100, chunk: int = 65536) -> torch.Tensor:
+    """Least squares G c = h per leaf (tiny ridge); nonnegative by projected gradient when asked.
+    Processed in chunks of leaves to keep the GPU memory peak small."""
+    if h.shape[0] > chunk:
+        return torch.cat([_fit(G[a : a + chunk], h[a : a + chunk], nonneg, iterations, chunk) for a in range(0, h.shape[0], chunk)])
     m = h.shape[1]
     A = G.reshape(-1, m, m).double()
     A = A + 1e-6 * A.diagonal(dim1=1, dim2=2).mean(1).clamp_min(1e-12)[:, None, None] * torch.eye(m, dtype=A.dtype, device=A.device)
