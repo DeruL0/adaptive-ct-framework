@@ -8,8 +8,9 @@ unseen rays better.  Gain = objective(keep) - objective(option).
 
 Choice: each leaf takes the option maximising  gain - lambda * extra_bytes ; lambda >= 0 is the smallest
 price of a byte that keeps the model within the byte budget (byte-saving options are taken when the lost
-gain is below the bytes they free).  Only the best-ranked actions carrying `action_share` of the total net
-benefit are executed per round; the tree is re-solved before the next decision.
+gain is below the bytes they free).  Per round, in order of net benefit, byte-saving actions are executed
+and byte-adding ones until they spend `action_share` of the remaining bytes; the tree is re-solved before
+the next decision.
 """
 
 from __future__ import annotations
@@ -192,14 +193,12 @@ def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, rema
     chosen = torch.nonzero(idx >= 0).flatten()
     if chosen.numel() == 0:
         return chosen, idx[chosen], lam
+    # Executed batch: in order of net benefit, byte-saving actions always, byte-adding ones while they stay
+    # within `share` of the remaining bytes (the budget fills geometrically over the rounds).
     order = chosen[torch.argsort(best[chosen], descending=True)]
-    net = best[order]
-    keep = int(torch.searchsorted(torch.cumsum(net, 0), share * float(net.sum())).item()) + 1
-    cum_bytes = torch.cumsum(extra[order, idx[order]], 0)
-    over = torch.nonzero(cum_bytes > remaining).flatten()
-    if over.numel():
-        keep = min(keep, int(over[0]))
-    order = order[:keep]
+    added = extra[order, idx[order]]
+    spent_so_far = torch.cumsum(added.clamp_min(0), 0)
+    order = order[(added <= 0) | (spent_so_far <= share * max(remaining, 0.0))]
     return order, idx[order], lam
 
 

@@ -35,7 +35,7 @@ training:
     min_leaf_px: 2.5        # bin the detector 2x2 / 4x4 while the finest leaf spans >= this many binned pixels
     extrapolate: true
   refinement:
-    action_share: 0.5       # each round: best actions until they carry half the total net benefit
+    action_share: 0.5       # each round may spend at most this share of the remaining bytes
     estimator_rays: 4194304 # sampled rays for the refit decision (split in two halves)
     min_footprint_px: 1.0   # children must span >= 1 detector pixel
     byte_budget: 8388608

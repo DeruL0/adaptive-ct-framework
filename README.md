@@ -26,7 +26,8 @@ diagram, module responsibilities, and the training protocol.
 3. On the solved model, refit every leaf's options (keep / constant / trilinear / step / split)
    with all other leaves fixed, on half of a random ray sample, and score them on the other
    half; each leaf takes the option with the largest held-out gain minus a byte price that keeps
-   the model within budget, and the best half of these actions (by net benefit) is executed.
+   the model within budget; per round, actions are executed in order of net benefit until they
+   spend half of the remaining bytes (byte-saving actions always).
    Each solve stops at an optimality-residual tolerance (1e-3 per round); while leaves are still
    coarse it uses 2x2 / 4x4 averaged detector pixels.
 4. When no action has a positive net benefit, solve strictly (tolerance 1e-4, full resolution), round the
