@@ -78,9 +78,12 @@ def gradient(model, c, angles, projections, views):
     return _physical_grad(model).clone(), J
 
 
-def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolate=True, detector_bin=1, on_pass=None):
+def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolate=True, detector_bin=1, on_pass=None,
+          penalty=None, penalty_weight=0.0):
     """Run `group_passes` passes of grouped updates, then full-data (optionally extrapolated) updates until the
     optimality residual is <= tol or `passes` full-data-equivalent passes are spent.
+    With `penalty` (training.regularizer.EdgePenalty) the objective is  J + penalty_weight / bin^2 * R  (the data
+    term has bin^2 fewer rays when binned); its gradient joins g and its curvature bound joins d.
     Returns (coefficients, history, converged)."""
     angles, projections = split.angles, binned(split, detector_bin)
     views = list(range(int(angles.numel())))
@@ -88,13 +91,24 @@ def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolat
     view_groups = [order[g::groups] for g in range(groups)]
     model.coefficient_logits.requires_grad_(True)
     d = curvature(model, angles, projections, views)
+    beta = float(penalty_weight) / detector_bin**2 if penalty is not None else 0.0
+    if beta > 0:
+        d = d + beta * penalty.curvature()
     c = model.coefficients().detach().clone()
+
+    def penalised(g, J, at):
+        if beta == 0:
+            return g, J, 0.0
+        R, gR = penalty.value_and_gradient(at)
+        return g + beta * gR, J + beta * R, R
+
     history, spent, t0, converged = [], 1.0, time.time(), False  # the curvature pass counts as one pass
 
     while spent < 1 + group_passes:
         for grp in view_groups:
             g, _ = gradient(model, c, angles, projections, grp)
-            c = (c - groups * g / d).clamp_min(0)
+            g, _, _ = penalised(groups * g, 0.0, c)
+            c = (c - g / d).clamp_min(0)
         spent += 1
         if on_pass:
             history.append({"pass": spent, "phase": "grouped", "seconds": time.time() - t0, **on_pass(c)})
@@ -102,6 +116,7 @@ def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolat
     t_k, z = 1.0, c.clone()
     while spent < passes:
         g, J = gradient(model, z, angles, projections, views)
+        g, J, R = penalised(g, J, z)
         c_new = (z - g / d).clamp_min(0)
         resid = float((z - c_new).norm() / c_new.norm().clamp_min(1e-30))
         if extrapolate:
@@ -115,7 +130,7 @@ def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolat
         c = c_new
         spent += 1
         row = {"pass": spent, "phase": "full", "objective_at_eval_point": J, "optimality_residual": resid,
-               "seconds": time.time() - t0, "detector_bin": detector_bin}
+               "seconds": time.time() - t0, "detector_bin": detector_bin, "penalty": R}
         if on_pass:
             row.update(on_pass(c))
         history.append(row)

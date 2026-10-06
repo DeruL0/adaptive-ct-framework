@@ -21,6 +21,7 @@ from adaptive_ct.evaluation.volume import boundary_sharpness_metrics, material_v
 from adaptive_ct.refinement.controller import RefinementController
 from adaptive_ct.representation.factory import build_model
 from adaptive_ct.training.export import deploy, export_center_slice_png, finest_model_shape
+from adaptive_ct.training.regularizer import EdgePenalty
 from adaptive_ct.training.solve import solve
 from adaptive_ct.training.validate import validate_config
 
@@ -101,9 +102,13 @@ def run_training(config_path: str | Path) -> dict:
         leaf_px = min(detector_h / finest[2], detector_w / finest[0])
         detector_bin = 1 if final else max([1] + [b for b in (2, 4) if leaf_px / b >= float(solver_cfg.get("min_leaf_px", 2.5))])
         t0 = time.perf_counter()
+        edge = solver_cfg.get("edge_penalty") or {}
+        weight = float(edge.get("weight", 0.0))
+        penalty = EdgePenalty(model, float(edge["delta"])) if weight > 0 else None
         _, hist, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg.get("groups", 24)),
                                    group_passes=group_passes, extrapolate=bool(solver_cfg.get("extrapolate", True)),
-                                   detector_bin=detector_bin)
+                                   detector_bin=detector_bin, penalty=penalty, penalty_weight=weight)
+        del penalty
         last = hist[-1] if hist else {}
         entry = {
             "round": r,

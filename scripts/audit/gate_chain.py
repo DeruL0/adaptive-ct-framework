@@ -5,6 +5,7 @@
   speed       solver from a cold start on the oracle tree, to the stopping tolerance
   profile     capacity of the adjustable-width step leaf vs constant / trilinear leaves (GT fits)
   main_eval   volume metrics and median slice of output/<run>
+  edge_penalty strength of the edge-preserving penalty on the run's tree (held-out views decide)
 
 usage: python gate_chain.py <run> <stage> [<stage> ...]     results -> output/_chain/results.json
 Every model-producing stage saves its checkpoint and a median slice figure (GT | model | reference | error).
@@ -330,6 +331,36 @@ def stage_main_eval(ds):
     save(f"main_eval_{RUN}", out)
 
 
+def stage_edge_penalty(ds):
+    """Strength of the edge-preserving penalty on the run's tree: strict solves from the deployed values with
+    weight = f * J / R (J, R: data term and penalty at the start), f in {0, 0.003, 0.03, 0.3}; chosen by the held-out
+    views (the GT volume metrics are reported only as diagnosis)."""
+    from adaptive_ct.training.regularizer import EdgePenalty
+    from adaptive_ct.training.solve import gradient, solve
+    dh, dw = ds.detector_shape
+    delta = 0.02
+    m0 = load_checkpoint(ROOT / "output" / RUN / "checkpoint.pt")
+    m0.coefficient_logits.requires_grad_(True)
+    c0 = m0.coefficients().detach().clone()
+    _, J = gradient(m0, c0, ds.train.angles, ds.train.projections, list(range(int(ds.train.angles.numel()))))
+    R, _ = EdgePenalty(m0, delta).value_and_gradient(c0)
+    print(f"start: data term {J:.4g}, penalty {R:.4g}", flush=True)
+    out = {"delta": delta, "data_term_start": J, "penalty_start": R}
+    for f in (0.0, 0.003, 0.03, 0.3):
+        m = load_checkpoint(ROOT / "output" / RUN / "checkpoint.pt")
+        weight = f * J / max(R, 1e-30)
+        penalty = EdgePenalty(m, delta) if weight > 0 else None
+        t0 = time.time()
+        _, hist, conv = solve(m, ds.train, passes=120, tol=1e-4, groups=24, group_passes=0, penalty=penalty, penalty_weight=weight)
+        with torch.no_grad():
+            held = projection_metrics(render_split(m, ds.validation, detector_h=dh, detector_w=dw), ds.validation.projections)
+        res = {**evaluate_volume(m), "weight": weight, "factor": f, "held_out_projection_psnr": held["psnr"], "passes": hist[-1]["pass"],
+               "converged": conv, "seconds": time.time() - t0, "penalty_end": hist[-1]["penalty"]}
+        report(f"edge_penalty_f{f:g}", m, res)
+        out[f"f{f:g}"] = {k: res[k] for k in ("weight", "held_out_projection_psnr", "volume_psnr_db", "band_rmse", "far_rmse", "passes", "converged")}
+    save("edge_penalty_selection", out)
+
+
 def stage_speed(ds):
     """Accelerated solver on the oracle tree, cold start: tolerance stop, with / without a 2x2-binned warm-up.
     Reference: 80 fixed passes, 57 min, 36.58 dB (solve_C_groups24_then_extrapolated_80)."""
@@ -554,4 +585,4 @@ def stage_profile(ds):
 if __name__ == "__main__":
     ds = get_dataset()
     for st in STAGES:
-        {"ls_eval": stage_ls_eval, "oracle": stage_oracle, "speed": stage_speed, "profile": stage_profile, "main_eval": stage_main_eval}[st](ds)
+        {"ls_eval": stage_ls_eval, "oracle": stage_oracle, "speed": stage_speed, "profile": stage_profile, "main_eval": stage_main_eval, "edge_penalty": stage_edge_penalty}[st](ds)
