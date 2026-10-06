@@ -5,6 +5,7 @@ import torch
 from adaptive_ct.core.geometry import parallel_rays
 from adaptive_ct.core.projector import has_bernstein_native
 from adaptive_ct.representation.octree import BernsteinOctree
+from tests.representation.test_octree import make_step
 
 
 def _rays(ray_count, detector, seed, full_turn=False):
@@ -42,25 +43,27 @@ class BernsteinCudaTests(unittest.TestCase):
         for ref, act in zip(out[False], out[True]):
             self.assertTrue(torch.allclose(act, ref, atol=atol, rtol=atol))
 
-    def test_mixed_constant_trilinear_tree(self):
-        model = BernsteinOctree(levels=[2, 4], max_degree=1, attenuation_shift=0.0)
+    def test_mixed_constant_trilinear_step_tree(self):
+        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
         model.to_trilinear([0, 3, 5])
         model.split_leaves_batch([model.find_leaf((0, 1, 1, 1)), model.find_leaf((0, 0, 0, 0))])
-        self._compare(model, _rays(96, 8, 23))
+        make_step(model, [model.find_leaf((1, 2, 2, 3)), model.find_leaf((0, 1, 0, 0))], seed=4)
+        make_step(model, [model.find_leaf((1, 3, 3, 2))], seed=8, width=0.0)
+        self._compare(model, _rays(256, 8, 23))
 
     def test_large_grid_shallow_angle_leaf_assignment(self):
-        model = BernsteinOctree(levels=[24, 48, 96], max_degree=0, attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[24, 48, 96], leaf_types=("constant",), attenuation_shift=0.0)
         self._compare(model, _rays(128, 96, 20260628, full_turn=True), atol=2e-5)
 
     def test_four_level_tree(self):
-        model = BernsteinOctree(levels=[2, 4, 8, 16], max_degree=1, attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[2, 4, 8, 16], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
         for level in range(3):
             model.split_leaves_batch([model.find_leaf((level, 0, 0, 0))])
         model.to_trilinear([model.find_leaf((3, 0, 0, 0))])
         self._compare(model, _rays(64, 8, 23))
 
     def test_anisotropic_levels(self):
-        model = BernsteinOctree(levels=[[2, 3, 4], [4, 6, 8], [8, 12, 16]], max_degree=1, attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[[2, 3, 4], [4, 6, 8], [8, 12, 16]], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
         model.split_leaves_batch([model.find_leaf((0, 0, 0, 0))])
         model.split_leaves_batch([model.find_leaf((1, 0, 0, 0))])
         model.to_trilinear([model.find_leaf((2, 0, 0, 0))])

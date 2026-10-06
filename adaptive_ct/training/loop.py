@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 from adaptive_ct.codec.artifact import export_compact_octree_artifact
-from adaptive_ct.codec.budget import codec_bytes
+from adaptive_ct.codec.budget import model_bytes
 from adaptive_ct.core.config import load_config
 from adaptive_ct.data.dataset import load_r2_dataset
 from adaptive_ct.data.splits import split_projection_views
@@ -64,7 +64,7 @@ def run_training(config_path: str | Path) -> dict:
     # Normalized [-1, 1]^3 box: the representative path length is two, so the
     # constant start value comes directly from the projections.
     _initialize_constant_mu(model, (dataset.train.projections.mean() * 0.5).clamp_min(1e-8))
-    if model.max_degree == 1:  # trilinear main line: every root leaf starts trilinear
+    if "trilinear" in model.leaf_types:  # main line: every root leaf starts trilinear
         model.to_trilinear(torch.arange(model.leaf_levels.shape[0], device=device))
 
     train_cfg = config["training"]
@@ -76,7 +76,6 @@ def run_training(config_path: str | Path) -> dict:
         estimator_split=dataset.train,
         detector_h=detector_h,
         detector_w=detector_w,
-        chunk_rays=eval_chunk,
         seed=training_seed,
         byte_budget=int(ref_cfg["byte_budget"]),
     )
@@ -116,7 +115,8 @@ def run_training(config_path: str | Path) -> dict:
             "objective": last.get("objective_at_eval_point"),
             "optimality_residual": last.get("optimality_residual"),
             "leaves": int(model.leaf_levels.shape[0]),
-            "codec_bytes": codec_bytes(model, controller.codec),
+            "bytes": model_bytes(model, controller.quantization),
+            "leaf_type_counts": list(model.stats().leaf_type_counts),
             "held_out_projection": held_out_metric(),
         }
         history.extend({**h, "round": r} for h in hist)
@@ -124,12 +124,12 @@ def run_training(config_path: str | Path) -> dict:
         print(json.dumps({"round": entry}, default=float), flush=True)
         if final:
             break
-        _, event = controller.refine(model)
+        event = controller.refine(model)
         growth_events.append(event)
         print(json.dumps({"grow": event}, default=float), flush=True)
 
     elapsed = time.perf_counter() - start_time
-    codec_summary = deploy(model, dataset, config["export"]["codec"], detector_h=detector_h, detector_w=detector_w, ray_chunk=eval_chunk)
+    codec_summary = deploy(model, dataset, controller.quantization, detector_h=detector_h, detector_w=detector_w, ray_chunk=eval_chunk)
     stats = model.stats()
     metrics_cfg = config.get("metrics", {}) or {}
     if bool(metrics_cfg.get("compute_projection_metrics", True)):
@@ -194,16 +194,16 @@ def run_training(config_path: str | Path) -> dict:
         "boundary_sharpness": boundary_sharpness,
         "model": stats.__dict__,
         "training_objective": {
-            "form": "min_{c>=0} 1/2 ||A c - y||^2 per fixed tree; tree grows until codec_bytes <= byte_budget",
+            "form": "min_{c>=0} 1/2 ||A c - y||^2 per fixed tree; tree and leaf types chosen by held-out refits under the byte budget",
             "byte_budget": int(ref_cfg["byte_budget"]),
-            "codec": controller.codec,
+            "quantization": controller.quantization,
             "solver": solver_cfg,
             "dense_volume_loaded_during_training": False,
         },
         "refinement": {
             "rounds": controller.round_index,
             "stop_reasons": list(controller.stop_reasons),
-            "gain_share": controller.share,
+            "action_share": float(ref_cfg.get("action_share", 0.5)),
         },
         "rounds": rounds,
         "codec": codec_summary,

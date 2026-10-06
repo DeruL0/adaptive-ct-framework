@@ -1,9 +1,10 @@
-# Main pipeline: trilinear Bernstein octree, projections only.
+# Main pipeline: adaptive octree with constant / trilinear / step leaves, projections only.
 #
 # Start: 48^3 grid of trilinear leaves, every value = half the mean training projection.
-# Each round: solve the fixed tree (nonnegative least squares on the physical coefficients),
-# score leaves on the solved model, split the best batch (function preserving). When the byte
-# budget is spent: a final strict solve, then the physical coefficients are stored in fp16.
+# Each round: solve the fixed tree (nonnegative least squares on the physical coefficients), then
+# for every leaf refit the options keep / constant / trilinear / step / split on half of the sampled
+# rays, score them on the other half, and take the best batch under "gain - price x bytes" within
+# the byte budget. When nothing is worth doing: a final strict solve, then everything stored in fp16.
 # Views: train 240 / held-out 16 (reported per round, used for no decision) / test 4 (final
 # evaluation only). The GT volume is loaded only for the final volume metrics.
 device: cuda
@@ -16,7 +17,7 @@ dataset:
 model:
   levels: [48, 96, 192, 384, 768]
   max_leaf_count: 6000000
-  max_degree: 1             # 0: constant leaves only; 1: trilinear leaves
+  leaf_types: [constant, trilinear, step]
   cuda_integrator: true
   attenuation_shift: -3.0
 
@@ -34,15 +35,12 @@ training:
     min_leaf_px: 2.5        # bin the detector 2x2 / 4x4 while the finest leaf spans >= this many binned pixels
     extrapolate: true
   refinement:
-    gain_share: 0.5         # each batch: best-scored leaves until they carry half the total score
-    estimator_rays: 2097152
-    estimator_max_buffer_mb: 512
-    min_footprint_px: 1.0
+    action_share: 0.5       # each round: best actions until they carry half the total net benefit
+    estimator_rays: 4194304 # sampled rays for the refit decision (split in two halves)
+    min_footprint_px: 1.0   # children must span >= 1 detector pixel
     byte_budget: 8388608
     max_rounds: 32
-    codec:                  # bytes are counted for what is stored: 8 physical fp16 values per leaf
-      type: p1
-      quantization: float16
+    quantization: float16   # bytes counted for what is stored: constant 5, trilinear 19, step 15 per leaf
 
 metrics:
   compute_projection_metrics: true
@@ -50,9 +48,6 @@ metrics:
   compute_boundary_metrics: false
 
 export:
-  codec:                    # deploy = the solved physical coefficients rounded to fp16
-    type: p1
-    quantization: float16
   compact_octree:
     enabled: true
     artifact_name: ANVO.npz

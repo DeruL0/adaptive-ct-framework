@@ -1,4 +1,5 @@
-"""Compact file of the deployed octree: packed hierarchy (node arrays) + physical coefficients in fp16."""
+"""Compact file of the deployed octree: packed hierarchy (node arrays), leaf types, physical coefficients and
+step geometry (direction angles, d, w of the step leaves) in fp16."""
 
 from __future__ import annotations
 
@@ -9,7 +10,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-SCHEMA = "compact_bernstein_octree_packed_v3"
+from adaptive_ct.codec.quantize import angles_to_direction, direction_to_angles
+from adaptive_ct.representation.octree import type_ids
+
+SCHEMA = "compact_octree_typed_v4"
 
 
 @dataclass(frozen=True)
@@ -45,10 +49,12 @@ def export_compact_octree_artifact(model, path: str | Path, *, quantization: str
         "leaf_degrees": model.leaf_degrees.detach().cpu().numpy().astype(np.uint8),
         "leaf_count": np.asarray([int(model.leaf_levels.shape[0])], dtype=np.uint32),
         "level_shapes": np.asarray(model.level_shapes, dtype=np.uint16),
-        "max_degree": np.asarray([model.max_degree], dtype=np.uint8),
         "attenuation_shift": np.asarray([float(model.attenuation_shift)], dtype=np.float32),
         "coefficients": coefficients.astype(np.float16 if quantization == "float16" else np.float32),
     }
+    step = (type_ids(model.leaf_degrees) == 2).detach().cpu()
+    g = model.step_geometry.detach().float().cpu()[step]
+    arrays["step_geometry"] = torch.cat([direction_to_angles(g[:, :3]), g[:, 3:]], 1).numpy().astype(arrays["coefficients"].dtype)
     metadata = {"schema": SCHEMA, "quantization": quantization}
     arrays["metadata_json"] = np.asarray([json.dumps(metadata, sort_keys=True)], dtype="<U1024")
     np.savez_compressed(output_path, **arrays)
@@ -71,14 +77,13 @@ def load_compact_octree_state_dict(model, path: str | Path, *, device=None) -> t
         shapes = [tuple(int(v) for v in row) for row in payload["level_shapes"].tolist()]
         if shapes != [tuple(s) for s in model.level_shapes]:
             raise ValueError(f"Compact octree levels {shapes} do not match model config {model.level_shapes}.")
-        if int(payload["max_degree"][0]) != model.max_degree:
-            raise ValueError("Compact octree max_degree does not match model config.")
         model.attenuation_shift = float(payload["attenuation_shift"][0])
         node_child_base = payload["node_child_base"].astype(np.int64)
         node_leaf_id = payload["node_leaf_id"].astype(np.int64)
         leaf_count = int(payload["leaf_count"][0])
         leaf_degrees = payload["leaf_degrees"].astype(np.int64)
         coefficients = payload["coefficients"].astype(np.float32)
+        step_rows = torch.from_numpy(payload["step_geometry"].astype(np.float32))
 
     # Walk the packed hierarchy level by level to recover each leaf's level and coordinates.
     leaf_levels = np.full((leaf_count,), -1, dtype=np.int64)
@@ -104,6 +109,8 @@ def load_compact_octree_state_dict(model, path: str | Path, *, device=None) -> t
     if int(offsets[-1]) != coefficients.size:
         raise ValueError("Compact octree coefficient count does not match the leaf degrees.")
     t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device=target_device)
+    step_geometry = torch.zeros((leaf_count, 5))
+    step_geometry[type_ids(torch.from_numpy(leaf_degrees)) == 2] = torch.cat([angles_to_direction(step_rows[:, :2]), step_rows[:, 2:]], 1)
     state_dict = {
         "coefficient_logits": model._coefficients_to_logits(t(coefficients)).contiguous(),
         "leaf_levels": t(leaf_levels),
@@ -111,5 +118,6 @@ def load_compact_octree_state_dict(model, path: str | Path, *, device=None) -> t
         "leaf_degrees": t(leaf_degrees),
         "coefficient_offsets": t(offsets.astype(np.int64)),
         "coefficient_leaf_ids": t(np.repeat(np.arange(leaf_count), counts)),
+        "step_geometry": step_geometry.to(target_device),
     }
     return state_dict, metadata

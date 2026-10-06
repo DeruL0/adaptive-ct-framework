@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from adaptive_ct.codec.budget import codec_bytes, split_delta_bytes
+from adaptive_ct.codec.budget import model_bytes
 from adaptive_ct.data.dataset import load_r2_dataset
 from adaptive_ct.evaluation.metrics import projection_metrics
 from adaptive_ct.evaluation.render import render_split
@@ -40,9 +40,8 @@ GT = np.load(ROOT / "output/figure473_dicom_orig_r2_convergence/vol_gt.npy", mma
 D, H, W = GT.shape
 CK = torch.load(ROOT / "output" / RUN / "checkpoint.pt", map_location="cpu")
 CFG = CK["config"]
-CODEC = {"type": "p1", "quantization": "float16"}  # what the main pipeline stores
+SPLIT_BYTES = 64 + 7 * 19  # one split of a trilinear leaf, fp16 (codec.budget)
 BUDGET = 8_388_608
-SPLIT_BYTES = split_delta_bytes(CODEC)
 TAU, BAND_R = 0.1, 3
 
 
@@ -134,7 +133,7 @@ def evaluate_volume(model):
         "band_rmse": math.sqrt(se["band"] / cnt["band"]),
         "far_rmse": math.sqrt(se["far"] / cnt["far"]),
         "leaves": int(model.leaf_levels.shape[0]),
-        "codec_bytes": codec_bytes(model, CODEC),
+        "bytes": model_bytes(model),
     }
 
 
@@ -242,7 +241,7 @@ def stage_oracle(ds):
         A[li] = B[li] = s2[li] = None
     torch.cuda.empty_cache()
     base = base_model(ds.train)
-    k_splits = (BUDGET - codec_bytes(base, CODEC)) // SPLIT_BYTES
+    k_splits = (BUDGET - model_bytes(base)) // SPLIT_BYTES
     sse0, sse1, sse2 = sses
 
     def dp(lam):

@@ -3,185 +3,104 @@ from pathlib import Path
 
 import torch
 
-from adaptive_ct.representation.octree import BernsteinOctree
-from adaptive_ct.data.dataset import ProjectionSplit
-from adaptive_ct.refinement.controller import RefinementController
-from adaptive_ct.refinement.estimator import attributed_residual_energy, resolvable_mask
-from adaptive_ct.codec.budget import codec_bytes, split_delta_bytes
-from adaptive_ct.refinement.marking import mark_by_gain_share
-from adaptive_ct.data.rays import sample_random_rays
+from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
-
-
-def _compact_raw_payload_bytes(model, quantization: str = "float16") -> int:
-    """Reference byte count of the compact packed-hierarchy export (no metadata)."""
-    bytes_per_float = 4 if quantization == "float32" else 2
-    total = int(model.node_child_base.numel()) * 8
-    total += int(model.leaf_levels.shape[0]) * 3 + 4 + len(model.level_shapes) * 6 + 3 + 4
-    return total + int(model.coefficients().numel()) * bytes_per_float
-
+from adaptive_ct.data.dataset import ProjectionSplit
+from adaptive_ct.data.rays import sample_random_rays
+from adaptive_ct.refinement.decision import decide_and_apply, resolvable_mask
+from adaptive_ct.representation.octree import BernsteinOctree, type_ids
+from adaptive_ct.training.solve import solve
 
 DETECTOR = 8
+ALL = ("constant", "trilinear", "step")
 
 
-def _batch(rays):
-    from adaptive_ct.data.rays import ray_batch
-
-    return ray_batch(rays, 0, rays.observation_count)
-
-
-def _model(levels=(2, 4, 8), degree=1):
-    model = BernsteinOctree(levels=list(levels), max_degree=degree, attenuation_shift=0.0, cuda_integrator=False)
-    if degree == 1:
+def _model(levels=(2, 4, 8), types=ALL, trilinear=True):
+    model = BernsteinOctree(levels=list(levels), leaf_types=types, attenuation_shift=0.0, cuda_integrator=False)
+    if trilinear:
         model.to_trilinear(torch.arange(model.leaf_levels.shape[0]))
     return model
 
 
 def _render(model, angles):
     rows, cols = detector_grid(DETECTOR, DETECTOR, torch.device("cpu"))
-    images = []
-    for angle in angles:
-        batch = parallel_rays(angle.expand(rows.numel()), rows, cols, detector_h=DETECTOR, detector_w=DETECTOR,
-                              targets=torch.zeros(rows.numel()))
-        images.append(model.integrate_ray_batch(batch).detach().reshape(DETECTOR, DETECTOR))
-    return torch.stack(images)
+    return torch.stack([model.integrate_ray_batch(parallel_rays(a.expand(rows.numel()), rows, cols, detector_h=DETECTOR, detector_w=DETECTOR,
+                                                                targets=torch.zeros(rows.numel()))).detach().reshape(DETECTOR, DETECTOR)
+                        for a in angles])
 
 
-def _split_from(truth, views=6):
+def _split_from(truth, views=16):
     angles = torch.linspace(0.0, 3.0, views)
     return ProjectionSplit(angles=angles, projections=_render(truth, angles), paths=[Path(str(i)) for i in range(views)])
 
 
-def _truth(levels=(2, 4, 8), degree=1):
-    truth = _model(levels, degree)
-    torch.manual_seed(3)
+def _rays(split, count=4096, seed=1):
+    return sample_random_rays(split, ray_count=count, detector_h=DETECTOR, detector_w=DETECTOR, seed=seed, chunk_rays=1024)
+
+
+def _random_values(model, seed):
+    torch.manual_seed(seed)
     with torch.no_grad():
-        values = 0.05 + 0.5 * torch.rand(truth.coefficient_logits.shape[0])
-        truth.coefficient_logits.copy_(truth._coefficients_to_logits(values))
-    return truth
-
-
-class MarkTests(unittest.TestCase):
-    def test_mark_is_minimal_prefix_reaching_theta(self):
-        eta = torch.tensor([5.0, 1.0, 3.0, 1.0])
-        ids = torch.tensor([10, 11, 12, 13])
-        marked, info = mark_by_gain_share(eta, ids, delta_bytes=10, theta=0.5, remaining_bytes=float("inf"))
-        self.assertEqual(marked.tolist(), [10])
-        self.assertAlmostEqual(info["eta_fraction"], 0.5)
-        marked, _ = mark_by_gain_share(eta, ids, delta_bytes=10, theta=0.51, remaining_bytes=float("inf"))
-        self.assertEqual(marked.tolist(), [10, 12])
-
-    def test_mark_respects_byte_and_parent_caps(self):
-        eta = torch.tensor([4.0, 3.0, 2.0, 1.0])
-        ids = torch.arange(4)
-        marked, info = mark_by_gain_share(eta, ids, delta_bytes=10, theta=1.0, remaining_bytes=25.0)
-        self.assertEqual(marked.tolist(), [0, 1])
-        self.assertEqual(info["k_bytes"], 2)
-        marked, _ = mark_by_gain_share(eta, ids, delta_bytes=10, theta=1.0, remaining_bytes=float("inf"), max_parents=1)
-        self.assertEqual(marked.tolist(), [0])
+        model.coefficient_logits.copy_(model._coefficients_to_logits(0.05 + 0.5 * torch.rand(model.coefficient_logits.shape[0])))
 
 
 class ByteModelTests(unittest.TestCase):
-    def test_p0_codec_matches_compact_payload_and_split_delta(self):
-        model = _model(degree=0)
-        codec = {"type": "p0", "quantization": "float16"}
-        self.assertEqual(codec_bytes(model, codec), _compact_raw_payload_bytes(model))
-        before = codec_bytes(model, codec)
-        model.split_leaves_batch(torch.tensor([0, 3]))
-        self.assertEqual(codec_bytes(model, codec) - before, 2 * split_delta_bytes(codec))
-        self.assertEqual(split_delta_bytes(codec), 99)
-
-    def test_p1_codec_matches_compact_payload_and_split_delta(self):
-        model = _truth()
-        codec = {"type": "p1", "quantization": "float16"}
-        before = codec_bytes(model, codec)
-        model.split_leaves_batch(torch.tensor([1, 5]))
-        self.assertEqual(codec_bytes(model, codec), _compact_raw_payload_bytes(model))
-        self.assertEqual(codec_bytes(model, codec) - before, 2 * split_delta_bytes(codec))
-        self.assertEqual(split_delta_bytes(codec), 197)
-
-
-class EstimatorTests(unittest.TestCase):
-    def test_residual_energy_sums_to_sampled_energy(self):
-        truth = _truth()
-        split = _split_from(truth)
-        model = _model()
-        rays = sample_random_rays(
-            split,
-            ray_count=512,
-            detector_h=DETECTOR,
-            detector_w=DETECTOR,
-            seed=1,
-            chunk_rays=128,
-        )
-        eta, exposure, summary = attributed_residual_energy(model, rays)
-        self.assertAlmostEqual(float(eta.sum()), summary["estimator_rss"], places=3)
-        self.assertGreater(float((exposure > 0).float().mean()), 0.0)
-
+    def test_bytes_per_leaf_type_and_per_split(self):
+        self.assertEqual(leaf_bytes("float16").tolist(), [5, 19, 15])
+        model = _model(trilinear=False)
+        before = model_bytes(model)
+        model.to_trilinear([0, 1])
+        self.assertEqual(model_bytes(model) - before, 2 * 14)
+        before = model_bytes(model)
+        kind = type_ids(model.leaf_degrees)
+        ids = torch.tensor([int(torch.nonzero(kind == 1)[0]), int(torch.nonzero(kind == 0)[0])])
+        expected = int(split_bytes(kind[ids]).sum())
+        model.split_leaves_batch(ids)
+        self.assertEqual(model_bytes(model) - before, expected)
+        self.assertEqual(expected, (64 + 7 * 19) + (64 + 7 * 5))
 
     def test_resolvable_mask_follows_pixel_footprint(self):
-        model = _model(levels=(2, 4, 8), degree=0)
+        model = _model(trilinear=False)
         model.split_leaves_batch(torch.tensor([0]))
         fine = resolvable_mask(model, detector_h=16, detector_w=16, min_footprint_px=1.0)
         self.assertTrue(bool(fine[model.leaf_levels == 0].all()))
         self.assertTrue(bool(fine[model.leaf_levels == 1].all()))
-        coarse = resolvable_mask(model, detector_h=4, detector_w=4, min_footprint_px=1.0)
-        self.assertFalse(bool(coarse[model.leaf_levels == 1].any()))
-        self.assertFalse(bool(resolvable_mask(model, detector_h=16, detector_w=16, min_footprint_px=1.0)[model.leaf_levels == 2].any()))
+        self.assertFalse(bool(resolvable_mask(model, detector_h=4, detector_w=4, min_footprint_px=1.0)[model.leaf_levels == 1].any()))
+        self.assertFalse(bool(fine[model.leaf_levels == 2].any()))  # deepest level
 
 
-class SplitAndCodecTests(unittest.TestCase):
-    def test_p1_split_preserves_projections(self):
-        truth = _truth()
+class DecisionTests(unittest.TestCase):
+    def test_exact_model_has_no_beneficial_action(self):
+        truth = _model()
+        _random_values(truth, 3)
+        report = decide_and_apply(truth, _rays(_split_from(truth)), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=10**9)
+        self.assertEqual(sum(report["actions"].values()), 0)
+
+    def test_planar_step_inside_a_leaf_becomes_a_step_leaf(self):
+        truth = _model(levels=(1, 2, 4), trilinear=False)
+        truth.set_types([0], [2], torch.tensor([0.1, 0.5]), torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]]))  # hard step at x = 0
         split = _split_from(truth)
-        model = _model()
-        with torch.no_grad():
-            model.coefficient_logits.copy_(model._coefficients_to_logits(0.05 + 0.5 * torch.rand(model.coefficient_logits.shape[0])))
-        rays = sample_random_rays(
-            split,
-            ray_count=256,
-            detector_h=DETECTOR,
-            detector_w=DETECTOR,
-            seed=2,
-            chunk_rays=128,
-        )
-        before = float(((model.integrate_ray_batch(_batch(rays)) - _batch(rays).target) ** 2).sum())
-        model.split_leaves_batch(torch.tensor([0, 2, 5]))
-        after = float(((model.integrate_ray_batch(_batch(rays)) - _batch(rays).target) ** 2).sum())
-        self.assertAlmostEqual(before, after, delta=1e-5 * max(before, 1.0))
+        model = _model(levels=(1, 2, 4))
+        solve(model, split, passes=60, tol=1e-6)  # trilinear fit: a ramp along x
+        report = decide_and_apply(model, _rays(split), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=10**9, action_share=1.0)
+        self.assertEqual(report["actions"]["step"], 1)
+        self.assertEqual(type_ids(model.leaf_degrees).tolist(), [2])
+        self.assertGreater(abs(float(model.step_geometry[0, 0])), 0.9)  # direction along x
+        err = (_render(model, split.angles) - split.projections).square().mean()
+        self.assertLess(float(err), 0.05 * float(split.projections.square().mean()))
 
-
-class ControllerTests(unittest.TestCase):
-    def _controller(self, split, **spec):
-        base = {"gain_share": 0.5, "estimator_rays": 512, "min_footprint_px": 1.0, "codec": {"type": "p1", "quantization": "float16"}}
-        base.update(spec)
-        return RefinementController(spec=base, estimator_split=split, detector_h=DETECTOR, detector_w=DETECTOR, chunk_rays=128,
-                                    seed=5, byte_budget=spec.get("byte_budget"))
-
-    def test_round_splits_a_batch_without_changing_projections(self):
-        truth = _truth()
+    def test_actions_respect_the_byte_budget(self):
+        truth = _model(levels=(2, 4, 8))
+        truth.split_leaves_batch(torch.arange(8))
+        _random_values(truth, 5)
         split = _split_from(truth)
-        model = _model()
-        rays = sample_random_rays(split, ray_count=256, detector_h=DETECTOR, detector_w=DETECTOR, seed=3, chunk_rays=128)
-        before = float(model.integrate_ray_batch(_batch(rays)).sum())
-        leaves = int(model.leaf_levels.shape[0])
-        active, event = self._controller(split).refine(model)
-        self.assertGreater(active, 0)
-        self.assertEqual(int(model.leaf_levels.shape[0]), leaves + 7 * active)
-        self.assertAlmostEqual(float(model.integrate_ray_batch(_batch(rays)).sum()), before, delta=1e-4 * abs(before))
-        self.assertFalse(event["stop"])
-
-    def test_exact_model_has_nothing_to_split(self):
-        truth = _truth()
-        _, event = self._controller(_split_from(truth)).refine(truth)
-        self.assertTrue(event["stop"])
-        self.assertIn("no_splittable_leaf", event["stop_reasons"])
-
-    def test_byte_budget_stops_growth(self):
-        truth = _truth()
-        model = _model()
-        _, event = self._controller(_split_from(truth), byte_budget=1).refine(model)
-        self.assertIn("byte_budget_exhausted", event["stop_reasons"])
+        model = _model(levels=(2, 4, 8))
+        solve(model, split, passes=30, tol=1e-4)
+        budget = model_bytes(model) + 400
+        report = decide_and_apply(model, _rays(split), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=budget, action_share=1.0)
+        self.assertGreater(sum(report["actions"].values()), 0)
+        self.assertLessEqual(report["bytes_after"], budget)
+        self.assertEqual(report["bytes_after"], model_bytes(model))
 
 
 if __name__ == "__main__":

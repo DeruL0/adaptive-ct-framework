@@ -82,6 +82,7 @@ class _BernsteinOctreeIntegrate(Function):
         coefficient_logits: torch.Tensor,
         leaf_degrees: torch.Tensor,
         coefficient_offsets: torch.Tensor,
+        step_geometry: torch.Tensor,
         node_child_base: torch.Tensor,
         node_leaf_id: torch.Tensor,
         angles: torch.Tensor,
@@ -102,6 +103,7 @@ class _BernsteinOctreeIntegrate(Function):
             coefficient_logits,
             leaf_degrees,
             coefficient_offsets,
+            step_geometry,
             node_child_base,
             node_leaf_id,
             angles,
@@ -117,6 +119,7 @@ class _BernsteinOctreeIntegrate(Function):
             coefficient_logits.contiguous(),
             leaf_degrees.contiguous(),
             coefficient_offsets.contiguous(),
+            step_geometry.contiguous(),
             node_child_base.contiguous(),
             node_leaf_id.contiguous(),
             angles.contiguous(),
@@ -137,6 +140,7 @@ class _BernsteinOctreeIntegrate(Function):
             coefficient_logits,
             leaf_degrees,
             coefficient_offsets,
+            step_geometry,
             node_child_base,
             node_leaf_id,
             angles,
@@ -147,6 +151,7 @@ class _BernsteinOctreeIntegrate(Function):
             coefficient_logits.contiguous(),
             leaf_degrees.contiguous(),
             coefficient_offsets.contiguous(),
+            step_geometry.contiguous(),
             node_child_base.contiguous(),
             node_leaf_id.contiguous(),
             angles.contiguous(),
@@ -161,7 +166,7 @@ class _BernsteinOctreeIntegrate(Function):
             ctx.root_shape[2],
             ctx.attenuation_shift,
         )
-        return (grad_coefficients,) + (None,) * 14
+        return (grad_coefficients,) + (None,) * 15
 
 
 def bernstein_octree_integrate(
@@ -169,6 +174,7 @@ def bernstein_octree_integrate(
     coefficient_logits: torch.Tensor,
     leaf_degrees: torch.Tensor,
     coefficient_offsets: torch.Tensor,
+    step_geometry: torch.Tensor,
     node_child_base: torch.Tensor,
     node_leaf_id: torch.Tensor,
     angles: torch.Tensor,
@@ -187,6 +193,7 @@ def bernstein_octree_integrate(
         coefficient_logits,
         leaf_degrees,
         coefficient_offsets,
+        step_geometry,
         node_child_base,
         node_leaf_id,
         angles,
@@ -207,6 +214,7 @@ def bernstein_octree_ray_segments(
     coefficient_logits: torch.Tensor,
     leaf_degrees: torch.Tensor,
     coefficient_offsets: torch.Tensor,
+    step_geometry: torch.Tensor,
     node_child_base: torch.Tensor,
     node_leaf_id: torch.Tensor,
     angles: torch.Tensor,
@@ -228,6 +236,7 @@ def bernstein_octree_ray_segments(
         coefficient_logits.contiguous(),
         leaf_degrees.contiguous(),
         coefficient_offsets.contiguous(),
+        step_geometry.contiguous(),
         node_child_base.contiguous(),
         node_leaf_id.contiguous(),
         angles.contiguous(),

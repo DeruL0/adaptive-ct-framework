@@ -1,19 +1,8 @@
-# Control: same pipeline as p1.yaml with constant leaves stored as fp16 values.
+# Control: same pipeline as p1.yaml with constant leaves only.
 extends: p1.yaml
 
 model:
-  max_degree: 0
-
-training:
-  refinement:
-    codec:
-      type: p0
-      quantization: float16
-
-export:
-  codec:
-    type: p0
-    quantization: float16
+  leaf_types: [constant]
 
 output:
   dir: output\main_p0_256v

@@ -23,7 +23,7 @@ def _render(model, angle):
 
 def _write_dataset(root: Path, train_views: int = 12) -> Path:
     torch.manual_seed(11)
-    truth = BernsteinOctree(levels=[2, 4, 8], max_degree=1, attenuation_shift=0.0, cuda_integrator=False)
+    truth = BernsteinOctree(levels=[2, 4, 8], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0, cuda_integrator=False)
     truth.to_trilinear(torch.arange(truth.leaf_levels.shape[0]))
     with torch.no_grad():
         truth.coefficient_logits.copy_(truth._coefficients_to_logits(0.02 + 0.4 * torch.rand(truth.coefficient_logits.shape[0])))
@@ -48,37 +48,37 @@ def _write_dataset(root: Path, train_views: int = 12) -> Path:
     return dataset_root
 
 
-def _config(dataset_root: Path, output_root: Path, *, codec: dict, degree: int) -> dict:
+def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
     return {
         "device": "cpu",
         "dataset": {"root": str(dataset_root), "dev_views": 3, "dev_seed": 1},
-        "model": {"levels": [2, 4, 8], "max_degree": degree, "cuda_integrator": False, "attenuation_shift": 0.0},
+        "model": {"levels": [2, 4, 8], "leaf_types": types, "cuda_integrator": False, "attenuation_shift": 0.0},
         "training": {
             "seed": 3,
             "eval_ray_chunk": 4096,
             "solver": {"groups": 3, "first_group_passes": 2, "group_passes": 1, "round_tol": 1e-3, "round_passes": 6, "final_tol": 1e-4, "final_passes": 8},
-            "refinement": {"gain_share": 0.5, "estimator_rays": 256, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3, "codec": codec},
+            "refinement": {"action_share": 0.5, "estimator_rays": 2048, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3, "quantization": "float16"},
         },
         "metrics": {"compute_projection_metrics": True, "compute_volume_metrics": False, "compute_boundary_metrics": False},
-        "export": {"codec": codec, "compact_octree": {"enabled": True, "artifact_name": "ANVO.npz", "quantization": "float16"}},
+        "export": {"compact_octree": {"enabled": True, "artifact_name": "ANVO.npz", "quantization": "float16"}},
         "output": {"dir": str(output_root)},
     }
 
 
 class PipelineTests(unittest.TestCase):
-    def _run(self, *, codec: dict, degree: int):
+    def _run(self, *, types: list):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            config = _config(_write_dataset(root), root / "output", codec=codec, degree=degree)
+            config = _config(_write_dataset(root), root / "output", types=types)
             config_path = root / "config.yaml"
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
             report = run_training(config_path)
             artifacts = {name: (root / "output" / name).exists() for name in ("checkpoint.pt", "ANVO.npz", "training_report.json")}
         return report, artifacts
 
-    def test_trilinear_run_refines_from_projections_and_stores_fp16(self):
-        report, artifacts = self._run(codec={"type": "p1", "quantization": "float16"}, degree=1)
-        events = [event for event in report["growth_events"] if event.get("active_splits")]
+    def test_three_type_run_refines_from_projections_and_stores_fp16(self):
+        report, artifacts = self._run(types=["constant", "trilinear", "step"])
+        events = [event for event in report["growth_events"] if sum(event["actions"].values())]
         self.assertGreaterEqual(len(events), 1)
         self.assertEqual(report["evaluation_protocol"]["training_views"], 9)
         self.assertEqual(report["evaluation_protocol"]["validation_views"], 3)
@@ -88,8 +88,9 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(all(artifacts.values()), artifacts)
 
     def test_constant_control_runs(self):
-        report, artifacts = self._run(codec={"type": "p0", "quantization": "float16"}, degree=0)
-        self.assertGreaterEqual(len([e for e in report["growth_events"] if e.get("active_splits")]), 1)
+        report, artifacts = self._run(types=["constant"])
+        self.assertGreaterEqual(len([e for e in report["growth_events"] if sum(e["actions"].values())]), 1)
+        self.assertEqual(list(report["model"]["leaf_type_counts"][1:]), [0, 0])
         self.assertTrue(artifacts["ANVO.npz"])
 
 

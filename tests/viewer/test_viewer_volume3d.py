@@ -23,7 +23,7 @@ from adaptive_ct.viewer.server import (
 
 class ViewerVolume3DTests(unittest.TestCase):
     def test_leaf_structure_payload_reports_leaf_sizes(self):
-        model = build_model({"model": {"max_degree": 0, "levels": [2, 4, 8], "cuda_integrator": False}})
+        model = build_model({"model": {"leaf_types": ["constant"], "levels": [2, 4, 8], "cuda_integrator": False}})
         model.split_leaves_batch(torch.tensor([0]))
         payload = _leaf_structure_payload(model)
         self.assertEqual(payload["leaf_cells"], 15)
@@ -33,7 +33,7 @@ class ViewerVolume3DTests(unittest.TestCase):
         self.assertEqual(payload["size_range"], {"min": 0.5, "max": 1.0})
 
     def test_leaf_geometry_payload_exports_boxes_with_sizes(self):
-        model = build_model({"model": {"max_degree": 0, "levels": [2, 4, 8], "cuda_integrator": False}})
+        model = build_model({"model": {"leaf_types": ["constant"], "levels": [2, 4, 8], "cuda_integrator": False}})
         model.split_leaves_batch(torch.tensor([0]))
         payload = _leaf_geometry_payload(model)
         self.assertEqual(payload["kind"], "leaves")
@@ -57,7 +57,7 @@ class ViewerVolume3DTests(unittest.TestCase):
         self.assertTrue(np.all(np.abs(positions) <= 1.0 + 1e-5))
 
     def test_leaf_geometry_payload_respects_budget(self):
-        model = build_model({"model": {"max_degree": 0, "levels": [4], "cuda_integrator": False}})
+        model = build_model({"model": {"leaf_types": ["constant"], "levels": [4], "cuda_integrator": False}})
         payload = _leaf_geometry_payload(model, max_leaves=10)
         self.assertEqual(payload["total"], 64)
         self.assertEqual(payload["count"], 10)
@@ -65,7 +65,7 @@ class ViewerVolume3DTests(unittest.TestCase):
         self.assertEqual(positions.size, 30)
 
     def test_leaf_geometry_binary_is_compact_and_decodable(self):
-        model = build_model({"model": {"max_degree": 0, "levels": [4], "cuda_integrator": False}})
+        model = build_model({"model": {"leaf_types": ["constant"], "levels": [4], "cuda_integrator": False}})
         encoded = _leaf_geometry_binary(model)
         self.assertEqual(encoded[:8], b"ACTLEAF1")
         header_size = struct.unpack("<I", encoded[8:12])[0]
@@ -101,7 +101,7 @@ class ViewerVolume3DTests(unittest.TestCase):
         self.assertIsNone(header["corners_offset"])
 
     def test_leaf_geometry_binary_carries_p1_corners_for_non_constant_leaves(self):
-        model = BernsteinOctree(levels=[2, 4], max_degree=1, attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
         model.to_trilinear([model.find_leaf((0, 0, 0, 0))])
         leaf_id = model.find_leaf((0, 0, 0, 0))
         with torch.no_grad():

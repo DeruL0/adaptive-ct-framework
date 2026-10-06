@@ -12,6 +12,7 @@ at::Tensor bernstein_octree_integrate_forward_cuda(
     at::Tensor coefficient_logits,
     at::Tensor leaf_degrees,
     at::Tensor coefficient_offsets,
+    at::Tensor step_geometry,
     at::Tensor node_child_base,
     at::Tensor node_leaf_id,
     at::Tensor angles,
@@ -29,6 +30,7 @@ at::Tensor bernstein_octree_integrate_backward_cuda(
     at::Tensor coefficient_logits,
     at::Tensor leaf_degrees,
     at::Tensor coefficient_offsets,
+    at::Tensor step_geometry,
     at::Tensor node_child_base,
     at::Tensor node_leaf_id,
     at::Tensor angles,
@@ -47,6 +49,7 @@ std::vector<at::Tensor> bernstein_octree_segments_forward_cuda(
     at::Tensor coefficient_logits,
     at::Tensor leaf_degrees,
     at::Tensor coefficient_offsets,
+    at::Tensor step_geometry,
     at::Tensor node_child_base,
     at::Tensor node_leaf_id,
     at::Tensor angles,
@@ -68,11 +71,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "bernstein_octree_integrate_forward",
         &bernstein_octree_integrate_forward_cuda,
-        "Integrate anisotropic Bernstein octree leaves along parallel rays (CUDA)");
+        "Integrate constant / trilinear / step octree leaves along parallel rays (CUDA)");
     m.def(
         "bernstein_octree_integrate_backward",
         &bernstein_octree_integrate_backward_cuda,
-        "Backpropagate anisotropic Bernstein octree ray integration (CUDA)");
+        "Backpropagate octree ray integration (CUDA)");
     m.def(
         "bernstein_octree_segments_forward",
         &bernstein_octree_segments_forward_cuda,

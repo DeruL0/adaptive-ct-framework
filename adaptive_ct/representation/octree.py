@@ -16,6 +16,33 @@ from adaptive_ct.core.projector import (
 )
 
 
+# Leaf types, stored as degree triples (the CUDA traversal reads them):
+#   constant  (0, 0, 0)  1 value
+#   trilinear (1, 1, 1)  8 corner values
+#   step      (1, 0, 0)  2 values c0, c1:  (1 - H) c0 + H c1,  H = sigmoid((n . (u - 1/2) - d) / w)
+#             with geometry (n, d, w) in step_geometry; w = 0 is a hard step.
+LEAF_TYPES = {"constant": (0, 0, 0), "trilinear": (1, 1, 1), "step": (1, 0, 0)}
+TYPE_NAMES = ("constant", "trilinear", "step")  # type id = index
+
+
+def type_ids(degrees: torch.Tensor) -> torch.Tensor:
+    """0 constant, 1 trilinear, 2 step."""
+    return torch.where(degrees[:, 0] == 0, 0, torch.where(degrees[:, 1] == 1, 1, 2))
+
+
+def step_integral(geometry: torch.Tensor, s_start: torch.Tensor, s_stop: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
+    """Exact integral of H over straight segments, given s = n . (u - 1/2) at both ends (same formula as the CUDA kernel)."""
+    s0, s1, w = s_start - geometry[:, 3], s_stop - geometry[:, 3], geometry[:, 4]
+    hard = torch.where((s0 > 0) & (s1 > 0), length, torch.where((s0 <= 0) & (s1 <= 0), torch.zeros_like(length),
+                                                                 length * torch.maximum(s0, s1) / (s1 - s0).abs().clamp_min(1e-30)))
+    ws = w.clamp_min(1e-30)
+    a0, a1 = s0 / ws, s1 / ws
+    close = (a1 - a0).abs() < 1e-3
+    smooth = torch.where(close, length * torch.sigmoid(0.5 * (a0 + a1)),
+                         length * (F.softplus(a1) - F.softplus(a0)) / torch.where(close, torch.ones_like(a0), a1 - a0))
+    return torch.where(w > 0, smooth, hard)
+
+
 @dataclass(frozen=True)
 class BernsteinStats:
     parameter_count: int
@@ -30,7 +57,8 @@ class BernsteinStats:
     max_depth: int
     representation: str
     coefficient_count: int
-    max_degree: int
+    leaf_types: tuple[str, ...]
+    leaf_type_counts: tuple[int, ...]
 
 
 def _shape3(value: int | Sequence[int]) -> tuple[int, int, int]:
@@ -98,10 +126,11 @@ def bernstein_basis(degree: int, coordinate: torch.Tensor) -> torch.Tensor:
 
 
 class BernsteinOctree(nn.Module):
-    """Sparse octree whose leaves are constant (degree 0, 1 value) or trilinear (degree 1, 8 corner values).
+    """Sparse octree whose leaves are constant, trilinear or step functions (see LEAF_TYPES).
 
-    Physical coefficients c = softplus(logit + attenuation_shift) >= 0 are packed into one vector; leaf
-    topology, degree and packed offsets are explicit buffers.
+    Physical coefficients c = softplus(logit + attenuation_shift) >= 0 are packed into one vector; every
+    leaf value is a nonnegative weighted average of its coefficients, so the field is >= 0.  Leaf topology,
+    type (degree triple), packed offsets and step geometry are explicit buffers.
     """
 
     representation = "bernstein_octree"
@@ -110,7 +139,7 @@ class BernsteinOctree(nn.Module):
         self,
         *,
         levels: Iterable[int | Sequence[int]],
-        max_degree: int = 1,
+        leaf_types: Sequence[str] = ("constant", "trilinear", "step"),
         attenuation_shift: float = -3.0,
         cuda_integrator: bool = True,
         max_leaf_count: int | None = None,
@@ -127,9 +156,9 @@ class BernsteinOctree(nn.Module):
                     "Bernstein octree levels must use dyadic refinement; "
                     f"got parent={parent}, child={child}."
                 )
-        self.max_degree = int(max_degree)
-        if self.max_degree not in (0, 1):
-            raise ValueError("max_degree must be 0 (constant leaves) or 1 (trilinear leaves allowed).")
+        self.leaf_types = tuple(str(t) for t in leaf_types)
+        if not self.leaf_types or any(t not in LEAF_TYPES for t in self.leaf_types):
+            raise ValueError(f"leaf_types must be a non-empty subset of {list(LEAF_TYPES)}.")
         self.l0_shape = self.level_shapes[0]
         self.attenuation_shift = float(attenuation_shift)
         self.cuda_integrator = bool(cuda_integrator)
@@ -146,6 +175,7 @@ class BernsteinOctree(nn.Module):
         self.register_buffer("leaf_degrees", torch.zeros((leaf_count, 3), dtype=torch.long), persistent=True)
         self.register_buffer("coefficient_offsets", torch.arange(leaf_count + 1, dtype=torch.long), persistent=True)
         self.register_buffer("coefficient_leaf_ids", torch.arange(leaf_count, dtype=torch.long), persistent=True)
+        self.register_buffer("step_geometry", torch.zeros((leaf_count, 5)), persistent=True)  # n (3), d, w
         self.register_buffer("node_child_base", torch.empty((0,), dtype=torch.int32), persistent=False)
         self.register_buffer("node_leaf_id", torch.empty((0,), dtype=torch.int32), persistent=False)
         for level in range(len(self.level_shapes)):
@@ -382,6 +412,13 @@ class BernsteinOctree(nn.Module):
             )[levels]
             coords = self.leaf_coords[group_leaf_ids].to(dtype=flat_points.dtype)
             local = (flat_points[point_ids] + 1.0) * 0.5 * resolutions - coords
+            if degree == LEAF_TYPES["step"]:
+                g = self.step_geometry[group_leaf_ids]
+                s = ((local.clamp(0.0, 1.0) - 0.5) * g[:, :3]).sum(1) - g[:, 3]
+                H = torch.where(g[:, 4] > 0, torch.sigmoid(s / g[:, 4].clamp_min(1e-30)), (s > 0).to(s.dtype))
+                c = physical_coefficients[self.coefficient_offsets[group_leaf_ids, None] + torch.arange(2, device=flat_points.device)]
+                values[point_ids] = (1 - H) * c[:, 0] + H * c[:, 1]
+                continue
             bx = bernstein_basis(degree[0], local[:, 0])
             by = bernstein_basis(degree[1], local[:, 1])
             bz = bernstein_basis(degree[2], local[:, 2])
@@ -473,6 +510,16 @@ class BernsteinOctree(nn.Module):
             degree_mask = torch.all(segment_degrees == degree_tensor, dim=1)
             segment_ids = torch.nonzero(degree_mask, as_tuple=False).reshape(-1)
             degree = tuple(int(value) for value in degree_tensor.tolist())
+            if degree == LEAF_TYPES["step"]:
+                leaves, iv = leaf_ids[segment_ids], intervals[segment_ids]
+                u0 = self.segment_local_coords(ray_batch, ray_ids[segment_ids], leaves, iv[:, 0])
+                u1 = self.segment_local_coords(ray_batch, ray_ids[segment_ids], leaves, iv[:, 1])
+                g = self.step_geometry[leaves]
+                length = iv[:, 1] - iv[:, 0]
+                I = step_integral(g, ((u0 - 0.5) * g[:, :3]).sum(1), ((u1 - 0.5) * g[:, :3]).sum(1), length)
+                c = self.coefficients()[self.coefficient_offsets[leaves, None] + torch.arange(2, device=iv.device)]
+                segment_integrals[segment_ids] = c[:, 0] * (length - I) + c[:, 1] * I
+                continue
             quadrature_order = max(1, int(math.ceil((sum(degree) + 1) / 2.0)))
             nodes_np, weights_np = np.polynomial.legendre.leggauss(quadrature_order)
             nodes = torch.tensor(nodes_np, dtype=intervals.dtype, device=intervals.device)
@@ -515,6 +562,15 @@ class BernsteinOctree(nn.Module):
             totals,
         )
 
+    def segment_local_coords(self, ray_batch, ray_ids: torch.Tensor, leaf_ids: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Leaf-local coordinates u in [0, 1]^3 of the points at ray parameter t (same convention as _parallel_ray_segments)."""
+        a = -ray_batch.angles.to(device=t.device, dtype=t.dtype)[ray_ids]
+        u = -1.0 + (ray_batch.cols.to(device=t.device, dtype=t.dtype)[ray_ids] + 0.5) * 2.0 / float(ray_batch.detector_w)
+        z = -1.0 + (ray_batch.rows.to(device=t.device, dtype=t.dtype)[ray_ids] + 0.5) * 2.0 / float(ray_batch.detector_h)
+        points = torch.stack([-torch.sin(a) * u + torch.cos(a) * t, torch.cos(a) * u + torch.sin(a) * t, z], dim=1)
+        shapes = torch.tensor(self.level_shapes, dtype=t.dtype, device=t.device)[self.leaf_levels[leaf_ids]]
+        return (points + 1.0) * 0.5 * shapes - self.leaf_coords[leaf_ids].to(t.dtype)
+
     def _can_use_cuda_integrator(self, ray_batch) -> bool:
         return self.cuda_integrator and self.coefficient_logits.is_cuda and has_bernstein_native()
 
@@ -523,6 +579,7 @@ class BernsteinOctree(nn.Module):
             "coefficient_logits": self.coefficient_logits,
             "leaf_degrees": self.leaf_degrees,
             "coefficient_offsets": self.coefficient_offsets,
+            "step_geometry": self.step_geometry,
             "node_child_base": self.node_child_base,
             "node_leaf_id": self.node_leaf_id,
             "angles": ray_batch.angles.to(device=self.coefficient_logits.device, dtype=torch.float32),
@@ -591,6 +648,7 @@ class BernsteinOctree(nn.Module):
         new_coords: torch.Tensor,
         new_degrees: torch.Tensor,
         new_blocks: Sequence[torch.Tensor] | torch.Tensor,
+        new_geometry: torch.Tensor | None = None,
     ) -> None:
         device = self.coefficient_logits.device
         removed_leaf_ids = torch.unique(removed_leaf_ids.to(device=device, dtype=torch.long))
@@ -614,6 +672,9 @@ class BernsteinOctree(nn.Module):
         levels = torch.cat([self.leaf_levels[keep_leaf_mask], new_levels.to(device=device, dtype=torch.long)], dim=0)
         coords = torch.cat([self.leaf_coords[keep_leaf_mask], new_coords.to(device=device, dtype=torch.long)], dim=0)
         degrees = torch.cat([self.leaf_degrees[keep_leaf_mask], new_degrees.to(device=device, dtype=torch.long)], dim=0)
+        if new_geometry is None:
+            new_geometry = torch.zeros((new_levels.shape[0], 5), device=device)
+        geometry = torch.cat([self.step_geometry[keep_leaf_mask], new_geometry.to(device=device, dtype=torch.float32)], dim=0)
         counts = torch.prod(degrees + 1, dim=1)
         offsets = torch.cat(
             [torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(counts, dim=0)],
@@ -627,13 +688,15 @@ class BernsteinOctree(nn.Module):
         self.leaf_degrees = degrees.contiguous()
         self.coefficient_offsets = offsets.contiguous()
         self.coefficient_leaf_ids = owners.contiguous()
+        self.step_geometry = geometry.contiguous()
         self._rebuild_packed_topology()
 
     @torch.no_grad()
     def split_leaves_batch(self, leaf_ids) -> int:
-        """Split leaves into 8 children each, function preserving: a constant child copies its parent;
-        trilinear children take the parent's values at their corners (exact subdivision).  Returns the
-        number of split leaves (capped by max_leaf_count)."""
+        """Split leaves into 8 children of the same type, function preserving:
+        constant children copy the parent; trilinear children take the parent's values at their corners;
+        step children keep both values with geometry n' = n, d' = 2d - n . (o - 1/2), w' = 2w (o = child offset).
+        Returns the number of split leaves (capped by max_leaf_count)."""
         device = self.coefficient_logits.device
         ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=device), sorted=True)
         ids = ids[(ids >= 0) & (ids < self.leaf_levels.shape[0])]
@@ -643,40 +706,57 @@ class BernsteinOctree(nn.Module):
             return 0
         if torch.any(self.leaf_levels[ids] + 1 >= len(self.level_shapes)):
             raise ValueError("At least one selected leaf is already at maximum octree depth.")
-        degree = self.leaf_degrees[ids, 0]
-        ids = torch.cat([ids[degree == 0], ids[degree == 1]])  # constant leaves first, then trilinear
-        n0 = int((degree == 0).sum())
+        kind = type_ids(self.leaf_degrees[ids])
+        ids = torch.cat([ids[kind == 0], ids[kind == 1], ids[kind == 2]])  # grouped by type
+        n0, n1 = int((kind == 0).sum()), int((kind == 1).sum())
         physical = self.coefficients().detach()
         child_offsets = _all_coords(2, device=device)
         constant_children = physical[self.coefficient_offsets[ids[:n0]]].repeat_interleave(8)
-        parents = physical[self.coefficient_offsets[ids[n0:], None] + torch.arange(8, device=device)].reshape(-1, 2, 2, 2)
+        parents = physical[self.coefficient_offsets[ids[n0 : n0 + n1], None] + torch.arange(8, device=device)].reshape(-1, 2, 2, 2)
         half = parents.new_tensor([[1.0, 0.0], [0.5, 0.5], [0.0, 1.0]])  # corner values at 0, 1/2, 1 per axis
         lattice = torch.einsum("ai,bj,ck,nijk->nabc", half, half, half, parents)
         trilinear_children = torch.stack(
             [lattice[:, x : x + 2, y : y + 2, z : z + 2] for x, y, z in child_offsets.tolist()], dim=1
         ).reshape(-1)
+        step_ids = ids[n0 + n1 :]
+        step_children = physical[self.coefficient_offsets[step_ids, None] + torch.arange(2, device=device)][:, None, :].expand(-1, 8, -1).reshape(-1)
+        geometry = torch.zeros((ids.numel(), 8, 5), device=device)
+        g = self.step_geometry[step_ids][:, None, :]
+        shift = (g[..., :3] * (child_offsets[None].float() - 0.5)).sum(-1)
+        geometry[n0 + n1 :] = torch.cat([g[..., :3].expand(-1, 8, -1), (2 * g[..., 3] - shift)[..., None], (2 * g[..., 4]).expand(-1, 8)[..., None]], -1)
         self._replace_leaves(
             ids,
             (self.leaf_levels[ids][:, None] + 1).expand(-1, 8).reshape(-1),
             (self.leaf_coords[ids][:, None, :] * 2 + child_offsets[None]).reshape(-1, 3),
             self.leaf_degrees[ids][:, None, :].expand(-1, 8, -1).reshape(-1, 3),
-            torch.cat([constant_children, trilinear_children]),
+            torch.cat([constant_children, trilinear_children, step_children]),
+            geometry.reshape(-1, 5),
         )
         return int(ids.numel())
 
     @torch.no_grad()
-    def to_trilinear(self, leaf_ids) -> None:
-        """Turn constant leaves into trilinear leaves with all 8 corners equal to the constant (same function)."""
-        if self.max_degree < 1:
-            raise ValueError("max_degree 0 allows constant leaves only.")
+    def set_types(self, leaf_ids, types: torch.Tensor, values: torch.Tensor, geometry: torch.Tensor) -> None:
+        """Replace leaves in place (same cell) by leaves of type ``types`` (0 constant, 1 trilinear, 2 step) with
+        the given physical values (concatenated in leaf order) and step geometry (rows used only by step leaves)."""
         device = self.coefficient_logits.device
-        ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=device))
-        ids = ids[self.leaf_degrees[ids, 0] == 0]
+        ids = torch.as_tensor(leaf_ids, dtype=torch.long, device=device)
+        types = torch.as_tensor(types, dtype=torch.long, device=device)
         if ids.numel() == 0:
             return
+        allowed = torch.tensor([name in self.leaf_types for name in TYPE_NAMES], device=device)
+        if not bool(allowed[types].all()):
+            raise ValueError(f"leaf types outside {self.leaf_types}")
+        degrees = torch.tensor([LEAF_TYPES[name] for name in TYPE_NAMES], device=device)[types]
+        self._replace_leaves(ids, self.leaf_levels[ids], self.leaf_coords[ids], degrees, values, geometry)
+
+    @torch.no_grad()
+    def to_trilinear(self, leaf_ids) -> None:
+        """Turn constant leaves into trilinear leaves with all 8 corners equal to the constant (same function)."""
+        device = self.coefficient_logits.device
+        ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=device))
+        ids = ids[type_ids(self.leaf_degrees[ids]) == 0]
         values = self.coefficients().detach()[self.coefficient_offsets[ids]]
-        self._replace_leaves(ids, self.leaf_levels[ids], self.leaf_coords[ids], torch.ones_like(self.leaf_coords[ids]),
-                             values[:, None].expand(-1, 8).reshape(-1))
+        self.set_types(ids, torch.ones_like(ids), values[:, None].expand(-1, 8).reshape(-1), torch.zeros((ids.numel(), 5), device=device))
 
     def stats(self) -> BernsteinStats:
         active_by_level = [
@@ -709,7 +789,8 @@ class BernsteinOctree(nn.Module):
             max_depth=max((level for level, count in enumerate(active_by_level) if count > 0), default=0),
             representation=self.representation,
             coefficient_count=parameter_count,
-            max_degree=self.max_degree,
+            leaf_types=self.leaf_types,
+            leaf_type_counts=tuple(torch.bincount(type_ids(self.leaf_degrees), minlength=3).tolist()),
         )
 
     def prepare_sparse_from_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
@@ -720,6 +801,7 @@ class BernsteinOctree(nn.Module):
             "leaf_degrees",
             "coefficient_offsets",
             "coefficient_leaf_ids",
+            "step_geometry",
         }
         missing = sorted(required.difference(state_dict))
         if missing:

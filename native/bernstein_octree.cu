@@ -165,10 +165,44 @@ __device__ __forceinline__ void gauss_legendre(int order, int index, float* node
     }
 }
 
+// Step leaf (degree triple (1, 0, 0), two values c0, c1): value (1 - H) c0 + H c1 with
+// H = sigmoid((n . (u - 1/2) - d) / w), u = leaf-local coordinates in [0, 1]^3, geometry g = (n, d, w);
+// w = 0 is a hard step.  Along the segment s = n . (u - 1/2) - d is linear in t, so the integral of H
+// is exact: L (softplus(s1 / w) - softplus(s0 / w)) / ((s1 - s0) / w).
+__device__ __forceinline__ bool is_step_leaf(int px, int py, int pz) {
+    return px == 1 && py == 0 && pz == 0;
+}
+
+__device__ __forceinline__ float step_integral(
+    const float* g, int rx, int ry, int rz, int ix, int iy, int iz,
+    float base_x, float base_y, float dir_x, float dir_y, float z, float t0, float t1) {
+    const float uz = (z + 1.0f) * 0.5f * static_cast<float>(rz) - static_cast<float>(iz) - 0.5f;
+    const float ux0 = (base_x + dir_x * t0 + 1.0f) * 0.5f * static_cast<float>(rx) - static_cast<float>(ix) - 0.5f;
+    const float uy0 = (base_y + dir_y * t0 + 1.0f) * 0.5f * static_cast<float>(ry) - static_cast<float>(iy) - 0.5f;
+    const float ux1 = (base_x + dir_x * t1 + 1.0f) * 0.5f * static_cast<float>(rx) - static_cast<float>(ix) - 0.5f;
+    const float uy1 = (base_y + dir_y * t1 + 1.0f) * 0.5f * static_cast<float>(ry) - static_cast<float>(iy) - 0.5f;
+    const float s0 = g[0] * ux0 + g[1] * uy0 + g[2] * uz - g[3];
+    const float s1 = g[0] * ux1 + g[1] * uy1 + g[2] * uz - g[3];
+    const float length = t1 - t0;
+    const float w = g[4];
+    if (w <= 0.0f) {
+        if (s0 > 0.0f && s1 > 0.0f) return length;
+        if (s0 <= 0.0f && s1 <= 0.0f) return 0.0f;
+        return length * fmaxf(s0, s1) / fabsf(s1 - s0);
+    }
+    const float a0 = s0 / w;
+    const float a1 = s1 / w;
+    if (fabsf(a1 - a0) < 1.0e-3f) {
+        return length * sigmoid_stable(0.5f * (a0 + a1));
+    }
+    return length * (softplus_stable(a1) - softplus_stable(a0)) / (a1 - a0);
+}
+
 __device__ __forceinline__ float segment_integral(
     const float* coefficient_logits,
     const int64_t* leaf_degrees,
     const int64_t* coefficient_offsets,
+    const float* step_geometry,
     int64_t leaf,
     int rx,
     int ry,
@@ -189,6 +223,11 @@ __device__ __forceinline__ float segment_integral(
     const int pz = static_cast<int>(leaf_degrees[leaf * 3 + 2]);
     const int quadrature_order = (px + py + pz + 2) / 2;
     const int64_t coefficient_start = coefficient_offsets[leaf];
+    if (is_step_leaf(px, py, pz)) {
+        const float I = step_integral(step_geometry + leaf * 5, rx, ry, rz, ix, iy, iz, base_x, base_y, dir_x, dir_y, z, t0, t1);
+        return softplus_stable(coefficient_logits[coefficient_start] + attenuation_shift) * (t1 - t0 - I)
+            + softplus_stable(coefficient_logits[coefficient_start + 1] + attenuation_shift) * I;
+    }
     const float half = 0.5f * (t1 - t0);
     const float centre = 0.5f * (t1 + t0);
     float result = 0.0f;
@@ -225,6 +264,7 @@ __device__ __forceinline__ void segment_backward(
     const float* coefficient_logits,
     const int64_t* leaf_degrees,
     const int64_t* coefficient_offsets,
+    const float* step_geometry,
     float* grad_coefficient_logits,
     float grad_output,
     int64_t leaf,
@@ -247,6 +287,23 @@ __device__ __forceinline__ void segment_backward(
     const int pz = static_cast<int>(leaf_degrees[leaf * 3 + 2]);
     const int quadrature_order = (px + py + pz + 2) / 2;
     const int64_t coefficient_start = coefficient_offsets[leaf];
+    // Neighbouring rays of a warp usually cross the same leaf: sum their contributions in the
+    // warp and let one thread do the global atomic add (atomic throughput is the bottleneck).
+    const cg::coalesced_group peers = cg::labeled_partition(cg::coalesced_threads(), static_cast<unsigned int>(leaf));
+    if (is_step_leaf(px, py, pz)) {
+        const float I = step_integral(step_geometry + leaf * 5, rx, ry, rz, ix, iy, iz, base_x, base_y, dir_x, dir_y, z, t0, t1);
+        const float weights[2] = {t1 - t0 - I, I};
+        for (int k = 0; k < 2; ++k) {
+            float value = grad_output * weights[k] * sigmoid_stable(coefficient_logits[coefficient_start + k] + attenuation_shift);
+            if (peers.size() > 1) {
+                value = cg::reduce(peers, value, cg::plus<float>());
+            }
+            if (peers.thread_rank() == 0) {
+                atomicAdd(&grad_coefficient_logits[coefficient_start + k], value);
+            }
+        }
+        return;
+    }
     const float half = 0.5f * (t1 - t0);
     const float centre = 0.5f * (t1 + t0);
     // Basis values at each quadrature node, evaluated once per segment (weight folded into bx).
@@ -264,9 +321,6 @@ __device__ __forceinline__ void segment_backward(
         bx[quadrature_id][0] *= weight;
         bx[quadrature_id][1] *= weight;
     }
-    // Neighbouring rays of a warp usually cross the same leaf: sum their contributions in the
-    // warp and let one thread do the global atomic add (atomic throughput is the bottleneck).
-    const cg::coalesced_group peers = cg::labeled_partition(cg::coalesced_threads(), static_cast<unsigned int>(leaf));
     int local_id = 0;
     for (int i = 0; i <= px; ++i) {
         for (int j = 0; j <= py; ++j) {
@@ -292,6 +346,7 @@ __device__ __forceinline__ float traverse_bernstein_octree(
     const float* coefficient_logits,
     const int64_t* leaf_degrees,
     const int64_t* coefficient_offsets,
+    const float* step_geometry,
     const int32_t* node_child_base,
     const int32_t* node_leaf_id,
     float* grad_coefficient_logits,
@@ -398,6 +453,7 @@ __device__ __forceinline__ float traverse_bernstein_octree(
                 coefficient_logits,
                 leaf_degrees,
                 coefficient_offsets,
+                step_geometry,
                 grad_coefficient_logits,
                 grad_output,
                 leaf,
@@ -420,6 +476,7 @@ __device__ __forceinline__ float traverse_bernstein_octree(
                 coefficient_logits,
                 leaf_degrees,
                 coefficient_offsets,
+                step_geometry,
                 leaf,
                 rx,
                 ry,
@@ -450,6 +507,7 @@ __global__ void bernstein_forward_kernel(
     const float* coefficient_logits,
     const int64_t* leaf_degrees,
     const int64_t* coefficient_offsets,
+    const float* step_geometry,
     const int32_t* node_child_base,
     const int32_t* node_leaf_id,
     const float* angles,
@@ -473,6 +531,7 @@ __global__ void bernstein_forward_kernel(
         coefficient_logits,
         leaf_degrees,
         coefficient_offsets,
+        step_geometry,
         node_child_base,
         node_leaf_id,
         nullptr,
@@ -496,6 +555,7 @@ __global__ void bernstein_backward_kernel(
     const float* coefficient_logits,
     const int64_t* leaf_degrees,
     const int64_t* coefficient_offsets,
+    const float* step_geometry,
     const int32_t* node_child_base,
     const int32_t* node_leaf_id,
     const float* angles,
@@ -520,6 +580,7 @@ __global__ void bernstein_backward_kernel(
         coefficient_logits,
         leaf_degrees,
         coefficient_offsets,
+        step_geometry,
         node_child_base,
         node_leaf_id,
         grad_coefficient_logits,
@@ -543,6 +604,7 @@ __global__ void bernstein_segments_kernel(
     const float* coefficient_logits,
     const int64_t* leaf_degrees,
     const int64_t* coefficient_offsets,
+    const float* step_geometry,
     const int32_t* node_child_base,
     const int32_t* node_leaf_id,
     const float* angles,
@@ -567,6 +629,7 @@ __global__ void bernstein_segments_kernel(
         coefficient_logits,
         leaf_degrees,
         coefficient_offsets,
+        step_geometry,
         node_child_base,
         node_leaf_id,
         nullptr,
@@ -590,6 +653,7 @@ void validate_inputs(
     const at::Tensor& coefficient_logits,
     const at::Tensor& leaf_degrees,
     const at::Tensor& coefficient_offsets,
+    const at::Tensor& step_geometry,
     const at::Tensor& node_child_base,
     const at::Tensor& node_leaf_id,
     const at::Tensor& angles,
@@ -608,6 +672,9 @@ void validate_inputs(
     TORCH_CHECK(leaf_degrees.dim() == 2 && leaf_degrees.size(1) == 3, "leaf_degrees must have shape (N, 3).");
     TORCH_CHECK(coefficient_offsets.dim() == 1 && coefficient_offsets.size(0) == leaf_degrees.size(0) + 1,
         "coefficient_offsets must have shape (N + 1,).");
+    check_cuda_float(step_geometry, "step_geometry");
+    TORCH_CHECK(step_geometry.dim() == 2 && step_geometry.size(0) == leaf_degrees.size(0) && step_geometry.size(1) == 5,
+        "step_geometry must have shape (N, 5).");
     TORCH_CHECK(angles.dim() == 1 && rows.dim() == 1 && cols.dim() == 1, "ray inputs must be vectors.");
     TORCH_CHECK(angles.size(0) == rows.size(0) && angles.size(0) == cols.size(0), "ray vectors must have equal length.");
     TORCH_CHECK(node_child_base.dim() == 1 && node_leaf_id.dim() == 1,
@@ -634,6 +701,7 @@ at::Tensor bernstein_octree_integrate_forward_cuda(
     at::Tensor coefficient_logits,
     at::Tensor leaf_degrees,
     at::Tensor coefficient_offsets,
+    at::Tensor step_geometry,
     at::Tensor node_child_base,
     at::Tensor node_leaf_id,
     at::Tensor angles,
@@ -646,7 +714,7 @@ at::Tensor bernstein_octree_integrate_forward_cuda(
     int64_t root_y,
     int64_t root_z,
     double attenuation_shift) {
-    validate_inputs(coefficient_logits, leaf_degrees, coefficient_offsets, node_child_base, node_leaf_id, angles, rows, cols, num_levels);
+    validate_inputs(coefficient_logits, leaf_degrees, coefficient_offsets, step_geometry, node_child_base, node_leaf_id, angles, rows, cols, num_levels);
     c10::cuda::CUDAGuard guard(coefficient_logits.device());
     auto output = at::empty({angles.size(0)}, coefficient_logits.options());
     const int num_rays = static_cast<int>(angles.size(0));
@@ -658,6 +726,7 @@ at::Tensor bernstein_octree_integrate_forward_cuda(
         coefficient_logits.contiguous().data_ptr<float>(),
         leaf_degrees.contiguous().data_ptr<int64_t>(),
         coefficient_offsets.contiguous().data_ptr<int64_t>(),
+        step_geometry.contiguous().data_ptr<float>(),
         node_child_base.contiguous().data_ptr<int32_t>(),
         node_leaf_id.contiguous().data_ptr<int32_t>(),
         angles.contiguous().data_ptr<float>(),
@@ -682,6 +751,7 @@ at::Tensor bernstein_octree_integrate_backward_cuda(
     at::Tensor coefficient_logits,
     at::Tensor leaf_degrees,
     at::Tensor coefficient_offsets,
+    at::Tensor step_geometry,
     at::Tensor node_child_base,
     at::Tensor node_leaf_id,
     at::Tensor angles,
@@ -695,7 +765,7 @@ at::Tensor bernstein_octree_integrate_backward_cuda(
     int64_t root_y,
     int64_t root_z,
     double attenuation_shift) {
-    validate_inputs(coefficient_logits, leaf_degrees, coefficient_offsets, node_child_base, node_leaf_id, angles, rows, cols, num_levels);
+    validate_inputs(coefficient_logits, leaf_degrees, coefficient_offsets, step_geometry, node_child_base, node_leaf_id, angles, rows, cols, num_levels);
     check_cuda_float(grad_output, "grad_output");
     TORCH_CHECK(grad_output.dim() == 1 && grad_output.size(0) == angles.size(0), "grad_output must match rays.");
     c10::cuda::CUDAGuard guard(coefficient_logits.device());
@@ -709,6 +779,7 @@ at::Tensor bernstein_octree_integrate_backward_cuda(
         coefficient_logits.contiguous().data_ptr<float>(),
         leaf_degrees.contiguous().data_ptr<int64_t>(),
         coefficient_offsets.contiguous().data_ptr<int64_t>(),
+        step_geometry.contiguous().data_ptr<float>(),
         node_child_base.contiguous().data_ptr<int32_t>(),
         node_leaf_id.contiguous().data_ptr<int32_t>(),
         angles.contiguous().data_ptr<float>(),
@@ -734,6 +805,7 @@ std::vector<at::Tensor> bernstein_octree_segments_forward_cuda(
     at::Tensor coefficient_logits,
     at::Tensor leaf_degrees,
     at::Tensor coefficient_offsets,
+    at::Tensor step_geometry,
     at::Tensor node_child_base,
     at::Tensor node_leaf_id,
     at::Tensor angles,
@@ -746,7 +818,7 @@ std::vector<at::Tensor> bernstein_octree_segments_forward_cuda(
     int64_t root_y,
     int64_t root_z,
     double attenuation_shift) {
-    validate_inputs(coefficient_logits, leaf_degrees, coefficient_offsets, node_child_base, node_leaf_id, angles, rows, cols, num_levels);
+    validate_inputs(coefficient_logits, leaf_degrees, coefficient_offsets, step_geometry, node_child_base, node_leaf_id, angles, rows, cols, num_levels);
     c10::cuda::CUDAGuard guard(coefficient_logits.device());
     const int num_rays = static_cast<int>(angles.size(0));
     const int max_segments = max_segments_for_resolutions(root_x, root_y, num_levels);
@@ -759,6 +831,7 @@ std::vector<at::Tensor> bernstein_octree_segments_forward_cuda(
         coefficient_logits.contiguous().data_ptr<float>(),
         leaf_degrees.contiguous().data_ptr<int64_t>(),
         coefficient_offsets.contiguous().data_ptr<int64_t>(),
+        step_geometry.contiguous().data_ptr<float>(),
         node_child_base.contiguous().data_ptr<int32_t>(),
         node_leaf_id.contiguous().data_ptr<int32_t>(),
         angles.contiguous().data_ptr<float>(),

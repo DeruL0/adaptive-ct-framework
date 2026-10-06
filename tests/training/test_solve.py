@@ -10,7 +10,7 @@ from adaptive_ct.training.solve import solve
 
 
 def _tree():
-    m = BernsteinOctree(levels=[2, 4], max_degree=1, attenuation_shift=0.0, cuda_integrator=False)
+    m = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0, cuda_integrator=False)
     m.to_trilinear(torch.arange(m.leaf_levels.shape[0]))
     m.split_leaves_batch(torch.tensor([0, 5]))
     return m

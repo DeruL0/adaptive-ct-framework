@@ -1,9 +1,10 @@
 # Adaptive Projection-Domain CT Reconstruction
 
-CUDA-first research code for parallel-beam CT. A packed adaptive octree of
-trilinear or constant leaves is fitted directly to the projections with an exact
-CUDA ray integrator; the tree grows under a byte budget, and the solved physical
-coefficients are stored in fp16 (what is stored is what is counted).
+CUDA-first research code for parallel-beam CT. A packed adaptive octree whose
+leaves are constant, trilinear or adjustable-width step functions is fitted
+directly to the projections with an exact CUDA ray integrator; tree and leaf
+types are chosen under a byte budget, and everything is stored in fp16 (what is
+stored is what is counted).
 
 No FDK, reference volume, or ground-truth volume is used for initialization,
 topology, or scoring. The ground-truth volume is loaded only after training for
@@ -22,13 +23,14 @@ diagram, module responsibilities, and the training protocol.
    coefficients: residual `r = A c - y`, gradient `g = A^T r`, per-coefficient step `1/d` with
    `d = A^T A 1`, update `c <- max(0, c - g/d)`; angle-interleaved grouped updates first, then
    full-data updates with extrapolation. The optimality residual is reported per round.
-3. On the solved model, score leaves by residual energy shared along each ray in proportion to
-   chord length, split the best-scored batch carrying half the total score within the byte
-   budget; splits reproduce the parent function exactly, so the next solve continues from it.
+3. On the solved model, refit every leaf's options (keep / constant / trilinear / step / split)
+   with all other leaves fixed, on half of a random ray sample, and score them on the other
+   half; each leaf takes the option with the largest held-out gain minus a byte price that keeps
+   the model within budget, and the best half of these actions (by net benefit) is executed.
    Each solve stops at an optimality-residual tolerance (1e-3 per round); while leaves are still
    coarse it uses 2x2 / 4x4 averaged detector pixels.
-4. When the budget is spent, solve strictly (tolerance 1e-4, full resolution), round the
-   coefficients to fp16, evaluate, and write the compact file.
+4. When no action has a positive net benefit, solve strictly (tolerance 1e-4, full resolution), round the
+   values and step geometry to fp16, evaluate, and write the compact file.
 
 ## Layout
 
@@ -36,9 +38,9 @@ diagram, module responsibilities, and the training protocol.
 adaptive_ct/
   core/            config, ray geometry, native CUDA backend (projector)
   data/            dataset, train/dev view split, fixed ray sets
-  representation/  Bernstein octree (constant / trilinear leaves), model factory
+  representation/  octree with constant / trilinear / step leaves, model factory
   codec/           byte model, fp16 rounding, compact file
-  refinement/      residual estimator, batch marking, refinement controller
+  refinement/      held-out refit decision (keep / change type / split) and its controller
   evaluation/      metrics, rendering, ground-truth volume evaluation
   training/        fixed-tree solver, rounds of solve + structure update, export, checks
   viewer/          Python server and Three.js frontend

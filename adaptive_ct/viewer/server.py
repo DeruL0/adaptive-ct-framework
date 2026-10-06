@@ -169,7 +169,6 @@ def _synthesize_model_config(model_path: Path) -> dict[str, Any] | None:
         try:
             with np.load(model_path, allow_pickle=False) as payload:
                 levels = [int(shape[0]) for shape in payload["level_shapes"].tolist()]
-                max_degree = int(payload["max_degree"][0])
                 attenuation_shift = float(payload["attenuation_shift"][0])
         except Exception:
             return None
@@ -177,7 +176,7 @@ def _synthesize_model_config(model_path: Path) -> dict[str, Any] | None:
             "device": "cpu",
             "model": {
                 "levels": levels,
-                "max_degree": max_degree,
+                "leaf_types": ["constant", "trilinear", "step"],
                 "attenuation_shift": attenuation_shift,
                 "cuda_integrator": False,
             },
