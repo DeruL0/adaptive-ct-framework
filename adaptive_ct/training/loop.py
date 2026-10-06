@@ -74,6 +74,7 @@ def run_training(config_path: str | Path) -> dict:
     eval_chunk = int(train_cfg.get("eval_ray_chunk", 1 << 20))
     controller = RefinementController(
         spec=ref_cfg,
+        edge_penalty=solver_cfg["edge_penalty"],
         estimator_split=dataset.train,
         detector_h=detector_h,
         detector_w=detector_w,
@@ -90,23 +91,23 @@ def run_training(config_path: str | Path) -> dict:
         return projection_metrics(rendered, split.projections)
 
     rounds, history, growth_events = [], [], []
-    max_rounds = int(ref_cfg.get("max_rounds", 32))
+    max_rounds = int(ref_cfg["max_rounds"])
     start_time = time.perf_counter()
     for r in range(max_rounds + 1):
         final = controller.stopped or r == max_rounds
         passes = int(solver_cfg["final_passes"] if final else solver_cfg["round_passes"])
         tol = float(solver_cfg["final_tol"] if final else solver_cfg["round_tol"])
-        group_passes = int(solver_cfg.get("first_group_passes", 4) if r == 0 else solver_cfg.get("group_passes", 2))
+        group_passes = int(solver_cfg["first_group_passes"] if r == 0 else solver_cfg["group_passes"])
         # Detector binning while the finest leaf still spans >= min_leaf_px binned pixels; the final solve is unbinned.
         finest = model.level_shapes[int(model.leaf_levels.max())]
         leaf_px = min(detector_h / finest[2], detector_w / finest[0])
-        detector_bin = 1 if final else max([1] + [b for b in (2, 4) if leaf_px / b >= float(solver_cfg.get("min_leaf_px", 2.5))])
+        detector_bin = 1 if final else max([1] + [b for b in (2, 4) if leaf_px / b >= float(solver_cfg["min_leaf_px"])])
         t0 = time.perf_counter()
-        edge = solver_cfg.get("edge_penalty") or {}
-        weight = float(edge.get("weight", 0.0))
+        edge = solver_cfg["edge_penalty"]
+        weight = float(edge["weight"])
         penalty = EdgePenalty(model, float(edge["delta"])) if weight > 0 else None
-        _, hist, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg.get("groups", 24)),
-                                   group_passes=group_passes, extrapolate=bool(solver_cfg.get("extrapolate", True)),
+        _, hist, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg["groups"]),
+                                   group_passes=group_passes, extrapolate=bool(solver_cfg["extrapolate"]),
                                    detector_bin=detector_bin, penalty=penalty, penalty_weight=weight)
         del penalty
         last = hist[-1] if hist else {}
@@ -202,7 +203,7 @@ def run_training(config_path: str | Path) -> dict:
         "boundary_sharpness": boundary_sharpness,
         "model": stats.__dict__,
         "training_objective": {
-            "form": "min_{c>=0} 1/2 ||A c - y||^2 per fixed tree; tree and leaf types chosen by held-out refits under the byte budget",
+            "form": "min_{c>=0} 1/2 ||A c - y||^2 + beta R(c) per fixed tree; tree and leaf types chosen by held-out refits of the same objective under the byte budget",
             "byte_budget": int(ref_cfg["byte_budget"]),
             "quantization": controller.quantization,
             "solver": solver_cfg,
@@ -211,7 +212,7 @@ def run_training(config_path: str | Path) -> dict:
         "refinement": {
             "rounds": controller.round_index,
             "stop_reasons": list(controller.stop_reasons),
-            "action_share": float(ref_cfg.get("action_share", 0.5)),
+            "action_share": float(ref_cfg["action_share"]),
         },
         "rounds": rounds,
         "codec": codec_summary,

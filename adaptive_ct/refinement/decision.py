@@ -5,6 +5,10 @@ For every leaf the options are refitted in the same background (all other leaves
 Rays: every pixel of a set of evenly spaced training views; alternate views form two halves.  Each option's
 values are fitted on one half and its objective  sum (prediction - data)^2  is measured on the other half
 (and the other way round), so extra parameters only win when they predict unseen view directions better.
+With the solve's edge-preserving penalty (weight beta) each half's objective is  sum (prediction - data)^2 +
+beta * R  (the whole objective  1/2 ||Ac - y||^2 + beta R  doubled and shared between the halves); R near the
+leaf is replaced by the quadratic that touches it at the current values and lies above it (penalty_statistics),
+so the penalty part of a gain never exceeds the true one.
 Gain = objective(keep) - objective(option); every refit respects the constraint of the solve (attenuation >= 0),
 so gains that would need negative values are not counted.  A leaf whose type changed in the previous round may only be
 kept or split (no immediate change back).  Trilinear and step leaves are never downgraded to constant: the
@@ -28,6 +32,7 @@ from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
 from adaptive_ct.core.projector import bernstein_octree_decision_accumulate
 from adaptive_ct.representation.octree import TYPE_NAMES, step_integral, type_ids
+from adaptive_ct.training.regularizer import basis_rows, face_samples
 
 OPTIONS = ("constant", "trilinear", "step", "split")  # column order of gains / extra bytes
 _DIMS = {"constant": 1, "trilinear": 8, "step": 2, "split": 8}
@@ -143,12 +148,56 @@ def step_side_fraction(geometry: torch.Tensor, samples: int = 4) -> torch.Tensor
 
 
 @torch.no_grad()
-def local_statistics(model, split, views: list[int], candidate: torch.Tensor) -> dict:
-    """Per leaf and ray half f (alternate views): normal equations G[f] (N, m, m), h[f] (N, m) of every option,
-    b2[f] = sum b^2 with b = data minus the other leaves (target of a type refit), r2[f] = sum residual^2."""
+def penalty_statistics(model, delta: float, candidate: torch.Tensor) -> torch.Tensor:
+    """(N, STRIDE) edge-penalty terms of every option, in the layout of the ray statistics.
+    Each shared-face sample p of leaf L (other side g = neighbour value, fixed) enters with weight
+    alpha = area * min(1, delta / |t0|), t0 = f_L(p) - g: the quadratic that touches the penalty's
+    phi(t) at the current t0 and lies above it everywhere (phi <= alpha t^2 / 2 + const).  Summed:
+      option values c (basis a at p):  sum alpha (a.c - g)^2   -> G, h, b2 slots (target b = g)
+      split corrections e (child of p): sum alpha (e - (g - f_L))^2  -> split G, h, r2 slots (residual = t0)
+    plus the faces between the 8 children (current jump 0, alpha = area)."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
-    acc = torch.zeros((2, N, STRIDE), device=device)
+    coeff = model.coefficients().detach()
+    acc = torch.zeros((N, STRIDE), device=device)
+
+    def value(ids, u):
+        w, idx = basis_rows(model, ids, u)
+        return (w * coeff[idx]).sum(1)
+
+    for i_ids, j_ids, ui, uj, area in face_samples(model):
+        fi, fj = value(i_ids, ui), value(j_ids, uj)
+        s = (area * (float(delta) / (fi - fj).abs().clamp_min(1e-30)).clamp(max=1.0)).sqrt()
+        for ids, u, f, g in ((i_ids, ui, fi, fj), (j_ids, uj, fj, fi)):
+            p = torch.stack([1 - u, u], -1)
+            tri = (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(-1, 8)
+            cg = candidate[ids]
+            H = torch.sigmoid((((u - 0.5) * cg[:, :3]).sum(1) - cg[:, 3]) / cg[:, 4].clamp_min(1e-30))
+            child = torch.nn.functional.one_hot((u[:, 0] > 0.5).long() * 4 + (u[:, 1] > 0.5).long() * 2 + (u[:, 2] > 0.5).long(), 8).float()
+            acc.index_add_(0, ids, _pack(s, s[:, None] * tri, s[:, None] * torch.stack([1 - H, H], 1), s[:, None] * child, s * f, s * (f - g)))
+    iu, ju = torch.triu_indices(8, 8, device=device)
+    size = 2.0 / torch.tensor(model.level_shapes, dtype=torch.float32, device=device)[model.leaf_levels]
+    for axis in range(3):
+        bit = 4 >> axis  # child index = 4 x + 2 y + z
+        M = torch.zeros((8, 8), device=device)
+        for a in range(8):
+            if not a & bit:
+                e = torch.zeros(8, device=device)
+                e[a], e[a | bit] = 1.0, -1.0
+                M += torch.outer(e, e)
+        t1, t2 = [b for b in range(3) if b != axis]
+        acc[:, 51:87] += (size[:, t1] * size[:, t2] / 4.0)[:, None] * M[iu, ju][None]
+    return acc
+
+
+@torch.no_grad()
+def local_statistics(model, split, views: list[int], candidate: torch.Tensor, prior: torch.Tensor | None = None) -> dict:
+    """Per leaf and ray half f (alternate views): normal equations G[f] (N, m, m), h[f] (N, m) of every option,
+    b2[f] = sum b^2 with b = data minus the other leaves (target of a type refit), r2[f] = sum residual^2.
+    `prior` (N, STRIDE), e.g. the weighted penalty_statistics, is added to both halves."""
+    device = model.leaf_levels.device
+    N = int(model.leaf_levels.shape[0])
+    acc = torch.zeros((2, N, STRIDE), device=device) if prior is None else prior[None].repeat(2, 1, 1)
     h, w = split.projections.shape[1:]
     rows, cols = detector_grid(h, w, device)
     for position, v in enumerate(views):
@@ -294,15 +343,17 @@ def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: 
 
 
 @torch.no_grad()
-def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, quantization="float16",
-                     action_share=0.5, min_footprint_px=1.0, frozen=None) -> tuple[dict, torch.Tensor]:
+def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, quantization, action_share, min_footprint_px,
+                     penalty_weight, penalty_delta, frozen=None) -> tuple[dict, torch.Tensor]:
     """One structure / type decision on a solved model; applies the chosen batch.  `frozen` (N,) marks leaves
     that may not change type.  Returns a report and the cells (level, x, y, z) whose type changed."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     kind = type_ids(model.leaf_degrees)
     candidate = candidate_step_geometry(model, detector_w=detector_w)
-    acc = local_statistics(model, split, views, candidate)
+    prior = 0.5 * float(penalty_weight) * penalty_statistics(model, penalty_delta, candidate) if penalty_weight > 0 else None
+    acc = local_statistics(model, split, views, candidate, prior)
+    del prior
     gains = evaluate_options(acc, -child_minimum(model))
     per_leaf = leaf_bytes(quantization).to(device)
     extra = torch.stack([per_leaf[0] - per_leaf[kind], per_leaf[1] - per_leaf[kind], per_leaf[2] - per_leaf[kind],

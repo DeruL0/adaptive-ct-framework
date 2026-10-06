@@ -37,40 +37,45 @@ def basis_rows(model, leaf_ids: torch.Tensor, u: torch.Tensor) -> tuple[torch.Te
     return w, idx
 
 
+def face_samples(model):
+    """Shared-face sample points, in 24 chunks: (finer leaf i, other leaf j, u_i, u_j leaf-local, area)."""
+    device = model.leaf_levels.device
+    N = int(model.leaf_levels.numel())
+    shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=device)
+    size = 2.0 / shapes[model.leaf_levels]  # (N, 3) box units
+    origin = -1.0 + model.leaf_coords.float() * size
+    eps = 1e-4 * float((2.0 / shapes[-1]).min())
+    q = torch.tensor([0.25, 0.75], device=device)
+    for axis in range(3):
+        t1, t2 = [a for a in range(3) if a != axis]
+        for side in (0.0, 1.0):
+            for a in q:
+                for b in q:
+                    u = torch.zeros((N, 3), device=device)
+                    u[:, axis], u[:, t1], u[:, t2] = side, a, b
+                    p = origin + u * size
+                    outside = p.clone()
+                    outside[:, axis] += eps if side == 1.0 else -eps
+                    j = model.resolve_leaf_ids(outside)
+                    keep = j >= 0
+                    lj = torch.where(keep, model.leaf_levels[j.clamp_min(0)], 0)
+                    keep &= (lj < model.leaf_levels) | ((lj == model.leaf_levels) & (side == 1.0))
+                    i_ids, j_ids = torch.nonzero(keep).flatten(), j[keep]
+                    yield i_ids, j_ids, u[keep], (p[keep] - origin[j_ids]) / size[j_ids], size[i_ids, t1] * size[i_ids, t2] / 4.0
+
+
 class EdgePenalty:
     def __init__(self, model, delta: float):
         self.delta = float(delta)
-        device = model.leaf_levels.device
-        N = int(model.leaf_levels.numel())
-        shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=device)
-        size = 2.0 / shapes[model.leaf_levels]  # (N, 3) box units
-        origin = -1.0 + model.leaf_coords.float() * size
-        eps = 1e-4 * float((2.0 / shapes[-1]).min())
-        q = torch.tensor([0.25, 0.75], device=device)
         rows_i, rows_j, w_i, w_j, area = [], [], [], [], []
-        for axis in range(3):
-            t1, t2 = [a for a in range(3) if a != axis]
-            for side in (0.0, 1.0):
-                for a in q:
-                    for b in q:
-                        u = torch.zeros((N, 3), device=device)
-                        u[:, axis], u[:, t1], u[:, t2] = side, a, b
-                        p = origin + u * size
-                        outside = p.clone()
-                        outside[:, axis] += eps if side == 1.0 else -eps
-                        j = model.resolve_leaf_ids(outside)
-                        keep = j >= 0
-                        lj = torch.where(keep, model.leaf_levels[j.clamp_min(0)], 0)
-                        keep &= (lj < model.leaf_levels) | ((lj == model.leaf_levels) & (side == 1.0))
-                        i_ids, j_ids = torch.nonzero(keep).flatten(), j[keep]
-                        uj = (p[keep] - origin[j_ids]) / size[j_ids]
-                        wi, ii = basis_rows(model, i_ids, u[keep])
-                        wj, jj = basis_rows(model, j_ids, uj)
-                        rows_i.append(ii)
-                        rows_j.append(jj)
-                        w_i.append(wi)
-                        w_j.append(wj)
-                        area.append(size[i_ids, t1] * size[i_ids, t2] / 4.0)
+        for i_ids, j_ids, ui, uj, a in face_samples(model):
+            wi, ii = basis_rows(model, i_ids, ui)
+            wj, jj = basis_rows(model, j_ids, uj)
+            rows_i.append(ii)
+            rows_j.append(jj)
+            w_i.append(wi)
+            w_j.append(wj)
+            area.append(a)
         self.idx_i, self.idx_j = torch.cat(rows_i), torch.cat(rows_j)
         self.w_i, self.w_j = torch.cat(w_i), torch.cat(w_j)
         self.area = torch.cat(area)

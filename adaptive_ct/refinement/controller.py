@@ -15,9 +15,10 @@ def _cell_keys(levels: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
 
 
 class RefinementController:
-    def __init__(self, *, spec, estimator_split, detector_h, detector_w, seed, byte_budget):
+    def __init__(self, *, spec, edge_penalty, estimator_split, detector_h, detector_w, seed, byte_budget):
         self.spec = dict(spec)
-        self.quantization = str(spec.get("quantization", "float16"))
+        self.edge_penalty = dict(edge_penalty)
+        self.quantization = str(spec["quantization"])
         self.estimator_split = estimator_split
         self.detector_h, self.detector_w = int(detector_h), int(detector_w)
         self.seed = int(seed)
@@ -37,18 +38,19 @@ class RefinementController:
         self.round_index += 1
         event = {"round": self.round_index}
         remaining = (self.byte_budget - model_bytes(model, self.quantization)) / self.byte_budget
-        if remaining < float(self.spec.get("stop_below_remaining", 0.01)):
+        if remaining < float(self.spec["stop_below_remaining"]):
             return self._stop(event, "byte_budget_nearly_spent")
         frozen = None
         if self.changed_cells is not None and self.changed_cells.numel():
             frozen = torch.isin(_cell_keys(model.leaf_levels, model.leaf_coords),
                                 _cell_keys(self.changed_cells[:, 0], self.changed_cells[:, 1:]))
-        views = decision_views(self.estimator_split, int(self.spec.get("decision_views", 16)), self.round_index)
+        views = decision_views(self.estimator_split, int(self.spec["decision_views"]), self.round_index)
         t0 = time.perf_counter()
         report, self.changed_cells = decide_and_apply(
             model, self.estimator_split, views, detector_h=self.detector_h, detector_w=self.detector_w,
             byte_budget=self.byte_budget, quantization=self.quantization, frozen=frozen,
-            action_share=float(self.spec.get("action_share", 0.5)), min_footprint_px=float(self.spec.get("min_footprint_px", 1.0)))
+            action_share=float(self.spec["action_share"]), min_footprint_px=float(self.spec["min_footprint_px"]),
+            penalty_weight=float(self.edge_penalty["weight"]), penalty_delta=float(self.edge_penalty["delta"]))
         event.update(report)
         event["decision_seconds"] = time.perf_counter() - t0
         if torch.cuda.is_available():

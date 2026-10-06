@@ -35,6 +35,7 @@ def _split_from(truth, views=16):
 
 
 def _decide(model, split, **kw):
+    kw = {"quantization": "float16", "action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, **kw}
     report, _ = decide_and_apply(model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, **kw)
     return report
 
