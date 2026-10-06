@@ -1,12 +1,13 @@
-"""Error-chain diagnostic: where does the GT -> deployed gap come from?  (offline, uses GT; not part of training)
+"""Offline diagnostics of the main pipeline (use the GT volume; never part of training).
 
-  s0      operator check: same function, exact integrator vs the dense projector that generated the data
-  ls_eval our tree + GT least-squares coefficients                        (2: selection, no inversion loss)
-  oracle  best tree under the same byte budget (Lagrangian DP, L0..L2) + GT LS coefficients   (1: capacity)
-  train   fixed trees trained from projections only: oracle tree (3a), our tree (3b)          (3: inversion)
-  views   oracle tree trained on 3x more views                                               (5: data)
+  ls_eval     the tree of output/<run> + per-leaf GT least-squares values        (how good is the chosen tree)
+  oracle      best tree under the byte budget (Lagrangian DP, L0..L2) + GT LS values (capacity of the representation)
+  speed       solver from a cold start on the oracle tree, to the stopping tolerance
+  profile     capacity of the adjustable-width step leaf vs constant / trilinear leaves (GT fits)
+  main_eval   volume metrics and median slice of output/<run>
 
 usage: python gate_chain.py <run> <stage> [<stage> ...]     results -> output/_chain/results.json
+Every model-producing stage saves its checkpoint and a median slice figure (GT | model | reference | error).
 """
 
 import json
@@ -21,11 +22,8 @@ import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from adaptive_ct.codec.budget import codec_bytes
-from adaptive_ct.core.geometry import random_training_rays
-from adaptive_ct.core.loss import projection_weight_kwargs, weighted_projection_loss
-from adaptive_ct.core.projector import project_dense_parallel
-from adaptive_ct.data.dataset import ProjectionSplit, load_r2_dataset
+from adaptive_ct.codec.budget import codec_bytes, split_delta_bytes
+from adaptive_ct.data.dataset import load_r2_dataset
 from adaptive_ct.evaluation.metrics import projection_metrics
 from adaptive_ct.evaluation.render import render_split
 from adaptive_ct.representation.factory import build_model
@@ -42,9 +40,9 @@ GT = np.load(ROOT / "output/figure473_dicom_orig_r2_convergence/vol_gt.npy", mma
 D, H, W = GT.shape
 CK = torch.load(ROOT / "output" / RUN / "checkpoint.pt", map_location="cpu")
 CFG = CK["config"]
-CODEC = {"type": "latent_p1", "latent_dim": 4, "quantization": "float16"}
+CODEC = {"type": "p1", "quantization": "float16"}  # what the main pipeline stores
 BUDGET = 8_388_608
-SPLIT_BYTES = 8 * 8 + 7 * 11  # codec.budget.split_delta_bytes for latent d=4
+SPLIT_BYTES = split_delta_bytes(CODEC)
 TAU, BAND_R = 0.1, 3
 
 
@@ -135,8 +133,8 @@ def evaluate_volume(model):
         "band_sse_share": se["band"] / tot,
         "band_rmse": math.sqrt(se["band"] / cnt["band"]),
         "far_rmse": math.sqrt(se["far"] / cnt["far"]),
-        "leaves": int(model.leaf_levels.shape[0]) if hasattr(model, "leaf_levels") else None,
-        "codec_bytes": codec_bytes(model, CODEC) if hasattr(model, "leaf_levels") else None,
+        "leaves": int(model.leaf_levels.shape[0]),
+        "codec_bytes": codec_bytes(model, CODEC),
     }
 
 
@@ -144,7 +142,7 @@ def evaluate_volume(model):
 def base_model(dataset_train):
     m = build_model(CFG).to(dev)
     _initialize_constant_mu(m, (dataset_train.projections.mean() * 0.5).clamp_min(1e-8))
-    m.elevate_leaves_isotropic_batch(torch.arange(m.leaf_levels.shape[0], device=dev), (1, 1, 1))
+    m.to_trilinear(torch.arange(m.leaf_levels.shape[0], device=dev))
     return m
 
 
@@ -182,26 +180,6 @@ def get_dataset():
 
 
 # ------------------------------------------------------------------ stages
-def stage_s0(ds):
-    model = our_tree_model(ds.train).eval()
-    dh, dw = ds.detector_shape
-    dense = torch.empty(D, H, W, device=dev)
-    with torch.no_grad():
-        for z0 in range(0, D, 8):
-            z1 = min(D, z0 + 8)
-            pts = slab_points(z0, z1)
-            dense[z0:z1] = torch.cat([model.forward_mu(pts[s : s + 4_000_000]) for s in range(0, pts.shape[0], 4_000_000)]).reshape(z1 - z0, H, W)
-        pd = project_dense_parallel(dense, ds.test.angles, detector_h=dh, detector_w=dw, samples_per_ray=1024)
-        pe = render_split(model, ds.test, detector_h=dh, detector_w=dw, samples_per_ray=1024, ray_chunk=4096)
-    data = ds.test.projections
-    mse = lambda x, y: float(((x - y) ** 2).mean())
-    ps = lambda m_: 10 * math.log10(float(data.max()) ** 2 / m_)
-    save("s0_operator", {
-        "mse_exact_vs_data": mse(pe, data), "mse_dense_vs_data": mse(pd, data), "mse_exact_vs_dense_same_function": mse(pe, pd),
-        "psnr_exact_vs_data": ps(mse(pe, data)), "psnr_dense_vs_data": ps(mse(pd, data)), "psnr_exact_vs_dense": ps(mse(pe, pd)),
-    })
-
-
 @torch.no_grad()
 def stage_ls_eval(ds):
     m = our_tree_model(ds.train).eval()
@@ -304,86 +282,9 @@ def stage_oracle(ds):
     torch.save({"s0": s0.cpu(), "s1": s1.cpu(), "coef": coef.cpu()}, OUT / "oracle_tree.pt")
 
 
-def train_fixed(m, split, iters, tag, ds, eval_every=0):
-    dh, dw = ds.detector_shape
-    opt = torch.optim.Adam([p for p in m.parameters() if p.requires_grad], lr=float(CFG["training"].get("lr", 0.015)))
-    wk = projection_weight_kwargs(CFG["training"], iteration=1)
-    compact = m.prefer_compact_ray_batch()
-    t0 = time.time()
-    hist = []
-    for it in range(1, iters + 1):
-        rb = random_training_rays(split, batch_rays=int(CFG["training"].get("batch_rays", 65536)), detector_h=dh, detector_w=dw, samples_per_ray=1024, materialize_points=not compact)
-        loss = weighted_projection_loss(m.integrate_ray_batch(rb), rb.target, **wk)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        if it % 5000 == 0:
-            print(f"{tag} it {it}/{iters} loss {float(loss):.3e} {time.time() - t0:.0f}s", flush=True)
-        if eval_every and it % eval_every == 0:
-            e = evaluate_volume(m)
-            hist.append({"it": it, "train_loss": float(loss), "volume_psnr_db": e["volume_psnr_db"], "band_rmse": e["band_rmse"], "far_rmse": e["far_rmse"]})
-            print(tag, hist[-1], flush=True)
-    with torch.no_grad():
-        pm = projection_metrics(render_split(m, ds.test, detector_h=dh, detector_w=dw, samples_per_ray=1024, ray_chunk=4096), ds.test.projections)
-    ev = evaluate_volume(m)
-    ev["test_projection_psnr"] = pm["psnr"]
-    if hist:
-        ev["history"] = hist
-    return ev
-
-
 def oracle_tree_for(ds):
     t = torch.load(OUT / "oracle_tree.pt")
     return oracle_model(ds.train, t["s0"].to(dev), t["s1"].to(dev))
-
-
-def stage_train(ds, iters=30000):
-    m0 = oracle_tree_for(ds)
-    report("train_oracle_tree", m0, train_fixed(m0, ds.train, iters, "oracle", ds))
-    m = our_tree_model(ds.train)
-    _initialize_constant_mu(m, (ds.train.projections.mean() * 0.5).clamp_min(1e-8))
-    report("train_our_tree", m, train_fixed(m, ds.train, iters, "ourtree", ds))
-
-
-def stage_warm(ds, iters=10000):
-    """Start the oracle tree at its GT least-squares coefficients, then train from projections only."""
-    m = oracle_tree_for(ds)
-    set_coefficients(m, torch.load(OUT / "oracle_tree.pt")["coef"].to(dev))
-    report("warm_oracle_tree", m, train_fixed(m, ds.train, iters, "warm", ds, eval_every=2000))
-
-
-def stage_solve(ds, variants=None):
-    """Stage 1: cold start on the oracle tree with the fixed-tree solver (physical coefficients, c >= 0)."""
-    from adaptive_ct.training.solve import _set, solve
-    dh, dw = ds.detector_shape
-    n_rays = int(ds.train.angles.numel()) * dh * dw
-    variants = variants or {"A_full_basic": dict(passes=10, extrapolate=False), "B_full_extrapolated": dict(passes=30), "C_groups24_then_extrapolated": dict(passes=30, groups=24, group_passes=4)}
-    for name, kw in variants.items():
-        m = oracle_tree_for(ds)
-
-        def on_pass(c, m=m):
-            p = len(hist_box)
-            hist_box.append(1)
-            if p % 3 != 2:
-                return {}
-            _set(m, c)
-            e = evaluate_volume(m)
-            return {"volume_psnr_db": e["volume_psnr_db"], "band_rmse": e["band_rmse"], "far_rmse": e["far_rmse"]}
-
-        hist_box = []
-        t0 = time.time()
-        c, hist, _ = solve(m, ds.train, on_pass=on_pass, **kw)
-        for h in hist:
-            if "objective_at_eval_point" in h:
-                h["train_mse"] = 2 * h["objective_at_eval_point"] / n_rays
-        with torch.no_grad():
-            pm = projection_metrics(render_split(m, ds.test, detector_h=dh, detector_w=dw, samples_per_ray=1024, ray_chunk=4096), ds.test.projections)
-        final = evaluate_volume(m)
-        report(f"solve_{name}", m, {**final, "test_projection_psnr": pm["psnr"], "seconds": time.time() - t0, "history": hist})
-
-
-def stage_solve_long(ds):
-    stage_solve(ds, {"C_groups24_then_extrapolated_80": dict(passes=80, groups=24, group_passes=4)})
 
 
 def slice_figure(models, path, z=None, crop=(440, 560, 256)):
@@ -407,142 +308,24 @@ def slice_figure(models, path, z=None, crop=(440, 560, 256)):
     return {"slice_z": z, "crop_rows_cols": [cy - s // 2, cy + s // 2, cx - s // 2, cx + s // 2]}
 
 
-def stage_solve_c_save(ds):
-    from adaptive_ct.training.solve import solve
-    dh, dw = ds.detector_shape
-    m = oracle_tree_for(ds)
-    t0 = time.time()
-    solve(m, ds.train, passes=80, groups=24, group_passes=4)
-    torch.save({"model": m.state_dict(), "config": CFG}, OUT / "solve_C_80.pt")
-    ev = evaluate_volume(m)
-    ours = our_tree_model(ds.train)
-    ev.update(slice_figure([m, ours], OUT / "slice_C.png"), seconds=time.time() - t0)
-    save("solve_C_80_saved", ev)
-
-
-def load_checkpoint(path, latent=False):
+def load_checkpoint(path):
     ck = torch.load(path, map_location="cpu")
-    cfg = dict(ck["config"])
-    if latent:
-        cfg["model"] = dict(cfg["model"], representation="latent_p1_octree", latent_dim=4)
-    m = build_model(cfg)
+    m = build_model(ck["config"])
     m.prepare_sparse_from_state_dict(ck["model"])
     m.load_state_dict(ck["model"], strict=True)
     return m.to(dev).eval()
 
 
 def stage_main_eval(ds):
-    """Official run in output/<RUN>: volume metrics for the solved and the deployed model, slice figure vs the legacy pipeline."""
+    """output/<RUN>/checkpoint.pt (deployed, fp16): volume metrics; slice figure next to the oracle tree solved from projections."""
     run_dir = ROOT / "output" / RUN
-    solved = load_checkpoint(run_dir / "checkpoint.pt")
-    legacy = load_checkpoint(ROOT / "output/stage7_dorfler_p1_256v/checkpoint.pt")
-    out = {"solved": evaluate_volume(solved), "legacy_pipeline_trained": evaluate_volume(legacy)}
-    if (run_dir / "checkpoint_codec.pt").exists():
-        out["deployed"] = evaluate_volume(load_checkpoint(run_dir / "checkpoint_codec.pt", latent=True))
-    out.update(slice_figure([solved, legacy], run_dir / "slice_vs_legacy.png"))
-    out["slice_png"] = str(run_dir / "slice_vs_legacy.png")
+    deployed = load_checkpoint(run_dir / "checkpoint.pt")
+    reference = load_checkpoint(OUT / "speed_full_tol1e-4.pt")
+    out = {"deployed": evaluate_volume(deployed), "reference_oracle_tree_solved": evaluate_volume(reference)}
+    out.update(slice_figure([deployed, reference], run_dir / "slice_vs_oracle_tree.png"))
+    out["slice_png"] = str(run_dir / "slice_vs_oracle_tree.png")
+    out["panel_order"] = "GT | this run | oracle tree solved from projections | |error of this run|"
     save(f"main_eval_{RUN}", out)
-
-
-class GridField:
-    """Uniform-grid field used only for the continuity capacity check (fitted to GT)."""
-
-    def __init__(self, kind, n, values):
-        self.kind, self.n, self.values = kind, n, values  # values: nodes (n+1)^3, or per-cell (n^3, 8) / (n^3,)
-
-    def eval(self):
-        return self
-
-    def forward_mu(self, pts):
-        if self.kind == "shared":
-            grid = pts[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
-            return F.grid_sample(self.values.view(1, 1, self.n + 1, self.n + 1, self.n + 1), grid, align_corners=True).view(-1)
-        q = (pts + 1.0) * 0.5 * self.n
-        cell = q.floor().clamp(0, self.n - 1)
-        lin = ((cell[:, 0] * self.n + cell[:, 1]) * self.n + cell[:, 2]).long()
-        if self.kind == "constant":
-            return self.values[lin]
-        return (trilinear((q - cell).clamp(0, 1)) * self.values[lin]).sum(1)
-
-
-def fit_shared(n, iters=40):
-    """Least squares fit of a continuous trilinear field (one value per grid corner) to GT, by conjugate gradients."""
-    x = torch.zeros((n + 1) ** 3, device=dev)
-
-    def apply(vec, rhs):  # returns F^T F vec (rhs=False) or F^T v (rhs=True)
-        vec = vec.clone().requires_grad_(True)
-        for z0 in range(0, D, 8):
-            z1 = min(D, z0 + 8)
-            pts = slab_points(z0, z1)
-            pred = GridField("shared", n, vec).forward_mu(pts)
-            if rhs:
-                gt = torch.from_numpy(np.ascontiguousarray(GT[z0:z1])).to(dev).reshape(-1)
-                (pred * gt).sum().backward()
-            else:
-                (0.5 * (pred * pred).sum()).backward()
-        return vec.grad.detach()
-
-    b = apply(x, True)
-    r = b.clone()
-    pdir = r.clone()
-    rs = float(r @ r)
-    for it in range(iters):
-        ap = apply(pdir, False)
-        alpha = rs / float(pdir @ ap)
-        x += alpha * pdir
-        r -= alpha * ap
-        rs_new = float(r @ r)
-        if it % 10 == 0:
-            print(f"shared n={n} cg it {it} rel resid {(rs_new / float(b @ b)) ** 0.5:.2e}", flush=True)
-        pdir = r + (rs_new / rs) * pdir
-        rs = rs_new
-    return GridField("shared", n, x)
-
-
-@torch.no_grad()
-def fit_cells(n, kind):
-    """Per-cell least squares: independent trilinear corners (kind='independent') or a constant per cell."""
-    cells = n**3
-    k = 8 if kind == "independent" else 1
-    A = torch.zeros(cells, k * k, device=dev)
-    B = torch.zeros(cells, k, device=dev)
-    s2 = torch.zeros(cells, dtype=torch.float64, device=dev)
-    for z0 in range(0, D, 4):
-        z1 = min(D, z0 + 4)
-        pts = slab_points(z0, z1)
-        v = torch.from_numpy(np.ascontiguousarray(GT[z0:z1])).to(dev).reshape(-1)
-        q = (pts + 1.0) * 0.5 * n
-        cell = q.floor().clamp(0, n - 1)
-        lin = ((cell[:, 0] * n + cell[:, 1]) * n + cell[:, 2]).long()
-        for s0 in range(0, lin.numel(), 2_000_000):
-            sl = slice(s0, s0 + 2_000_000)
-            bas = trilinear((q[sl] - cell[sl]).clamp(0, 1)) if k == 8 else torch.ones(lin[sl].numel(), 1, device=dev)
-            A.index_add_(0, lin[sl], (bas[:, :, None] * bas[:, None, :]).reshape(-1, k * k))
-            B.index_add_(0, lin[sl], bas * v[sl, None])
-            s2.index_add_(0, lin[sl], (v[sl] * v[sl]).double())
-    if k == 1:
-        return GridField("constant", n, (B[:, 0] / A[:, 0].clamp_min(1e-9)))
-    coef, _ = ls_solve(A, B, s2)
-    return GridField("independent", n, coef)
-
-
-def stage_continuity(ds):
-    """Capacity at (nearly) equal stored-value counts: continuous shared corners vs independent corners vs constants."""
-    fields = {
-        "shared_corners_192": fit_shared(192),
-        "independent_corners_96": fit_cells(96, "independent"),
-        "constant_192": fit_cells(192, "constant"),
-        "shared_corners_96": fit_shared(96),
-    }
-    values = {"shared_corners_192": 193**3, "independent_corners_96": 96**3 * 8, "constant_192": 192**3, "shared_corners_96": 97**3}
-    out = {}
-    for name, fld in fields.items():
-        out[name] = {**evaluate_volume(fld), "stored_values": values[name]}
-        print(name, out[name], flush=True)
-    out.update(slice_figure([fields["shared_corners_192"], fields["independent_corners_96"], fields["constant_192"]], OUT / "continuity_slice.png"))
-    out["slice_png"] = str(OUT / "continuity_slice.png")
-    out["panel_order"] = "GT | shared corners 192 | independent corners 96 | constant 192 | |error of shared corners 192|"
-    save("continuity_capacity", out)
 
 
 def stage_speed(ds):
@@ -563,7 +346,7 @@ def stage_speed(ds):
             out[f"step{i}"] = {"passes": h[-1]["pass"], "converged": conv, "seconds": time.time() - t0, **{k: kw[k] for k in ("tol", "detector_bin") if k in kw}}
         last = hist[-1]
         with torch.no_grad():
-            pm = projection_metrics(render_split(m, ds.test, detector_h=dh, detector_w=dw, samples_per_ray=1024, ray_chunk=1 << 20), ds.test.projections)
+            pm = projection_metrics(render_split(m, ds.test, detector_h=dh, detector_w=dw), ds.test.projections)
         report(name, m, {**evaluate_volume(m), **out, "seconds": time.time() - t0, "train_mse": 2 * last["objective_at_eval_point"] / n_rays,
                          "optimality_residual": last["optimality_residual"], "test_projection_psnr": pm["psnr"], "history": hist})
 
@@ -766,19 +549,7 @@ def stage_profile(ds):
     save("profile_capacity", out)
 
 
-def stage_views(ds, iters=30000, extra=480):
-    dh, dw = ds.detector_shape
-    angles = torch.tensor([math.pi * (i + 0.37) / extra for i in range(extra)], dtype=torch.float32, device=dev)
-    vol = torch.from_numpy(np.ascontiguousarray(GT)).to(dev)
-    projs = torch.cat([project_dense_parallel(vol, angles[s : s + 16], detector_h=dh, detector_w=dw, samples_per_ray=1024) for s in range(0, extra, 16)])
-    del vol
-    torch.cuda.empty_cache()
-    big = ProjectionSplit(angles=torch.cat([ds.train.angles, angles]), projections=torch.cat([ds.train.projections, projs]), paths=[])
-    mv = oracle_tree_for(ds)
-    report("train_oracle_tree_3x_views", mv, {**train_fixed(mv, big, iters, "views", ds), "train_views": int(big.angles.numel())})
-
-
 if __name__ == "__main__":
     ds = get_dataset()
     for st in STAGES:
-        {"s0": stage_s0, "ls_eval": stage_ls_eval, "oracle": stage_oracle, "train": stage_train, "views": stage_views, "warm": stage_warm, "solve": stage_solve, "solve_long": stage_solve_long, "solve_c_save": stage_solve_c_save, "main_eval": stage_main_eval, "continuity": stage_continuity, "speed": stage_speed, "profile": stage_profile}[st](ds)
+        {"ls_eval": stage_ls_eval, "oracle": stage_oracle, "speed": stage_speed, "profile": stage_profile, "main_eval": stage_main_eval}[st](ds)

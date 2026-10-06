@@ -1,10 +1,9 @@
 # Adaptive Projection-Domain CT Reconstruction
 
-CUDA-first research code for sparse-view parallel-beam CT. A packed adaptive
-octree of trilinear (P1) or constant (P0) Bernstein leaves is fitted directly to
-the projections with an exact CUDA ray integrator; the tree is refined by
-projection-driven Dörfler marking under a deployment byte budget, then exported
-as a compact latent-P1 codec (per-leaf latent + one shared linear decoder).
+CUDA-first research code for parallel-beam CT. A packed adaptive octree of
+trilinear or constant leaves is fitted directly to the projections with an exact
+CUDA ray integrator; the tree grows under a byte budget, and the solved physical
+coefficients are stored in fp16 (what is stored is what is counted).
 
 No FDK, reference volume, or ground-truth volume is used for initialization,
 topology, or scoring. The ground-truth volume is loaded only after training for
@@ -26,25 +25,28 @@ diagram, module responsibilities, and the training protocol.
 3. On the solved model, score leaves by residual energy shared along each ray in proportion to
    chord length, split the best-scored batch carrying half the total score within the byte
    budget; splits reproduce the parent function exactly, so the next solve continues from it.
-4. When the budget is spent, run a longer final solve, convert to the deployed codec, evaluate,
-   and write the compact artifact.
+   Each solve stops at an optimality-residual tolerance (1e-3 per round); while leaves are still
+   coarse it uses 2x2 / 4x4 averaged detector pixels.
+4. When the budget is spent, solve strictly (tolerance 1e-4, full resolution), round the
+   coefficients to fp16, evaluate, and write the compact file.
 
 ## Layout
 
 ```text
 adaptive_ct/
-  core/            config, ray geometry, loss, native CUDA backend (projector)
+  core/            config, ray geometry, native CUDA backend (projector)
   data/            dataset, train/dev view split, fixed ray sets
-  representation/  Bernstein octree, latent-P1 octree, model factory, state snapshot
-  codec/           byte model, fp16 quantization, fine-tuning, compact artifact
-  refinement/      residual estimator, Dörfler marking, refinement controller
+  representation/  Bernstein octree (constant / trilinear leaves), model factory
+  codec/           byte model, fp16 rounding, compact file
+  refinement/      residual estimator, batch marking, refinement controller
   evaluation/      metrics, rendering, ground-truth volume evaluation
-  training/        rounds of fixed-tree solve + structure update, export, checks
+  training/        fixed-tree solver, rounds of solve + structure update, export, checks
   viewer/          Python server and Three.js frontend
 native/            CUDA extension sources
 configs/stage7/    p1 (main) and p0 (constant-leaf control) configurations
+scripts/audit/     gate_chain.py: offline diagnostics with the GT volume (not part of training)
 docs/              architecture.md
-tests/             mirrors adaptive_ct/ (core, data, representation, codec, refinement, training, viewer)
+tests/             mirrors adaptive_ct/
 ```
 
 ## Requirements
@@ -76,7 +78,7 @@ python -m pip install numpy pyyaml pillow
 Build the native extension:
 
 ```powershell
-python setup.py build_ext --inplace   # or scriptsuild_native.ps1
+python setup.py build_ext --inplace   # or scripts\build_native.ps1
 ```
 
 Check that the CUDA backend loads:
@@ -130,10 +132,10 @@ An optional `proj_val` list may define a validation split. Update
 ```
 
 Control: `p0.yaml` (constant leaves). Edit `dataset.root` and `output.dir` first. A run
-writes `checkpoint.pt` (trained octree), `checkpoint_codec.pt` (deployed codec
-model), `ANVO.npz` (compact export), `training_report.json`, and slice previews.
+writes `checkpoint.pt` (deployed octree, coefficients rounded to fp16), `ANVO.npz`
+(compact file), `training_report.json`, and slice previews.
 
-Run the tests with `scripts	est.ps1` or
+Run the tests with `scripts\test.ps1` or
 `.venv\Scripts\python.exe -m unittest discover -s tests -t .`.
 
 ## Viewer

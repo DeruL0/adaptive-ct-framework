@@ -1,1 +1,1 @@
-"""Config, ray geometry, loss, and the native CUDA backend."""
+"""Config, ray geometry, and the native CUDA backend."""

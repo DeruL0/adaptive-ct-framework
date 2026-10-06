@@ -1,11 +1,11 @@
-# Main pipeline: trilinear (P1) Bernstein octree, projections only.
+# Main pipeline: trilinear Bernstein octree, projections only.
 #
-# Each round: solve the fixed tree to convergence (nonnegative least squares on the
-# physical coefficients), score leaves on the solved model, split the best batch
-# (function preserving). When the byte budget is spent: a final strict solve, then
-# export of the physical coefficients in fp16. Views: train 240 / held-out 16 (reported per round, used for no decision) /
-# 4 test views (final evaluation only). No FDK, no reference volume; the GT volume is
-# loaded only for the final volume metrics.
+# Start: 48^3 grid of trilinear leaves, every value = half the mean training projection.
+# Each round: solve the fixed tree (nonnegative least squares on the physical coefficients),
+# score leaves on the solved model, split the best batch (function preserving). When the byte
+# budget is spent: a final strict solve, then the physical coefficients are stored in fp16.
+# Views: train 240 / held-out 16 (reported per round, used for no decision) / test 4 (final
+# evaluation only). The GT volume is loaded only for the final volume metrics.
 device: cuda
 
 dataset:
@@ -13,29 +13,16 @@ dataset:
   dev_views: 16
   dev_seed: 20260702
 
-geometry:
-  samples_per_ray: 1024
-
 model:
-  representation: bernstein_octree
   levels: [48, 96, 192, 384, 768]
-  topology: packed_hierarchy
   max_leaf_count: 6000000
-  max_degree: [1, 1, 1]
-  initial_leaf_degree: [1, 1, 1]
-  integration_mode: exact
+  max_degree: 1             # 0: constant leaves only; 1: trilinear leaves
   cuda_integrator: true
-  initialization: projection_mean
-  init_std: 0.001
   attenuation_shift: -3.0
 
 training:
   seed: 20260702
-  eval_ray_chunk: 65536
-  allow_test_during_training: false
-  projection_weighting_schedule:
-    1:
-      mode: uniform
+  eval_ray_chunk: 1048576
   solver:
     groups: 24              # views split into 24 angle-interleaved groups
     first_group_passes: 4   # grouped passes on the first round (cold start)
@@ -63,14 +50,13 @@ metrics:
   compute_boundary_metrics: false
 
 export:
-  codec:                    # deploy = the solved physical coefficients rounded to fp16 (no refit afterwards)
+  codec:                    # deploy = the solved physical coefficients rounded to fp16
     type: p1
     quantization: float16
   compact_octree:
     enabled: true
     artifact_name: ANVO.npz
     quantization: float16
-    topology: packed_hierarchy
 
 output:
   dir: output\main_p1_256v

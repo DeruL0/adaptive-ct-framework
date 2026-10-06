@@ -20,7 +20,6 @@ class ProjectorAngleZeroTests(unittest.TestCase):
             ds.train.angles[:1],
             detector_h=detector_h,
             detector_w=detector_w,
-            samples_per_ray=ds.volume_shape[0],
         )[0]
         metrics = projection_metrics(pred, ds.train.projections[0])
         self.assertGreater(metrics["psnr"], 80.0)

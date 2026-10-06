@@ -4,7 +4,6 @@ import unittest
 import torch
 
 from adaptive_ct.data.dataset import ProjectionSplit
-from adaptive_ct.core.loss import projection_weights, weighted_projection_loss
 from adaptive_ct.data.splits import split_projection_views
 
 
@@ -21,13 +20,6 @@ class ProjectionDomainTests(unittest.TestCase):
         self.assertEqual(validation_a.paths, validation_b.paths)
         self.assertTrue(set(train_a.paths).isdisjoint(validation_a.paths))
         self.assertEqual(len(validation_a.paths), 2)
-
-    def test_uniform_weights_reduce_to_mse(self):
-        target = torch.tensor([0.1, 0.5, 2.0])
-        prediction = torch.tensor([0.2, 0.4, 1.0])
-        self.assertTrue(torch.allclose(projection_weights(target, mode="uniform"), torch.ones(3)))
-        loss = weighted_projection_loss(prediction, target, mode="uniform")
-        self.assertAlmostEqual(float(loss), float(torch.mean((prediction - target) ** 2)), places=6)
 
 
 if __name__ == "__main__":

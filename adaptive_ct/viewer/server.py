@@ -168,29 +168,17 @@ def _synthesize_model_config(model_path: Path) -> dict[str, Any] | None:
     if suffix == ".npz":
         try:
             with np.load(model_path, allow_pickle=False) as payload:
-                metadata = json.loads(str(payload["metadata_json"][0])) if "metadata_json" in payload else {}
-                if "level_resolutions" in payload:
-                    levels = [int(v) for v in payload["level_resolutions"].tolist()]
-                elif "level_shapes" in payload:
-                    levels = [int(shape[0]) for shape in payload["level_shapes"].tolist()]
-                else:
-                    return None
-                max_degree = (
-                    [int(v) for v in payload["max_degree"].tolist()] if "max_degree" in payload else 3
-                )
-                attenuation_shift = (
-                    float(payload["attenuation_shift"][0]) if "attenuation_shift" in payload else -3.0
-                )
+                levels = [int(shape[0]) for shape in payload["level_shapes"].tolist()]
+                max_degree = int(payload["max_degree"][0])
+                attenuation_shift = float(payload["attenuation_shift"][0])
         except Exception:
             return None
         return {
             "device": "cpu",
             "model": {
-                "representation": str(metadata.get("representation", "bernstein_octree")),
                 "levels": levels,
                 "max_degree": max_degree,
                 "attenuation_shift": attenuation_shift,
-                "topology": str(metadata.get("topology", "packed_hierarchy")),
                 "cuda_integrator": False,
             },
         }
@@ -387,7 +375,7 @@ def _artifact_payload(output_dir: Path, *, checkpoint_path: Path | None, report_
 
 
 def _leaf_structure_payload(model) -> dict[str, Any]:
-    raw_levels = getattr(model, "level_shapes", getattr(model, "level_resolutions", []))
+    raw_levels = model.level_shapes
     resolutions = [
         [int(v), int(v), int(v)] if isinstance(v, (int, np.integer)) else [int(c) for c in v]
         for v in raw_levels
@@ -433,7 +421,7 @@ def _leaf_geometry_payload(model, *, max_leaves: int | None = None, min_mu: floa
     length of its level. This is the adaptive structure the dense decode hides:
     coarse leaves stay big, refined leaves shrink to L1/L2 size.
     """
-    raw_levels = getattr(model, "level_shapes", getattr(model, "level_resolutions", []))
+    raw_levels = model.level_shapes
     resolutions = [
         [int(v), int(v), int(v)] if isinstance(v, (int, np.integer)) else [int(c) for c in v]
         for v in raw_levels
@@ -578,7 +566,7 @@ def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float
     the renderer can interpolate the real function instead of flat-shading a
     single box (pipeline v5 step 9: "viewer must evaluate p1, not block-fill it").
     """
-    raw_levels = getattr(model, "level_shapes", getattr(model, "level_resolutions", []))
+    raw_levels = model.level_shapes
     resolutions = [
         [int(v), int(v), int(v)] if isinstance(v, (int, np.integer)) else [int(c) for c in v]
         for v in raw_levels
@@ -996,7 +984,6 @@ class ViewerState:
                     f"GT volume shape {self.target_volume.shape} does not match scanner nVoxel {self.dataset.volume_shape}."
                 )
             self.detector_h, self.detector_w = self.dataset.detector_shape
-            self.samples_per_ray = int(self.config["geometry"].get("samples_per_ray", self.dataset.volume_shape[0]))
         else:
             # Model-only: no ground-truth dataset, so slice/projection comparisons
             # are unavailable. Everything the voxel view and inspector need comes
@@ -1005,7 +992,6 @@ class ViewerState:
             self.target_volume_path = None
             self.target_volume = None
             self.detector_h = self.detector_w = None
-            self.samples_per_ray = None
         self.ray_chunk = int(
             self.config.get("viewer", {}).get(
                 "ray_chunk", self.config.get("training", {}).get("eval_ray_chunk", 4096)
@@ -1056,11 +1042,6 @@ class ViewerState:
             else:
                 payload = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
                 state_dict = payload.get("model", payload)
-                checkpoint_config = payload.get("config") if isinstance(payload, dict) else None
-                if isinstance(checkpoint_config, dict):
-                    checkpoint_representation = checkpoint_config.get("model", {}).get("representation")
-                    if checkpoint_representation != self.config.get("model", {}).get("representation"):
-                        self.model = build_model(checkpoint_config).to(device=self.device)
             self.model.prepare_sparse_from_state_dict(state_dict)
             self.model.load_state_dict(state_dict, strict=False)
         except Exception as exc:
@@ -1077,8 +1058,6 @@ class ViewerState:
         ray_integration = None
         training_objective = None
         exports = None
-        adaptive_events = None
-        rate_distortion_curve = None
         elapsed_sec = None
         growth_events = None
         history = None
@@ -1091,8 +1070,6 @@ class ViewerState:
             exports = self.training_report.get("exports")
             elapsed_sec = self.training_report.get("elapsed_sec")
             growth_events = self.training_report.get("growth_events")
-            adaptive_events = self.training_report.get("adaptive_events")
-            rate_distortion_curve = self.training_report.get("rate_distortion_curve")
             history = self.training_report.get("history")
         if self.dataset is not None:
             dataset_fields: dict[str, Any] = {
@@ -1102,7 +1079,6 @@ class ViewerState:
                 "test_views": int(self.dataset.test.projections.shape[0]),
                 "train_angles": self.dataset.train.angles.detach().float().cpu().numpy(),
                 "test_angles": self.dataset.test.angles.detach().float().cpu().numpy(),
-                "samples_per_ray": self.samples_per_ray,
             }
         else:
             # Model-only: no ground truth, so the slice/projection comparison
@@ -1114,7 +1090,6 @@ class ViewerState:
                 "test_views": 0,
                 "train_angles": [],
                 "test_angles": [],
-                "samples_per_ray": None,
             }
         return _to_jsonable(
             {
@@ -1139,8 +1114,6 @@ class ViewerState:
                     "training_objective": training_objective,
                     "exports": exports,
                     "growth_events": growth_events,
-                    "adaptive_events": adaptive_events,
-                    "rate_distortion_curve": rate_distortion_curve,
                     "history": history,
                 },
             }
@@ -1179,7 +1152,6 @@ class ViewerState:
                 single,
                 detector_h=self.detector_h,
                 detector_w=self.detector_w,
-                samples_per_ray=self.samples_per_ray,
                 ray_chunk=self.ray_chunk,
             )[0]
             elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -1194,9 +1166,7 @@ class ViewerState:
             "source_path": str(single.paths[0]),
             "elapsed_ms": elapsed_ms,
             "device": str(self.device),
-            "native_cuda_integrator": bool(
-                hasattr(self.model, "prefer_compact_ray_batch") and self.model.prefer_compact_ray_batch()
-            ),
+            "native_cuda_integrator": bool(self.model.cuda_integrator and self.model.coefficient_logits.is_cuda),
             "metrics": _array_stats(pred, target),
             "images": {
                 "prediction": _encode_gray_png(pred, vmin=vmin, vmax=vmax),
@@ -1343,14 +1313,12 @@ class ViewerState:
                 angle,
                 detector_h=self.detector_h,
                 detector_w=self.detector_w,
-                samples_per_ray=self.samples_per_ray,
             )[0]
             target_projection = project_dense_parallel(
                 target_volume,
                 angle,
                 detector_h=self.detector_h,
                 detector_w=self.detector_w,
-                samples_per_ray=self.samples_per_ray,
             )[0]
             elapsed_ms = (time.perf_counter() - start) * 1000.0
         return _volume_projection_payload_from_arrays(

@@ -10,8 +10,8 @@ from adaptive_ct.training.solve import solve
 
 
 def _tree():
-    m = BernsteinOctree(levels=[2, 4], max_degree=1, attenuation_shift=0.0, cuda_integrator=False, init_std=0.0)
-    m.elevate_leaves_isotropic_batch(torch.arange(m.leaf_levels.shape[0]), (1, 1, 1))
+    m = BernsteinOctree(levels=[2, 4], max_degree=1, attenuation_shift=0.0, cuda_integrator=False)
+    m.to_trilinear(torch.arange(m.leaf_levels.shape[0]))
     m.split_leaves_batch(torch.tensor([0, 5]))
     return m
 
@@ -26,7 +26,7 @@ class FixedTreeSolverTests(unittest.TestCase):
             truth.coefficient_logits.copy_(truth._coefficients_to_logits(c_true.clamp_min(1e-12)))
         angles = torch.linspace(0.0, 3.1, 24)
         split = ProjectionSplit(angles=angles, projections=torch.zeros(24, 8, 8), paths=[Path("x")] * 24)
-        split = ProjectionSplit(angles=angles, projections=render_split(truth, split, detector_h=8, detector_w=8, samples_per_ray=8, ray_chunk=4096).detach(), paths=split.paths)
+        split = ProjectionSplit(angles=angles, projections=render_split(truth, split, detector_h=8, detector_w=8, ray_chunk=4096).detach(), paths=split.paths)
         model = _tree()
         with torch.no_grad():
             model.coefficient_logits.copy_(model._coefficients_to_logits(torch.full_like(c_true, 0.2)))

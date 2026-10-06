@@ -1,1 +1,1 @@
-"""Octree field representations (Bernstein octree, latent codec model)."""
+"""Octree field representation (Bernstein octree with constant / trilinear leaves)."""

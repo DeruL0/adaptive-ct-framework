@@ -1,9 +1,8 @@
-# Control: same pipeline as p1.yaml with constant (P0) leaves stored as float16 values.
+# Control: same pipeline as p1.yaml with constant leaves stored as fp16 values.
 extends: p1.yaml
 
 model:
-  max_degree: [0, 0, 0]
-  initial_leaf_degree: null
+  max_degree: 0
 
 training:
   refinement:

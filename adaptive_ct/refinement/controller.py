@@ -17,16 +17,14 @@ def _level_histogram(levels: torch.Tensor, level_count: int) -> list[int]:
 class RefinementController:
     """Called once per round, after the fixed-tree solve has converged."""
 
-    def __init__(self, *, spec, estimator_split, detector_h, detector_w, samples_per_ray, materialize_points, chunk_rays, seed, byte_budget):
+    def __init__(self, *, spec, estimator_split, detector_h, detector_w, chunk_rays, seed, byte_budget):
         self.spec = dict(spec)
-        self.codec = dict(spec.get("codec") or {"type": "p0", "quantization": "float16"})
+        self.codec = dict(spec["codec"])
         self.share = float(spec.get("gain_share", 0.5))
         if not 0.0 < self.share <= 1.0:
             raise ValueError("refinement.gain_share must be in (0, 1].")
         self.estimator_split = estimator_split
         self.detector_h, self.detector_w = int(detector_h), int(detector_w)
-        self.samples_per_ray = int(samples_per_ray)
-        self.materialize_points = bool(materialize_points)
         self.chunk_rays = int(chunk_rays)
         self.seed = int(seed)
         self.byte_budget = int(byte_budget) if byte_budget is not None else None
@@ -40,7 +38,7 @@ class RefinementController:
         event.update(stop=True, stop_reasons=list(self.stop_reasons))
         return 0, event
 
-    def refine(self, model, *, weight_kwargs) -> tuple[int, dict]:
+    def refine(self, model) -> tuple[int, dict]:
         self.round_index += 1
         event: dict = {"round": self.round_index, "gain_share": self.share, "codec": self.codec, "stop": False}
         level_count = len(model.level_shapes)
@@ -49,13 +47,11 @@ class RefinementController:
             ray_count=int(self.spec.get("estimator_rays", 1 << 21)),
             detector_h=self.detector_h,
             detector_w=self.detector_w,
-            samples_per_ray=self.samples_per_ray,
             seed=self.seed + 1000 * self.round_index,
             chunk_rays=self.chunk_rays,
-            materialize_points=self.materialize_points,
         )
         eta, exposure, summary = attributed_residual_energy(
-            model, rays, weight_kwargs=weight_kwargs, max_buffer_mb=float(self.spec.get("estimator_max_buffer_mb", 512.0))
+            model, rays, max_buffer_mb=float(self.spec.get("estimator_max_buffer_mb", 512.0))
         )
         event.update(summary)
         resolvable = resolvable_mask(model, detector_h=self.detector_h, detector_w=self.detector_w,

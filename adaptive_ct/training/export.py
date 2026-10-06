@@ -1,4 +1,4 @@
-"""Post-training export: codec conversion and slice previews."""
+"""Post-training export: storage rounding and slice previews."""
 
 from __future__ import annotations
 
@@ -8,11 +8,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from adaptive_ct.codec.finetune import finetune_model
 from adaptive_ct.codec.quantize import quantize_roundtrip_
 from adaptive_ct.evaluation.metrics import projection_metrics
 from adaptive_ct.evaluation.render import render_split
-from adaptive_ct.representation.latent import LatentP1Octree
 
 
 @torch.no_grad()
@@ -61,60 +59,14 @@ def export_center_slice_png(
     }
 
 
-def finest_model_shape(model, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
-    shapes = getattr(model, "level_shapes", None)
-    if shapes:
-        return tuple(int(value) for value in shapes[-1])
-    resolutions = getattr(model, "level_resolutions", None)
-    if resolutions:
-        return (int(resolutions[-1]),) * 3
-    return tuple(int(value) for value in fallback)
+def finest_model_shape(model) -> tuple[int, int, int]:
+    return tuple(int(value) for value in model.level_shapes[-1])
 
 
-def apply_export_codec(model, dataset, config: dict, *, batch_rays: int, detector_h: int, detector_w: int,
-                        samples_per_ray: int, materialize_points: bool, weight_kwargs: dict):
-    """Convert the trained octree to its deployed codec; returns (deployed_model, summary)."""
-    codec_cfg = (config.get("export", {}) or {}).get("codec") or {}
-    if not codec_cfg:
-        return model, None
-    train_cfg = config["training"]
-    codec_type = str(codec_cfg.get("type", "p0")).lower()
-
-    def test_metric(candidate):
-        return projection_metrics(
-            render_split(
-                candidate,
-                dataset.test,
-                detector_h=detector_h,
-                detector_w=detector_w,
-                samples_per_ray=samples_per_ray,
-                ray_chunk=int(train_cfg.get("eval_ray_chunk", 4096)),
-            ),
-            dataset.test.projections,
-        )
-
-    summary = {"type": codec_type, "projection_test_pre_codec": test_metric(model)}
-    if codec_type == "latent_p1":
-        deployed = LatentP1Octree.from_bernstein(model, int(codec_cfg.get("latent_dim", 4)))
-        summary["projection_test_after_pca"] = test_metric(deployed)
-        summary["finetune"] = finetune_model(
-            deployed,
-            dataset.train,
-            steps=int(codec_cfg.get("finetune_iterations", 2000)),
-            lr=float(codec_cfg.get("finetune_lr", 0.003)),
-            batch_rays=batch_rays,
-            detector_h=detector_h,
-            detector_w=detector_w,
-            samples_per_ray=samples_per_ray,
-            weight_kwargs=weight_kwargs,
-            materialize_points=materialize_points,
-        )
-    elif codec_type in {"p0", "p1"}:
-        deployed = model
-    else:
-        raise ValueError(f"Unknown export.codec.type {codec_type!r}.")
-    quantize_roundtrip_(deployed, codec_cfg)
-    summary["projection_test_deployed"] = test_metric(deployed)
-    summary["quantization"] = str(codec_cfg.get("quantization", "float16"))
-    summary["quantization_applied_in_eval"] = True
-    return deployed, summary
+def deploy(model, dataset, codec: dict, *, detector_h: int, detector_w: int, ray_chunk: int) -> dict:
+    """Round the solved physical coefficients to the storage precision (in place); test projections before/after."""
+    test = lambda: projection_metrics(render_split(model, dataset.test, detector_h=detector_h, detector_w=detector_w, ray_chunk=ray_chunk), dataset.test.projections)
+    summary = {"type": str(codec["type"]), "quantization": str(codec.get("quantization", "float16")), "projection_test_solved": test()}
+    quantize_roundtrip_(model, codec)
+    summary["projection_test_deployed"] = test()
+    return summary

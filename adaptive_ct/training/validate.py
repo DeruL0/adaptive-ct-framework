@@ -5,18 +5,15 @@ from __future__ import annotations
 
 def validate_config(config: dict) -> None:
     errors = []
-    model_cfg = config.get("model", {}) or {}
     train_cfg = config.get("training", {}) or {}
-    if str(model_cfg.get("representation", "")).lower() not in {"bernstein_octree", "bernstein"}:
-        errors.append("the pipeline solves for a Bernstein octree; latent codecs are applied at export only")
-    if str(model_cfg.get("initialization", "projection_mean")).lower() != "projection_mean":
-        errors.append("initialization must be projection_mean (no FDK / reference volume)")
-    if bool(train_cfg.get("allow_test_during_training", False)):
-        errors.append("test views must not be used during training")
+    if int((config.get("model", {}) or {}).get("max_degree", -1)) not in (0, 1):
+        errors.append("model.max_degree must be 0 (constant leaves) or 1 (trilinear leaves)")
     if not isinstance(train_cfg.get("solver"), dict):
         errors.append("training.solver is required (round_tol, round_passes, final_tol, final_passes, groups, group_passes)")
     ref = train_cfg.get("refinement")
-    if not isinstance(ref, dict) or ref.get("byte_budget") is None:
-        errors.append("training.refinement with a byte_budget is required")
+    if not isinstance(ref, dict) or ref.get("byte_budget") is None or not isinstance(ref.get("codec"), dict):
+        errors.append("training.refinement with byte_budget and codec is required")
+    if not isinstance((config.get("export", {}) or {}).get("codec"), dict):
+        errors.append("export.codec is required")
     if errors:
         raise ValueError("Invalid config:\n- " + "\n- ".join(errors))

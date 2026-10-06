@@ -1,7 +1,7 @@
 # Adaptive CT Viewer
 
-The viewer inspects projection-domain Bernstein-octree and latent-P1
-octree checkpoints. The main 3D view renders active leaves at their actual
+The viewer inspects Bernstein-octree checkpoints (constant / trilinear leaves)
+and compact `.npz` files. The main 3D view renders active leaves at their actual
 cell sizes, exposing adaptive topology without first converting it to a dense
 volume.
 

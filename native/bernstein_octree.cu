@@ -146,69 +146,22 @@ __device__ __forceinline__ int64_t lookup_leaf(
     return -1;
 }
 
+// Leaves are constant (degree 0) or trilinear (degree 1) per axis.
 __device__ __forceinline__ void bernstein_basis(int degree, float x, float* values) {
     x = fminf(fmaxf(x, 0.0f), 1.0f);
-    const float one_minus_x = 1.0f - x;
-    values[0] = 1.0f;
-    values[1] = 0.0f;
-    values[2] = 0.0f;
-    values[3] = 0.0f;
-    if (degree == 1) {
-        values[0] = one_minus_x;
-        values[1] = x;
-    } else if (degree == 2) {
-        values[0] = one_minus_x * one_minus_x;
-        values[1] = 2.0f * x * one_minus_x;
-        values[2] = x * x;
-    } else if (degree == 3) {
-        values[0] = one_minus_x * one_minus_x * one_minus_x;
-        values[1] = 3.0f * x * one_minus_x * one_minus_x;
-        values[2] = 3.0f * x * x * one_minus_x;
-        values[3] = x * x * x;
-    }
+    values[0] = degree == 1 ? 1.0f - x : 1.0f;
+    values[1] = x;
 }
 
+// Gauss-Legendre on [-1, 1]: 1 point for constant leaves, 2 points (exact up to cubic: the
+// trilinear field along a straight line) for trilinear leaves.
 __device__ __forceinline__ void gauss_legendre(int order, int index, float* node, float* weight) {
     if (order <= 1) {
         *node = 0.0f;
         *weight = 2.0f;
-    } else if (order == 2) {
-        const float nodes[2] = {-0.5773502691896257f, 0.5773502691896257f};
-        *node = nodes[index];
-        *weight = 1.0f;
-    } else if (order == 3) {
-        const float nodes[3] = {-0.7745966692414834f, 0.0f, 0.7745966692414834f};
-        const float weights[3] = {0.5555555555555556f, 0.8888888888888888f, 0.5555555555555556f};
-        *node = nodes[index];
-        *weight = weights[index];
-    } else if (order == 4) {
-        const float nodes[4] = {
-            -0.8611363115940526f,
-            -0.3399810435848563f,
-            0.3399810435848563f,
-            0.8611363115940526f};
-        const float weights[4] = {
-            0.3478548451374538f,
-            0.6521451548625461f,
-            0.6521451548625461f,
-            0.3478548451374538f};
-        *node = nodes[index];
-        *weight = weights[index];
     } else {
-        const float nodes[5] = {
-            -0.9061798459386640f,
-            -0.5384693101056831f,
-            0.0f,
-            0.5384693101056831f,
-            0.9061798459386640f};
-        const float weights[5] = {
-            0.2369268850561891f,
-            0.4786286704993665f,
-            0.5688888888888889f,
-            0.4786286704993665f,
-            0.2369268850561891f};
-        *node = nodes[index];
-        *weight = weights[index];
+        *node = index == 0 ? -0.5773502691896257f : 0.5773502691896257f;
+        *weight = 1.0f;
     }
 }
 
@@ -249,7 +202,7 @@ __device__ __forceinline__ float segment_integral(
         const float local_x = (x + 1.0f) * 0.5f * static_cast<float>(rx) - static_cast<float>(ix);
         const float local_y = (y + 1.0f) * 0.5f * static_cast<float>(ry) - static_cast<float>(iy);
         const float local_z = (z + 1.0f) * 0.5f * static_cast<float>(rz) - static_cast<float>(iz);
-        float bx[4], by[4], bz[4];
+        float bx[2], by[2], bz[2];
         bernstein_basis(px, local_x, bx);
         bernstein_basis(py, local_y, by);
         bernstein_basis(pz, local_z, bz);
@@ -297,7 +250,7 @@ __device__ __forceinline__ void segment_backward(
     const float half = 0.5f * (t1 - t0);
     const float centre = 0.5f * (t1 + t0);
     // Basis values at each quadrature node, evaluated once per segment (weight folded into bx).
-    float bx[5][4], by[5][4], bz[5][4];
+    float bx[2][2], by[2][2], bz[2][2];
     for (int quadrature_id = 0; quadrature_id < quadrature_order; ++quadrature_id) {
         float node = 0.0f;
         float weight = 0.0f;
@@ -308,9 +261,8 @@ __device__ __forceinline__ void segment_backward(
         bernstein_basis(px, (x + 1.0f) * 0.5f * static_cast<float>(rx) - static_cast<float>(ix), bx[quadrature_id]);
         bernstein_basis(py, (y + 1.0f) * 0.5f * static_cast<float>(ry) - static_cast<float>(iy), by[quadrature_id]);
         bernstein_basis(pz, (z + 1.0f) * 0.5f * static_cast<float>(rz) - static_cast<float>(iz), bz[quadrature_id]);
-        for (int i = 0; i < 4; ++i) {
-            bx[quadrature_id][i] *= weight;
-        }
+        bx[quadrature_id][0] *= weight;
+        bx[quadrature_id][1] *= weight;
     }
     // Neighbouring rays of a warp usually cross the same leaf: sum their contributions in the
     // warp and let one thread do the global atomic add (atomic throughput is the bottleneck).

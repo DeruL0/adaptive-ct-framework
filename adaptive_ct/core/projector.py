@@ -41,22 +41,10 @@ def require_native() -> None:
         raise RuntimeError("adaptive_ct native extension requires CUDA.")
 
 
-def project_dense_parallel(
-    volume: torch.Tensor,
-    angles: torch.Tensor,
-    *,
-    detector_h: int,
-    detector_w: int,
-    samples_per_ray: int,
-) -> torch.Tensor:
+def project_dense_parallel(volume: torch.Tensor, angles: torch.Tensor, *, detector_h: int, detector_w: int) -> torch.Tensor:
+    """Projections of a dense voxel volume (viewer only: GT and decoded volumes at any angle)."""
     require_native()
-    return _NATIVE.project_dense_parallel_forward(
-        volume.contiguous(),
-        angles.contiguous(),
-        int(detector_h),
-        int(detector_w),
-        int(samples_per_ray),
-    )
+    return _NATIVE.project_dense_parallel_forward(volume.contiguous(), angles.contiguous(), int(detector_h), int(detector_w), int(max(volume.shape)))
 
 
 def _normalise_level_shapes(

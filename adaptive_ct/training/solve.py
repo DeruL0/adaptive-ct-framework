@@ -23,7 +23,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from adaptive_ct.core.geometry import detector_grid, make_parallel_ray_points
+from adaptive_ct.core.geometry import detector_grid, parallel_rays
 
 CHUNK = 1 << 20  # rays per kernel call (one 1024x1024 view, or several binned views)
 
@@ -54,8 +54,7 @@ def _sweep(model, angles, projections, views, residual):
     for s in range(0, views.numel() * n, CHUNK):
         idx = torch.arange(s, min(s + CHUNK, views.numel() * n), device=projections.device)
         v, p = views[idx // n], idx % n
-        batch = make_parallel_ray_points(angles[v], rows[p], cols[p], detector_h=h, detector_w=w,
-                                         samples_per_ray=1024, targets=projections[v, rows[p], cols[p]], materialize_points=False)
+        batch = parallel_rays(angles[v], rows[p], cols[p], detector_h=h, detector_w=w, targets=projections[v, rows[p], cols[p]])
         e = residual(model.integrate_ray_batch(batch), batch.target)
         loss = 0.5 * (e * e).sum()
         loss.backward()

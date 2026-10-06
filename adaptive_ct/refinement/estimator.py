@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 
-from adaptive_ct.core.loss import projection_weights
 from adaptive_ct.core.projector import bernstein_segment_ray_capacity
 from adaptive_ct.data.rays import FixedDecisionRaySet, ray_batch
 
@@ -14,12 +13,11 @@ def attributed_residual_energy(
     model,
     rays: FixedDecisionRaySet,
     *,
-    weight_kwargs: dict,
     max_buffer_mb: float = 512.0,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     """Residual energy per leaf.
 
-    ``eta_K = sum_r w_r res_r^2 * l_rK / L_r``: each ray's squared residual is shared among the
+    ``eta_K = sum_r res_r^2 * l_rK / L_r``: each ray's squared residual is shared among the
     leaves it crosses in proportion to the chord length ``l_rK`` inside leaf K (``L_r`` = total
     length), so the leaf values add up to the sampled residual energy.  Also returns per-leaf
     exposure (total chord length) and a summary.
@@ -37,8 +35,7 @@ def attributed_residual_energy(
         stop = min(start + chunk, rays.observation_count)
         batch = ray_batch(rays, start, stop)
         residual = model.integrate_ray_batch(batch) - batch.target
-        weights = projection_weights(batch.target, **weight_kwargs)
-        energy = weights * torch.square(residual)
+        energy = torch.square(residual)
         ray_ids, leaf_ids, intervals = model._parallel_ray_segments(batch)
         segment = intervals[:, 1] - intervals[:, 0]
         path = torch.zeros((batch.num_rays,), dtype=segment.dtype, device=device)
@@ -49,7 +46,7 @@ def attributed_residual_energy(
         rss += float(energy.sum().item())
     return eta, exposure, {
         "estimator_rays": int(rays.observation_count),
-        "estimator_weighted_rss": rss,
+        "estimator_rss": rss,
         "covered_fraction": float((exposure > 0).float().mean().item()) if leaf_count else 0.0,
     }
 
@@ -58,7 +55,7 @@ def resolvable_mask(model, *, detector_h: int, detector_w: int, min_footprint_px
     """Leaves whose children stay resolvable on the detector.
 
     Axes 0/1 project onto detector columns, axis 2 onto detector rows (same
-    convention as ``make_parallel_ray_points``).  A child cell must span at
+    convention as ``core.geometry.parallel_rays``).  A child cell must span at
     least ``min_footprint_px`` detector pixels along every axis.
     """
     shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=model.leaf_levels.device)

@@ -1,1 +1,1 @@
-"""Deployed codec: byte model, quantization, fine-tuning, compact artifact."""
+"""Storage: byte model, fp16 rounding, compact file."""

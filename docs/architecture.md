@@ -8,6 +8,9 @@
   最多到第 4 层（相当于 768³）。不再切分的格子叫叶子。
 - **三线性叶**（当前主线）：存叶子 8 个角上的衰减值，叶内任一点的值是 8 个角值按位置的加权平均，
   权重非负且和为 1；所以只要存储值都 ≥ 0，整个场处处 ≥ 0。常数叶只存 1 个值（对照配置使用）。
+  同一棵树可以同时有两种叶子（切分、常数→三线性转换都保持函数不变）。
+- **存储**：直接存每个叶子的物理系数（半精度）+ 每叶 3 字节类型标记 + 每次切分 64 字节树结构；
+  三线性叶 19 字节，常数叶 5 字节。预算按实际存储的字节计。
 - **投影**：每个探测器像素对应一条直线，预测值是衰减系数沿直线的精确积分（按叶子边界分段计算）。
   场对系数是线性的，所以预测投影 = A·c，c 是全部系数排成的向量，A 的元素都 ≥ 0。
 
@@ -30,23 +33,23 @@
   4. 切分：被选中的叶子一分为八，子叶系数精确复现父叶函数，所以投影不变；
            下一轮求解从这里继续                                              (refinement/controller.py)
 直到：字节预算用完 / 没有可切的叶子 → 最后一轮按更多遍数严格求解
-导出：转成部署格式（每叶 4 个数 + 共享线性映射，半精度），评测，写入紧凑文件
+导出：系数四舍五入到半精度（不再重新拟合），评测，写入紧凑文件
 ```
 
 ## 目录
 ```
 adaptive_ct/
-  core/            config.py  geometry.py  loss.py  projector.py(CUDA 投影器封装)
+  core/            config.py  geometry.py  projector.py(CUDA 投影器封装)
   data/            dataset.py  splits.py  rays.py
-  representation/  octree.py  latent.py  factory.py  snapshot.py
+  representation/  octree.py  factory.py
   evaluation/      metrics.py  render.py  volume.py
-  codec/           budget.py  quantize.py  finetune.py  artifact.py
+  codec/           budget.py(字节计数)  quantize.py(半精度舍入)  artifact.py(紧凑文件)
   refinement/      estimator.py  marking.py  controller.py
   training/        loop.py  solve.py  export.py  validate.py  __main__.py
   viewer/          server.py + web/
-native/            bernstein_octree.cu  projector.cu  ext.cpp
+native/            bernstein_octree.cu(八叉树精确积分)  projector.cu(稠密体投影，仅查看器用)  ext.cpp
 configs/stage7/    p1.yaml（主线）  p0.yaml（常数叶对照）
-scripts/audit/     诊断脚本（用到 GT，只用于分析，不进入流水线）
+scripts/audit/     gate_chain.py：离线诊断（用到 GT，只用于分析，不进入流水线）
 tests/             与 adaptive_ct/ 镜像
 ```
 依赖只自上而下：core ← data ← representation ← evaluation ← codec ← refinement ← training；viewer 只读复用下层。
@@ -64,8 +67,11 @@ scripts\test.ps1
 环境：项目内 `.venv`（Python 3.10，torch 2.11.0+cu130，匹配本机 CUDA 13.0，可重编原生扩展）。
 
 ## 已知缺口
-- 打分规则仍是"残差平方按长度分摊"，计划换成"新增表示能力的局部最优收益 ÷ 新增字节"，
-  并支持常数叶 / 三线性叶混合与直接存储物理系数。
+- 打分规则仍是"残差平方按长度分摊"，定位不准（同一份数据，选出的树比最优树差约 1.4 dB）。
+- 主流程还不在常数叶 / 三线性叶之间做选择（表示和存储已支持混合）。
 - 保边正则（在检验视角上选强度，候选包含 0）尚未实现。
 - 一遍全数据（2.5 亿条射线，正投影 + 反投影）约 12 秒（反投影内核改为线程束内先合并再原子累加，
   原为 35 秒）；其中反投影约占 2/3、正投影约 1/3。
+
+只保留当前方法：旧的训练方式、旧的压缩编码、采样积分、高阶多项式叶等都已从代码中删除，
+历史版本只在 git 记录里（标签 `legacy-adam-pipeline` 和此前的提交）。

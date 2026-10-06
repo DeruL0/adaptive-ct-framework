@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from adaptive_ct.core.geometry import make_parallel_ray_points
+from adaptive_ct.core.geometry import parallel_rays
 from adaptive_ct.data.dataset import ProjectionSplit
 
 
@@ -16,43 +16,20 @@ class FixedDecisionRaySet:
     cols: torch.Tensor
     detector_h: int
     detector_w: int
-    samples_per_ray: int
     chunk_rays: int
-    materialize_points: bool
 
     @property
     def observation_count(self) -> int:
         return int(self.rows.numel())
 
 
-
 def ray_batch(rays: FixedDecisionRaySet, start: int, stop: int):
-    view_ids = rays.view_ids[start:stop]
-    rows = rays.rows[start:stop]
-    cols = rays.cols[start:stop]
-    return make_parallel_ray_points(
-        rays.split.angles[view_ids],
-        rows,
-        cols,
-        detector_h=rays.detector_h,
-        detector_w=rays.detector_w,
-        samples_per_ray=rays.samples_per_ray,
-        targets=rays.split.projections[view_ids, rows, cols],
-        materialize_points=rays.materialize_points,
-    )
+    view_ids, rows, cols = rays.view_ids[start:stop], rays.rows[start:stop], rays.cols[start:stop]
+    return parallel_rays(rays.split.angles[view_ids], rows, cols, detector_h=rays.detector_h, detector_w=rays.detector_w,
+                         targets=rays.split.projections[view_ids, rows, cols])
 
 
-def sample_random_rays(
-    split,
-    *,
-    ray_count: int,
-    detector_h: int,
-    detector_w: int,
-    samples_per_ray: int,
-    seed: int,
-    chunk_rays: int,
-    materialize_points: bool,
-) -> FixedDecisionRaySet:
+def sample_random_rays(split, *, ray_count: int, detector_h: int, detector_w: int, seed: int, chunk_rays: int) -> FixedDecisionRaySet:
     """Uniform random rays over every view of ``split`` (with replacement)."""
     device = split.projections.device
     generator = torch.Generator(device="cpu")
@@ -66,7 +43,5 @@ def sample_random_rays(
         cols=torch.randint(0, int(detector_w), (count,), generator=generator).to(device),
         detector_h=int(detector_h),
         detector_w=int(detector_w),
-        samples_per_ray=int(samples_per_ray),
         chunk_rays=max(1, int(chunk_rays)),
-        materialize_points=bool(materialize_points),
     )
