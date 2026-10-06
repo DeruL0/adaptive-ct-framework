@@ -181,7 +181,11 @@ def get_dataset():
 # ------------------------------------------------------------------ stages
 @torch.no_grad()
 def stage_ls_eval(ds):
+    """Cells of the run's tree, every leaf trilinear, values fitted to GT: how good the chosen cells are."""
     m = our_tree_model(ds.train).eval()
+    save("our_tree_current", evaluate_volume(m))
+    N = int(m.leaf_levels.shape[0])
+    m.set_types(torch.arange(N, device=dev), torch.ones(N, dtype=torch.long, device=dev), torch.zeros(N * 8, device=dev), torch.zeros(N, 5, device=dev))
     N = int(m.leaf_levels.shape[0])
     A = torch.zeros(N, 64, device=dev)
     B = torch.zeros(N, 8, device=dev)
@@ -201,7 +205,6 @@ def stage_ls_eval(ds):
             B.index_add_(0, ids, b * v[:, None])
             s2.index_add_(0, ids, (v * v).double())
     coef, _ = ls_solve(A, B, s2)
-    save("our_tree_current", evaluate_volume(m))
     set_coefficients(m, coef)
     report("our_tree_gt_ls", m, evaluate_volume(m))
 

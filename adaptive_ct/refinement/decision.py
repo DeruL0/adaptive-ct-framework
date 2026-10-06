@@ -64,7 +64,9 @@ def candidate_step_geometry(model, *, detector_w: int, grid: int = 5, chunk: int
         n = torch.linalg.eigh(torch.einsum("npi,npj->nij", g, g).double())[1][:, :, -1].float()
         s = ((uu[None] - 0.5) * n[:, None, :]).sum(-1)
         weight = (g * n[:, None, :]).sum(-1).abs()
-        d = ((weight * s).sum(1) / weight.sum(1).clamp_min(1e-12)).clamp(-0.85, 0.85)
+        extent = 0.5 * n.abs().sum(1)  # max |n . (u - 1/2)| over the cell: the plane stays well inside the leaf
+        d = (weight * s).sum(1) / weight.sum(1).clamp_min(1e-12)
+        d = torch.maximum(torch.minimum(d, 0.8 * extent), -0.8 * extent)
         out[a:b] = torch.cat([n, d[:, None], (0.5 * shapes[a:b, 0] / detector_w)[:, None]], 1)
     return out
 
@@ -125,6 +127,16 @@ def _accumulate_reference(model, batch, residual, fold, candidate, acc):
         0, inv, torch.cat([L[:, None], tri, step_weights(candidate[leaf_ids]), child, cur[:, None]], 1))
     pair_ray, pair_leaf = uniq // N, uniq % N
     acc[fold].index_add_(0, pair_leaf, _pack(feat[:, 0], feat[:, 1:9], feat[:, 9:11], feat[:, 11:19], feat[:, 19], residual[pair_ray]))
+
+
+def step_side_fraction(geometry: torch.Tensor, samples: int = 4) -> torch.Tensor:
+    """Volume fraction of the smaller side of each step (mean of H or 1 - H over samples^3 points of the leaf)."""
+    q = (torch.arange(samples, device=geometry.device, dtype=torch.float32) + 0.5) / samples
+    u = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
+    s = ((u[None] - 0.5) * geometry[:, None, :3]).sum(-1) - geometry[:, 3:4]
+    w = geometry[:, 4:5]
+    mean_h = torch.where(w > 0, torch.sigmoid(s / w.clamp_min(1e-30)), (s > 0).float()).mean(1)
+    return torch.minimum(mean_h, 1 - mean_h)
 
 
 @torch.no_grad()
@@ -270,6 +282,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     allowed = torch.zeros((N, 4), dtype=torch.bool, device=device)
     allowed[:, :3] = type_allowed[None, :] & (torch.arange(3, device=device)[None, :] != kind[:, None])
     allowed[:, 2] |= type_allowed[2] & (kind == 2)  # a step leaf may take the newly estimated geometry
+    allowed[:, 2] &= step_side_fraction(candidate) >= 0.02  # a step must split its leaf, not shave a corner
     if frozen is not None:
         allowed[:, :3] &= ~frozen[:, None]
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)

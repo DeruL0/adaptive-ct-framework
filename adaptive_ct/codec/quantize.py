@@ -21,3 +21,5 @@ def quantize_roundtrip_(model, quantization: str = "float16") -> None:
         g = model.step_geometry
         g[:, :3] = angles_to_direction(direction_to_angles(g[:, :3]).half().float())
         g[:, 3:] = g[:, 3:].half().float()
+    if not (torch.isfinite(model.coefficients()).all() and torch.isfinite(model.step_geometry).all()):
+        raise ValueError("stored values overflow fp16 (> 65504): the solve left unconstrained coefficients")

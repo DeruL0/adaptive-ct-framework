@@ -695,7 +695,8 @@ class BernsteinOctree(nn.Module):
     def split_leaves_batch(self, leaf_ids) -> int:
         """Split leaves into 8 children of the same type, function preserving:
         constant children copy the parent; trilinear children take the parent's values at their corners;
-        step children keep both values with geometry n' = n, d' = 2d - n . (o - 1/2), w' = 2w (o = child offset).
+        step children keep both values with geometry n' = n, d' = 2d - n . (o - 1/2), w' = 2w (o = child offset),
+        except children where one side of the step fills < 2% of the volume: those become constant (mean value).
         Returns the number of split leaves (capped by max_leaf_count)."""
         device = self.coefficient_logits.device
         ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=device), sorted=True)
@@ -719,18 +720,36 @@ class BernsteinOctree(nn.Module):
             [lattice[:, x : x + 2, y : y + 2, z : z + 2] for x, y, z in child_offsets.tolist()], dim=1
         ).reshape(-1)
         step_ids = ids[n0 + n1 :]
-        step_children = physical[self.coefficient_offsets[step_ids, None] + torch.arange(2, device=device)][:, None, :].expand(-1, 8, -1).reshape(-1)
-        geometry = torch.zeros((ids.numel(), 8, 5), device=device)
+        c_step = physical[self.coefficient_offsets[step_ids, None] + torch.arange(2, device=device)]  # (s, 2)
         g = self.step_geometry[step_ids][:, None, :]
         shift = (g[..., :3] * (child_offsets[None].float() - 0.5)).sum(-1)
-        geometry[n0 + n1 :] = torch.cat([g[..., :3].expand(-1, 8, -1), (2 * g[..., 3] - shift)[..., None], (2 * g[..., 4]).expand(-1, 8)[..., None]], -1)
+        child_geometry = torch.cat([g[..., :3].expand(-1, 8, -1), (2 * g[..., 3] - shift)[..., None], (2 * g[..., 4]).expand(-1, 8)[..., None]], -1)
+        # A child where one side of the step fills < 2% of its volume becomes a constant leaf (its mean value):
+        # the value on the small side would hardly affect any ray and drift unconstrained in the solve.
+        q = (torch.arange(4, device=device, dtype=torch.float32) + 0.5) / 4
+        u = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
+        sv = ((u[None, None] - 0.5) * child_geometry[..., None, :3]).sum(-1) - child_geometry[..., 3:4]
+        mean_h = torch.where(child_geometry[..., 4:5] > 0, torch.sigmoid(sv / child_geometry[..., 4:5].clamp_min(1e-30)), (sv > 0).float()).mean(-1)
+        flat = (torch.minimum(mean_h, 1 - mean_h) < 0.02).reshape(-1)  # (s * 8,)
+        pair = c_step[:, None, :].expand(-1, 8, -1).reshape(-1, 2)
+        mean_value = ((1 - mean_h) * c_step[:, None, 0] + mean_h * c_step[:, None, 1]).reshape(-1)
+        counts = torch.where(flat, 1, 2)
+        starts = torch.cumsum(counts, 0) - counts
+        step_children = torch.zeros(int(counts.sum()), device=device)
+        step_children[starts[flat]] = mean_value[flat]
+        step_children[starts[~flat]] = pair[~flat, 0]
+        step_children[starts[~flat] + 1] = pair[~flat, 1]
+        degrees = self.leaf_degrees[ids][:, None, :].expand(-1, 8, -1).reshape(-1, 3).clone()
+        degrees[(n0 + n1) * 8 :][flat] = 0
+        geometry = torch.zeros((ids.numel() * 8, 5), device=device)
+        geometry[(n0 + n1) * 8 :] = torch.where(flat[:, None], 0.0, child_geometry.reshape(-1, 5))
         self._replace_leaves(
             ids,
             (self.leaf_levels[ids][:, None] + 1).expand(-1, 8).reshape(-1),
             (self.leaf_coords[ids][:, None, :] * 2 + child_offsets[None]).reshape(-1, 3),
-            self.leaf_degrees[ids][:, None, :].expand(-1, 8, -1).reshape(-1, 3),
+            degrees,
             torch.cat([constant_children, trilinear_children, step_children]),
-            geometry.reshape(-1, 5),
+            geometry,
         )
         return int(ids.numel())
 
