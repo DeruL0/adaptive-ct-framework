@@ -6,7 +6,9 @@ Rays: every pixel of a set of evenly spaced training views; alternate views form
 values are fitted on one half and its objective  sum (prediction - data)^2  is measured on the other half
 (and the other way round), so extra parameters only win when they predict unseen view directions better.
 Gain = objective(keep) - objective(option).  A leaf whose type changed in the previous round may only be
-kept or split (no immediate change back).
+kept or split (no immediate change back).  Trilinear and step leaves are never downgraded to constant: the
+detail it drops is largely invisible in held-out projections but not in the volume (run fabed08: projections
++0.7 dB, volume -0.6 dB with 472k downgrades).
 
 Choice: each leaf takes the option maximising  gain - lambda * extra_bytes ; lambda >= 0 is the smallest
 price of a byte that keeps this round's additions within `action_share` of the remaining budget (byte-saving
@@ -286,6 +288,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     allowed[:, :3] = type_allowed[None, :] & (torch.arange(3, device=device)[None, :] != kind[:, None])
     allowed[:, 2] |= type_allowed[2] & (kind == 2)  # a step leaf may take the newly estimated geometry
     allowed[:, 2] &= step_side_fraction(candidate) >= 0.02  # a step must split its leaf, not shave a corner
+    allowed[:, 0] &= kind == 0  # no downgrade to constant: what it drops is largely invisible in projections but not in the volume
     if frozen is not None:
         allowed[:, :3] &= ~frozen[:, None]
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
