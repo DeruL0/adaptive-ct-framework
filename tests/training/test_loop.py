@@ -55,6 +55,7 @@ def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
         "model": {"levels": [2, 4, 8], "leaf_types": types, "cuda_integrator": False},
         "training": {
             "seed": 3,
+            "max_seconds": 600,
             "eval_ray_chunk": 4096,
             "solver": {"groups": 3, "first_group_passes": 2, "group_passes": 1, "round_tol": 1e-3, "round_passes": 6, "final_tol": 1e-4, "final_passes": 8,
                        "min_leaf_px": 2.5, "extrapolate": True, "edge_penalty": {"weight": 2300, "delta": 0.02}, "geometry_steps": 1},
@@ -66,14 +67,17 @@ def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
 
 
 class PipelineTests(unittest.TestCase):
-    def _run(self, *, types: list):
+    def _run(self, *, types: list, patch=None):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config = _config(_write_dataset(root), root / "output", types=types)
+            if patch:
+                patch(config)
             config_path = root / "config.yaml"
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
             report = run_training(config_path)
-            artifacts = {name: (root / "output" / name).exists() for name in ("checkpoint.pt", "model.npz", "training_report.json")}
+            artifacts = {name: (root / "output" / name).exists() for name in
+                         ("checkpoint.pt", "model.npz", "training_report.json", "states/pre_final_solve.pt", "states/pre_decision_last.pt")}
         return report, artifacts
 
     def test_three_type_run_refines_from_projections_and_stores_fp16(self):
@@ -86,6 +90,29 @@ class PipelineTests(unittest.TestCase):
         self.assertGreaterEqual(len(report["rounds"]), 2)
         self.assertTrue(report["rounds"][-1]["final"])
         self.assertTrue(all(artifacts.values()), artifacts)
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(all(r["values_converged"] for r in report["rounds"]))  # no structure change on unconverged values
+        self.assertTrue(all(isinstance(a, bool) for r in report["rounds"] for a in r["geometry_accepted"]))
+
+    def test_unconverged_values_stop_the_run_without_a_structure_change(self):
+        def patch(config):
+            config["training"]["max_seconds"] = 1e-6
+            config["training"]["solver"].update(round_passes=3, final_passes=3, round_tol=1e-12)
+
+        report, _ = self._run(types=["constant", "trilinear", "step"], patch=patch)
+        self.assertEqual(report["status"], "time_limit_not_converged")
+        self.assertEqual(len(report["rounds"]), 1)
+        self.assertFalse(report["rounds"][0]["values_converged"])
+        self.assertEqual(report["growth_events"], [])  # the tree was not refined
+
+    def test_unconverged_values_are_solved_on_before_the_structure_changes(self):
+        def patch(config):
+            config["training"]["solver"].update(round_passes=3, round_tol=1e-4)
+
+        report, _ = self._run(types=["constant", "trilinear", "step"], patch=patch)
+        self.assertEqual(report["status"], "complete")
+        self.assertGreater(max(r["continuation_solves"] for r in report["rounds"]), 0)
+        self.assertTrue(all(r["values_converged"] for r in report["rounds"]))
 
     def test_constant_control_runs(self):
         report, artifacts = self._run(types=["constant"])

@@ -46,6 +46,13 @@ def _split_dev_views(dataset, dataset_cfg: dict, seed: int):
     return dataclass_replace(dataset, train=train_split, validation=dev_split)
 
 
+def save_state(model, path: Path, config: dict, dataset, **extra) -> None:
+    """Model (tree, types, values, geometry), config and the view split, to restart a stage exactly."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model": model.state_dict(), "config": config, "train_angles": dataset.train.angles.cpu(),
+                "validation_angles": dataset.validation.angles.cpu() if dataset.validation is not None else None, **extra}, path)
+
+
 def run_training(config_path: str | Path) -> dict:
     """Rounds of: solve the fixed tree to convergence -> score leaves -> split a batch; then a final strict solve."""
     run_start_time = time.perf_counter()
@@ -81,6 +88,7 @@ def run_training(config_path: str | Path) -> dict:
         detector_w=detector_w,
         seed=training_seed,
         byte_budget=int(ref_cfg["byte_budget"]),
+        state_dir=out_dir / "states",
     )
 
     def held_out_metric():
@@ -93,6 +101,8 @@ def run_training(config_path: str | Path) -> dict:
 
     rounds, history, growth_events = [], [], []
     max_rounds = int(ref_cfg["max_rounds"])
+    time_limit = float(train_cfg["max_seconds"])
+    status = "complete"
     start_time = time.perf_counter()
     alpha = 1.0  # first step size of the next geometry step
     for r in range(max_rounds + 1):
@@ -112,23 +122,36 @@ def run_training(config_path: str | Path) -> dict:
             geometry.append(geometry_step(model, dataset.train, detector_bin=detector_bin, penalty_weight=weight,
                                           penalty_delta=float(edge["delta"]), alpha=alpha))
             alpha = geometry[-1]["accepted_step"] or alpha / 8  # next first try: the step accepted now
+        if final:  # the state every solver comparison starts from (audit/benchmark_pipeline.py)
+            save_state(model, out_dir / "states" / "pre_final_solve.pt", config, dataset, round=r, detector_bin=detector_bin)
         t0 = time.perf_counter()
         penalty = EdgePenalty(model, float(edge["delta"])) if weight > 0 else None
-        _, hist, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg["groups"]),
-                                   group_passes=group_passes, extrapolate=bool(solver_cfg["extrapolate"]),
-                                   detector_bin=detector_bin, penalty=penalty, penalty_weight=weight)
-        del penalty
+        # A tree is only changed once its values satisfy the optimality tolerance: otherwise the solve goes on
+        # (same curvature, momentum and penalty) until it does, or the run's time limit is reached.
+        solve_state, hist, continuations, passes_used = {}, [], 0, 0
+        while True:
+            _, more, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg["groups"]),
+                                       group_passes=group_passes, extrapolate=bool(solver_cfg["extrapolate"]),
+                                       detector_bin=detector_bin, penalty=penalty, penalty_weight=weight, state=solve_state)
+            hist += more
+            passes_used += int(more[-1]["pass"]) if more else 0
+            if converged or time.perf_counter() - run_start_time > time_limit:
+                break
+            continuations += 1
+        del penalty, solve_state
         last = hist[-1] if hist else {}
         entry = {
             "round": r,
             "final": final,
-            "passes": int(last.get("pass", 0)),
-            "converged": converged,
+            "passes": passes_used,  # full-data-equivalent passes, curvature and convergence checks included
+            "values_converged": converged,
+            "continuation_solves": continuations,
+            "geometry_accepted": [g["accepted_step"] > 0 for g in geometry],
             "detector_bin": detector_bin,
             "solve_seconds": time.perf_counter() - t0,
             "geometry": geometry,
             "objective": last.get("objective_at_eval_point"),
-            "optimality_residual": last.get("optimality_residual"),
+            "optimality_residual": last.get("optimality_residual_at_returned", last.get("optimality_residual")),
             "leaves": model.leaf_count,
             "bytes": model_bytes(model),
             "leaf_type_counts": list(model.stats().leaf_type_counts),
@@ -140,6 +163,9 @@ def run_training(config_path: str | Path) -> dict:
         print(json.dumps({"round": entry}, default=float), flush=True)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        if not converged:  # time limit: keep the model, do not change its structure, do not call it converged
+            status = "time_limit_not_converged"
+            break
         if final:
             break
         event = controller.refine(model)
@@ -199,6 +225,7 @@ def run_training(config_path: str | Path) -> dict:
             "held_out_role": "per-round projection check only (not used for any decision)",
             "test_role": "final evaluation only",
         },
+        "status": status,
         "elapsed_sec": elapsed,
         "total_elapsed_sec": time.perf_counter() - run_start_time,
         "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,

@@ -17,6 +17,8 @@ def validate_config(config: dict) -> None:
         errors.append("training.solver needs " + ", ".join(keys))
     elif not isinstance(solver["edge_penalty"], dict) or {"weight", "delta"} - set(solver["edge_penalty"]):
         errors.append("training.solver.edge_penalty needs weight and delta")
+    if not float(train_cfg.get("max_seconds", 0)) > 0:
+        errors.append("training.max_seconds (time limit of the whole run, seconds) is required")
     ref = train_cfg.get("refinement")
     keys = ("byte_budget", "action_share", "stop_below_remaining", "decision_views", "min_footprint_px", "max_rounds")
     if not isinstance(ref, dict) or any(k not in ref for k in keys):

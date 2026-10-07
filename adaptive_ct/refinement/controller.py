@@ -15,13 +15,14 @@ def _cell_keys(levels: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
 
 
 class RefinementController:
-    def __init__(self, *, spec, edge_penalty, estimator_split, detector_h, detector_w, seed, byte_budget):
+    def __init__(self, *, spec, edge_penalty, estimator_split, detector_h, detector_w, seed, byte_budget, state_dir):
         self.spec = dict(spec)
         self.edge_penalty = dict(edge_penalty)
         self.estimator_split = estimator_split
         self.detector_h, self.detector_w = int(detector_h), int(detector_w)
         self.seed = int(seed)
         self.byte_budget = int(byte_budget)
+        self.state_dir = state_dir
         self.round_index = 0
         self.stopped = False
         self.stop_reasons: list[str] = []
@@ -44,6 +45,8 @@ class RefinementController:
             frozen = torch.isin(_cell_keys(model.leaf_levels, model.leaf_coords),
                                 _cell_keys(self.changed_cells[:, 0], self.changed_cells[:, 1:]))
         views = decision_views(self.estimator_split, int(self.spec["decision_views"]), self.round_index)
+        self.state_dir.mkdir(parents=True, exist_ok=True)  # the last decision's input (audit/benchmark_pipeline.py)
+        torch.save({"model": model.state_dict(), "round": self.round_index}, self.state_dir / "pre_decision_last.pt")
         t0 = time.perf_counter()
         report, self.changed_cells = decide_and_apply(
             model, self.estimator_split, views, detector_h=self.detector_h, detector_w=self.detector_w,

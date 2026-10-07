@@ -22,6 +22,7 @@ model:
 
 training:
   seed: 20260702
+  max_seconds: 7200         # time limit of the whole run: the model is kept, its status says "time_limit_not_converged"
   eval_ray_chunk: 1048576
   solver:
     groups: 24              # views split into 24 angle-interleaved groups
