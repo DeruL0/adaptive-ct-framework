@@ -1,0 +1,9 @@
+# Control for the step-geometry update: main pipeline without it (same commit, geometry_steps 0).
+extends: p1.yaml
+
+training:
+  solver:
+    geometry_steps: 0
+
+output:
+  dir: output\main_p1_no_geometry
