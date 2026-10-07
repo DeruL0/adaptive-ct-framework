@@ -1,33 +1,35 @@
+"""Sparse octree of typed leaves (constant / trilinear / step), laid out for the CUDA traversal.
+
+Leaf order: all trilinear leaves, then all step leaves, then all constant leaves; inside each type in Z order
+(Morton code of the cell's corner at the finest level, so leaves close in space are close in memory).
+The type and the value offset of leaf i follow from its index and the three type counts:
+  trilinear  i < n_tri               values[8 i : 8 i + 8]            (one 32-byte aligned block)
+  step       n_tri <= i < n_tri + n_step   values[8 n_tri + 2 j : + 2], j = i - n_tri;  geometry row j
+  constant   otherwise               values[8 n_tri + 2 n_step + k],  k = i - n_tri - n_step
+Values are the physical attenuation (>= 0).  A step leaf is (1 - H) c0 + H c1,
+H = sigmoid((n . (u - 1/2) - d) / w), u = leaf-local coordinates in [0, 1]^3; w = 0 is a hard step.
+Its geometry row holds n (3), d, w and three padding floats (one 32-byte record).
+Tree: root[cell of the root grid] and child_table[internal node, child slot] are int32; a value >= 0 is a leaf
+index, a value < 0 is the internal node -1 - value.  Child slot = 4 x + 2 y + z of the child's parity bits.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
 from typing import Dict, Iterable, Sequence
 
-import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from adaptive_ct.core.projector import (
-    bernstein_octree_integrate,
-    bernstein_octree_ray_segments,
-    has_bernstein_native,
-)
+from adaptive_ct.core.projector import bernstein_octree_integrate, has_bernstein_native
 
-
-# Leaf types, stored as degree triples (the CUDA traversal reads them):
-#   constant  (0, 0, 0)  1 value
-#   trilinear (1, 1, 1)  8 corner values
-#   step      (1, 0, 0)  2 values c0, c1:  (1 - H) c0 + H c1,  H = sigmoid((n . (u - 1/2) - d) / w)
-#             with geometry (n, d, w) in step_geometry; w = 0 is a hard step.
-LEAF_TYPES = {"constant": (0, 0, 0), "trilinear": (1, 1, 1), "step": (1, 0, 0)}
 TYPE_NAMES = ("constant", "trilinear", "step")  # type id = index
-
-
-def type_ids(degrees: torch.Tensor) -> torch.Tensor:
-    """0 constant, 1 trilinear, 2 step."""
-    return torch.where(degrees[:, 0] == 0, 0, torch.where(degrees[:, 1] == 1, 1, 2))
+VALUE_COUNT = (1, 8, 2)  # stored values per leaf, by type id
+GEOMETRY_WIDTH = 8
+_ORDER_RANK = (2, 0, 1)  # position of each type id in the leaf order: trilinear, step, constant
+_MISSING = -(2**31)
 
 
 def step_integral(geometry: torch.Tensor, s_start: torch.Tensor, s_stop: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
@@ -43,653 +45,352 @@ def step_integral(geometry: torch.Tensor, s_start: torch.Tensor, s_stop: torch.T
     return torch.where(w > 0, smooth, hard)
 
 
+def step_H(geometry: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """H of step geometry rows (n, >= 5) at leaf-local points u (n, 3)."""
+    s = ((u - 0.5) * geometry[:, :3]).sum(1) - geometry[:, 3]
+    w = geometry[:, 4]
+    return torch.where(w > 0, torch.sigmoid(s / w.clamp_min(1e-30)), (s > 0).to(s.dtype))
+
+
+def trilinear_weights(u: torch.Tensor) -> torch.Tensor:
+    """(n, 8) corner weights at leaf-local points u (n, 3); corner index 4 i + 2 j + k."""
+    p = torch.stack([1 - u, u], -1)
+    return (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(-1, 8)
+
+
+def pad_geometry(g: torch.Tensor) -> torch.Tensor:
+    """(n, 5) n, d, w -> (n, GEOMETRY_WIDTH)."""
+    return F.pad(g[:, :5], (0, GEOMETRY_WIDTH - 5))
+
+
+def morton(coords: torch.Tensor, bits: int) -> torch.Tensor:
+    """Z-order code of nonnegative integer coordinates (n, 3)."""
+    code = torch.zeros(coords.shape[0], dtype=torch.long, device=coords.device)
+    for b in range(bits):
+        for axis in range(3):
+            code |= ((coords[:, axis] >> b) & 1) << (3 * b + 2 - axis)
+    return code
+
+
 @dataclass(frozen=True)
-class BernsteinStats:
-    parameter_count: int
-    model_bytes: int
-    l0_cells: int
-    l0_active: int
-    l1_active: int
-    l2_active: int
-    l3_active: int
-    active_by_level: tuple[int, ...]
+class OctreeStats:
     leaf_cells: int
+    active_by_level: tuple[int, ...]
     max_depth: int
-    representation: str
-    coefficient_count: int
+    value_count: int
     leaf_types: tuple[str, ...]
     leaf_type_counts: tuple[int, ...]
 
 
 def _shape3(value: int | Sequence[int]) -> tuple[int, int, int]:
-    if isinstance(value, int):
-        return (int(value),) * 3
-    shape = tuple(int(component) for component in value)
+    shape = (int(value),) * 3 if isinstance(value, int) else tuple(int(v) for v in value)
     if len(shape) != 3:
         raise ValueError(f"Expected an integer or a 3-value shape, got {value!r}.")
     return shape
 
 
-def _all_coords(
-    resolution: int | Sequence[int],
-    *,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    shape = _shape3(resolution)
-    axes = [torch.arange(value, dtype=torch.long, device=device) for value in shape]
-    xx, yy, zz = torch.meshgrid(*axes, indexing="ij")
-    return torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
-
-
-def _inverse_softplus(value: torch.Tensor) -> torch.Tensor:
-    value = value.clamp_min(torch.finfo(value.dtype).tiny)
-    return value + torch.log(-torch.expm1(-value))
-
-
-def unique_degree_rows(degrees: torch.Tensor) -> torch.Tensor:
-    """Fast replacement for `torch.unique(degrees, dim=0)` on (N, 3) small
-    nonnegative-integer degree tuples.
-
-    PyTorch's dim=0 unique is a general row-wise comparison and is
-    dramatically slower on CPU than the plain 1D unique -- for a few hundred
-    thousand rows the difference is seconds vs. milliseconds. Since a Bernstein
-    degree is a handful of small integers per axis, encode each row into one
-    integer key, run the well-optimized 1D unique, and decode back.
-    """
-    if degrees.shape[0] == 0:
-        return degrees
-    base = max(int(degrees.max().item()) + 1, 2)
-    keys = (degrees[:, 0] * base + degrees[:, 1]) * base + degrees[:, 2]
-    unique_keys = torch.unique(keys)
-    d0 = torch.div(unique_keys, base * base, rounding_mode="floor")
-    remainder = unique_keys - d0 * base * base
-    d1 = torch.div(remainder, base, rounding_mode="floor")
-    d2 = remainder - d1 * base
-    return torch.stack([d0, d1, d2], dim=1)
-
-
-def bernstein_basis(degree: int, coordinate: torch.Tensor) -> torch.Tensor:
-    """Evaluate all Bernstein basis functions of one degree on [0, 1]."""
-    degree = int(degree)
-    x = coordinate.clamp(0.0, 1.0)
-    if degree == 0:
-        return torch.ones((*x.shape, 1), dtype=x.dtype, device=x.device)
-    values = []
-    one_minus_x = 1.0 - x
-    for index in range(degree + 1):
-        values.append(
-            float(math.comb(degree, index))
-            * torch.pow(x, index)
-            * torch.pow(one_minus_x, degree - index)
-        )
-    return torch.stack(values, dim=-1)
+def _grid_coords(shape, device=None) -> torch.Tensor:
+    axes = [torch.arange(v, dtype=torch.long, device=device) for v in shape]
+    return torch.stack(torch.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
 
 
 class BernsteinOctree(nn.Module):
-    """Sparse octree whose leaves are constant, trilinear or step functions (see LEAF_TYPES).
-
-    Physical coefficients c = softplus(logit + attenuation_shift) >= 0 are packed into one vector; every
-    leaf value is a nonnegative weighted average of its coefficients, so the field is >= 0.  Leaf topology,
-    type (degree triple), packed offsets and step geometry are explicit buffers.
-    """
-
     representation = "bernstein_octree"
 
-    def __init__(
-        self,
-        *,
-        levels: Iterable[int | Sequence[int]],
-        leaf_types: Sequence[str] = ("constant", "trilinear", "step"),
-        attenuation_shift: float = -3.0,
-        cuda_integrator: bool = True,
-        max_leaf_count: int | None = None,
-    ):
+    def __init__(self, *, levels: Iterable[int | Sequence[int]], leaf_types: Sequence[str] = TYPE_NAMES,
+                 cuda_integrator: bool = True, max_leaf_count: int | None = None):
         super().__init__()
-        self.level_shapes = [_shape3(value) for value in levels]
-        if not self.level_shapes:
-            raise ValueError("At least one octree resolution is required.")
-        if any(component <= 0 for shape in self.level_shapes for component in shape):
+        self.level_shapes = [_shape3(v) for v in levels]
+        if not self.level_shapes or any(c <= 0 for s in self.level_shapes for c in s):
             raise ValueError("Octree resolutions must be positive.")
         for parent, child in zip(self.level_shapes, self.level_shapes[1:]):
-            if any(child[axis] != 2 * parent[axis] for axis in range(3)):
-                raise ValueError(
-                    "Bernstein octree levels must use dyadic refinement; "
-                    f"got parent={parent}, child={child}."
-                )
+            if any(child[a] != 2 * parent[a] for a in range(3)):
+                raise ValueError(f"Octree levels must refine dyadically; got parent={parent}, child={child}.")
         self.leaf_types = tuple(str(t) for t in leaf_types)
-        if not self.leaf_types or any(t not in LEAF_TYPES for t in self.leaf_types):
-            raise ValueError(f"leaf_types must be a non-empty subset of {list(LEAF_TYPES)}.")
+        if not self.leaf_types or any(t not in TYPE_NAMES for t in self.leaf_types):
+            raise ValueError(f"leaf_types must be a non-empty subset of {list(TYPE_NAMES)}.")
         self.l0_shape = self.level_shapes[0]
-        self.attenuation_shift = float(attenuation_shift)
         self.cuda_integrator = bool(cuda_integrator)
         self.max_leaf_count = int(max_leaf_count) if max_leaf_count is not None else None
-        root_count = math.prod(self.l0_shape)
-        if self.max_leaf_count is not None and self.max_leaf_count < root_count:
+        self._morton_bits = max(1, math.ceil(math.log2(max(self.level_shapes[-1]))))
+        coords = _grid_coords(self.l0_shape)
+        n = coords.shape[0]
+        if self.max_leaf_count is not None and self.max_leaf_count < n:
             raise ValueError("max_leaf_count cannot be smaller than the number of root cells.")
+        self.values = nn.Parameter(torch.zeros(0), requires_grad=False)
+        self.register_buffer("cells", torch.zeros((0, 4), dtype=torch.int32))  # level, x, y, z
+        self.register_buffer("type_counts", torch.zeros(3, dtype=torch.long))  # n_tri, n_step, n_const
+        self.register_buffer("step_geometry", torch.zeros((0, GEOMETRY_WIDTH)))
+        self.register_buffer("root", torch.zeros(0, dtype=torch.int32), persistent=False)
+        self.register_buffer("child_table", torch.zeros((0, 8), dtype=torch.int32), persistent=False)
+        self._assign(torch.zeros(n, dtype=torch.long), coords, torch.zeros(n, dtype=torch.long), torch.zeros(n),
+                     torch.zeros((n, GEOMETRY_WIDTH)))
 
-        base_coords = _all_coords(self.l0_shape)
-        leaf_count = int(base_coords.shape[0])
-        self.coefficient_logits = nn.Parameter(torch.zeros(leaf_count, dtype=torch.float32))
-        self.register_buffer("leaf_levels", torch.zeros(leaf_count, dtype=torch.long), persistent=True)
-        self.register_buffer("leaf_coords", base_coords, persistent=True)
-        self.register_buffer("leaf_degrees", torch.zeros((leaf_count, 3), dtype=torch.long), persistent=True)
-        self.register_buffer("coefficient_offsets", torch.arange(leaf_count + 1, dtype=torch.long), persistent=True)
-        self.register_buffer("coefficient_leaf_ids", torch.arange(leaf_count, dtype=torch.long), persistent=True)
-        self.register_buffer("step_geometry", torch.zeros((leaf_count, 5)), persistent=True)  # n (3), d, w
-        self.register_buffer("node_child_base", torch.empty((0,), dtype=torch.int32), persistent=False)
-        self.register_buffer("node_leaf_id", torch.empty((0,), dtype=torch.int32), persistent=False)
-        for level in range(len(self.level_shapes)):
-            self.register_buffer(self._lookup_linear_name(level), torch.empty((0,), dtype=torch.long), persistent=False)
-            self.register_buffer(self._lookup_leaf_name(level), torch.empty((0,), dtype=torch.long), persistent=False)
-        self._rebuild_packed_topology()
+    # ------------------------------------------------------------------ layout
+    @property
+    def leaf_count(self) -> int:
+        return int(self.cells.shape[0])
 
-    @staticmethod
-    def _lookup_linear_name(level: int) -> str:
-        return f"level_{int(level)}_leaf_linear"
+    @property
+    def leaf_levels(self) -> torch.Tensor:
+        return self.cells[:, 0].long()
 
-    @staticmethod
-    def _lookup_leaf_name(level: int) -> str:
-        return f"level_{int(level)}_leaf_ids"
+    @property
+    def leaf_coords(self) -> torch.Tensor:
+        return self.cells[:, 1:].long()
 
-    def _level_leaf_lookup(self, level: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return getattr(self, self._lookup_linear_name(level)), getattr(self, self._lookup_leaf_name(level))
+    def leaf_type(self) -> torch.Tensor:
+        """(N,) type ids (index into TYPE_NAMES)."""
+        i = torch.arange(self.leaf_count, device=self.cells.device)
+        return torch.where(i < self.n_tri, 1, torch.where(i < self.n_tri + self.n_step, 2, 0))
 
-    def coefficients(self) -> torch.Tensor:
-        return F.softplus(self.coefficient_logits + self.attenuation_shift)
+    def value_offsets(self) -> torch.Tensor:
+        """(N,) offset of each leaf's first value."""
+        i = torch.arange(self.leaf_count, device=self.cells.device)
+        base = 8 * self.n_tri
+        return torch.where(i < self.n_tri, 8 * i, torch.where(i < self.n_tri + self.n_step, base + 2 * (i - self.n_tri),
+                                                                base + 2 * self.n_step + (i - self.n_tri - self.n_step)))
 
-    def _coefficients_to_logits(self, coefficients: torch.Tensor) -> torch.Tensor:
-        return _inverse_softplus(coefficients.clamp_min(1e-12)) - self.attenuation_shift
+    def leaf_mean(self) -> torch.Tensor:
+        """(N,) mean of each leaf's stored values (summaries and the viewer)."""
+        counts = torch.tensor(VALUE_COUNT, device=self.cells.device)[self.leaf_type()]
+        owner = torch.repeat_interleave(torch.arange(self.leaf_count, device=self.cells.device), counts)
+        # values are laid out leaf by leaf in index order, so the owner of value k is the k-th entry of `owner`
+        return torch.zeros(self.leaf_count, device=self.cells.device).index_add(0, owner, self.values.detach()) / counts
 
-    def coefficient_counts(self) -> torch.Tensor:
-        return torch.prod(self.leaf_degrees + 1, dim=1)
+    def geometry(self, ids: torch.Tensor) -> torch.Tensor:
+        """(n, GEOMETRY_WIDTH) geometry rows of leaves `ids` (zeros for leaves that are not steps)."""
+        j = ids - self.n_tri
+        step = (j >= 0) & (j < self.n_step)
+        out = torch.zeros((ids.numel(), GEOMETRY_WIDTH), device=self.cells.device)
+        out[step] = self.step_geometry[j[step]]
+        return out
 
-    def leaf_key(self, leaf_id: int) -> tuple[int, int, int, int]:
-        leaf_id = int(leaf_id)
-        level = int(self.leaf_levels[leaf_id].item())
-        coord = self.leaf_coords[leaf_id].tolist()
-        return level, int(coord[0]), int(coord[1]), int(coord[2])
-
-    def find_leaf(self, key: Sequence[int]) -> int | None:
-        level, x, y, z = (int(value) for value in key)
-        if level < 0 or level >= len(self.level_shapes):
-            return None
-        nx, ny, nz = self.level_shapes[level]
-        if not (0 <= x < nx and 0 <= y < ny and 0 <= z < nz):
-            return None
-        linear, leaf_ids = self._level_leaf_lookup(level)
-        if linear.numel() == 0:
-            return None
-        target = (x * ny + y) * nz + z
-        position = int(torch.searchsorted(linear, linear.new_tensor(target)).item())
-        if position >= int(linear.numel()) or int(linear[position].item()) != target:
-            return None
-        return int(leaf_ids[position].item())
-
-    def _leaf_mu(self) -> torch.Tensor:
-        """Coefficient-domain leaf mean used by summaries and the viewer."""
-        coefficients = self.coefficients()
-        sums = coefficients.new_zeros((self.leaf_levels.shape[0],))
-        sums.scatter_add_(0, self.coefficient_leaf_ids, coefficients)
-        return sums / self.coefficient_counts().to(dtype=coefficients.dtype).clamp_min(1.0)
+    def leaf_values(self, ids: torch.Tensor) -> torch.Tensor:
+        """Values of leaves `ids`, concatenated in that order."""
+        counts = torch.tensor(VALUE_COUNT, device=ids.device)[self.leaf_type()[ids]]
+        starts = torch.cumsum(counts, 0) - counts
+        idx = torch.repeat_interleave(self.value_offsets()[ids] - starts, counts) + torch.arange(int(counts.sum()), device=ids.device)
+        return self.values.detach()[idx]
 
     @torch.no_grad()
-    def _rebuild_packed_topology(self) -> None:
-        self._topology_version = int(getattr(self, "_topology_version", 0)) + 1
-        device = self.coefficient_logits.device
-        root_count = math.prod(self.l0_shape)
-        leaf_count = int(self.leaf_levels.shape[0])
-        if leaf_count < root_count or (leaf_count - root_count) % 7 != 0:
-            raise ValueError("Invalid full-octree topology: leaf count is inconsistent with eight-way splits.")
-        internal_count = (leaf_count - root_count) // 7
-        node_count = root_count + 8 * internal_count
-        child_base = torch.full((node_count,), -1, dtype=torch.int32, device=device)
-        node_leaf_id = torch.full((node_count,), -1, dtype=torch.int32, device=device)
-        next_node = root_count
-        previous_internal_linear = torch.empty((0,), dtype=torch.long, device=device)
-        previous_internal_bases = torch.empty((0,), dtype=torch.long, device=device)
+    def _assign(self, levels, coords, types, values, geometry) -> None:
+        """Set all leaves (any order; `values` concatenated in that order, `geometry` (N, GEOMETRY_WIDTH) per leaf,
+        rows of non-step leaves ignored), sort them into the canonical layout and rebuild the tree."""
+        device = self.cells.device
+        levels, coords, types = levels.to(device).long(), coords.to(device).long(), types.to(device).long()
+        values, geometry = values.to(device).float(), geometry.to(device).float()
+        counts = torch.tensor(VALUE_COUNT, device=device)[types]
+        corner = coords << (len(self.level_shapes) - 1 - levels)[:, None]
+        rank = torch.tensor(_ORDER_RANK, device=device)[types]
+        order = torch.argsort((rank << (3 * self._morton_bits)) | morton(corner, self._morton_bits))
+        new_counts = counts[order]
+        starts = torch.cumsum(counts, 0) - counts
+        new_starts = torch.cumsum(new_counts, 0) - new_counts
+        idx = torch.repeat_interleave(starts[order] - new_starts, new_counts) + torch.arange(int(new_counts.sum()), device=device)
+        types = types[order]
+        self.values = nn.Parameter(values[idx].clamp_min(0).contiguous(), requires_grad=False)
+        self.cells = torch.cat([levels[order, None], coords[order]], 1).to(torch.int32).contiguous()
+        self.type_counts = torch.stack([(types == 1).sum(), (types == 2).sum(), (types == 0).sum()]).long()
+        self.step_geometry = geometry[order][types == 2].contiguous()
+        self._rebuild_tree()
 
-        for level, shape in enumerate(self.level_shapes):
-            _, ny, nz = shape
-            mask = self.leaf_levels == level
-            if torch.any(mask):
-                coords = self.leaf_coords[mask].to(device=device, dtype=torch.long)
-                leaf_ids = torch.nonzero(mask, as_tuple=False).reshape(-1).to(device=device, dtype=torch.long)
-                linear = (coords[:, 0] * ny + coords[:, 1]) * nz + coords[:, 2]
-                linear, order = torch.sort(linear)
-                leaf_ids = leaf_ids[order]
-            else:
-                linear = torch.empty((0,), dtype=torch.long, device=device)
-                leaf_ids = torch.empty((0,), dtype=torch.long, device=device)
-            setattr(self, self._lookup_linear_name(level), linear.contiguous())
-            setattr(self, self._lookup_leaf_name(level), leaf_ids.contiguous())
-
-            if level == 0:
-                leaf_nodes = linear
-            elif linear.numel():
-                coords = self.leaf_coords[leaf_ids]
-                _, parent_ny, parent_nz = self.level_shapes[level - 1]
-                parent = torch.div(coords, 2, rounding_mode="floor")
-                parent_linear = (parent[:, 0] * parent_ny + parent[:, 1]) * parent_nz + parent[:, 2]
-                parent_positions = torch.searchsorted(previous_internal_linear, parent_linear)
-                if torch.any(parent_positions >= previous_internal_linear.numel()) or torch.any(
-                    previous_internal_linear[parent_positions] != parent_linear
-                ):
-                    raise ValueError("Invalid octree topology: leaf parent is not an internal node.")
-                child_index = (coords[:, 0] & 1) * 4 + (coords[:, 1] & 1) * 2 + (coords[:, 2] & 1)
-                leaf_nodes = previous_internal_bases[parent_positions] + child_index
-            else:
-                leaf_nodes = torch.empty((0,), dtype=torch.long, device=device)
-            if leaf_nodes.numel():
-                node_leaf_id[leaf_nodes] = leaf_ids.to(dtype=torch.int32)
-
-            if level + 1 >= len(self.level_shapes):
-                continue
-            deeper = self.leaf_levels > level
-            if torch.any(deeper):
-                deeper_levels = self.leaf_levels[deeper]
-                deeper_coords = self.leaf_coords[deeper]
-                divisors = torch.pow(
-                    torch.full_like(deeper_levels, 2), deeper_levels - level
-                )[:, None]
-                internal_coords = torch.div(deeper_coords, divisors, rounding_mode="floor")
-                internal_linear = (
-                    (internal_coords[:, 0] * ny + internal_coords[:, 1]) * nz
-                    + internal_coords[:, 2]
-                )
-                internal_linear = torch.unique(internal_linear, sorted=True)
-            else:
-                internal_linear = torch.empty((0,), dtype=torch.long, device=device)
-
-            if level == 0:
-                internal_nodes = internal_linear
-            elif internal_linear.numel():
-                _, parent_ny, parent_nz = self.level_shapes[level - 1]
-                x = torch.div(internal_linear, ny * nz, rounding_mode="floor")
-                remainder = internal_linear - x * ny * nz
-                y = torch.div(remainder, nz, rounding_mode="floor")
-                z = remainder - y * nz
-                parent_x, parent_y, parent_z = x // 2, y // 2, z // 2
-                parent_linear = (parent_x * parent_ny + parent_y) * parent_nz + parent_z
-                positions = torch.searchsorted(previous_internal_linear, parent_linear)
-                if torch.any(positions >= previous_internal_linear.numel()) or torch.any(
-                    previous_internal_linear[positions] != parent_linear
-                ):
-                    raise ValueError("Invalid octree topology: internal node parent is missing.")
-                child_index = (x & 1) * 4 + (y & 1) * 2 + (z & 1)
-                internal_nodes = previous_internal_bases[positions] + child_index
-            else:
-                internal_nodes = torch.empty((0,), dtype=torch.long, device=device)
-            bases = torch.arange(
-                next_node,
-                next_node + 8 * int(internal_nodes.numel()),
-                8,
-                dtype=torch.long,
-                device=device,
-            )
-            if internal_nodes.numel():
-                child_base[internal_nodes] = bases.to(dtype=torch.int32)
-            next_node += 8 * int(internal_nodes.numel())
-            previous_internal_linear = internal_linear
-            previous_internal_bases = bases
-
-        if next_node != node_count:
-            raise ValueError(f"Packed octree node count mismatch: built {next_node}, expected {node_count}.")
-        if torch.any((child_base >= 0) & (node_leaf_id >= 0)):
-            raise ValueError("Packed octree node cannot be both internal and a leaf.")
-        if int(torch.sum(node_leaf_id >= 0).item()) != leaf_count:
-            raise ValueError("Packed octree did not assign every leaf exactly once.")
-        self.node_child_base = child_base.contiguous()
-        self.node_leaf_id = node_leaf_id.contiguous()
+    @torch.no_grad()
+    def _rebuild_tree(self) -> None:
+        self.n_tri, self.n_step, self.n_const = (int(v) for v in self.type_counts.tolist())
+        device = self.cells.device
+        levels, coords = self.leaf_levels, self.leaf_coords
+        L = len(self.level_shapes)
+        linear = lambda c, s: (c[:, 0] * s[1] + c[:, 1]) * s[2] + c[:, 2]
+        keys, base = [], [0]
+        for l in range(L):  # sorted linear keys of the internal nodes of every level
+            deeper = levels > l
+            k = torch.unique(linear(coords[deeper] >> (levels[deeper] - l)[:, None], self.level_shapes[l])) if l + 1 < L else \
+                torch.zeros(0, dtype=torch.long, device=device)
+            keys.append(k)
+            base.append(base[-1] + int(k.numel()))
+        root = torch.full((math.prod(self.l0_shape),), _MISSING, dtype=torch.long, device=device)
+        children = torch.full((base[-1], 8), _MISSING, dtype=torch.long, device=device)
+        ids = torch.arange(self.leaf_count, device=device)
+        for l in range(L):
+            leaf = levels == l
+            entries = [(coords[leaf], ids[leaf]), (None, -1 - (base[l] + torch.arange(keys[l].numel(), device=device)))]
+            for c, value in entries:
+                if c is None:  # internal nodes of this level, from their keys
+                    s = self.level_shapes[l]
+                    k = keys[l]
+                    c = torch.stack([k // (s[1] * s[2]), (k // s[2]) % s[1], k % s[2]], 1)
+                if l == 0:
+                    root[linear(c, self.l0_shape)] = value
+                elif c.numel():
+                    parent = base[l - 1] + torch.searchsorted(keys[l - 1], linear(c >> 1, self.level_shapes[l - 1]))
+                    children[parent, (c[:, 0] & 1) * 4 + (c[:, 1] & 1) * 2 + (c[:, 2] & 1)] = value
+        if bool((root == _MISSING).any()) or bool((children == _MISSING).any()):
+            raise ValueError("Invalid octree: a cell is neither a leaf nor an internal node.")
+        self.root = root.to(torch.int32).contiguous()
+        self.child_table = children.to(torch.int32).contiguous()
 
     def resolve_leaf_ids(self, points: torch.Tensor) -> torch.Tensor:
-        flat_points = points.reshape(-1, 3)
-        leaf_ids = torch.full((flat_points.shape[0],), -1, dtype=torch.long, device=flat_points.device)
-        valid = torch.all((flat_points >= -1.0) & (flat_points <= 1.0), dim=1)
-        point_ids = torch.nonzero(valid, as_tuple=False).reshape(-1)
-        if point_ids.numel() == 0:
-            return leaf_ids.reshape(points.shape[:-1])
-        root_shape = torch.tensor(self.l0_shape, dtype=flat_points.dtype, device=flat_points.device)
-        coords = torch.floor((flat_points[point_ids] + 1.0) * 0.5 * root_shape).long()
-        coords = torch.minimum(torch.maximum(coords, torch.zeros_like(coords)), root_shape.long() - 1)
-        nodes = (coords[:, 0] * self.l0_shape[1] + coords[:, 1]) * self.l0_shape[2] + coords[:, 2]
-        for level in range(len(self.level_shapes)):
-            candidates = self.node_leaf_id[nodes].long()
-            hit = candidates >= 0
-            if torch.any(hit):
-                leaf_ids[point_ids[hit]] = candidates[hit]
-            keep = ~hit
-            if not torch.any(keep) or level + 1 >= len(self.level_shapes):
+        """Leaf index containing each point (-1 outside [-1, 1]^3)."""
+        p = points.reshape(-1, 3)
+        inside = torch.all((p >= -1.0) & (p <= 1.0), dim=1)
+        v = None
+        for l, shape in enumerate(self.level_shapes):
+            s = torch.tensor(shape, device=p.device)
+            c = torch.minimum(torch.floor((p + 1.0) * 0.5 * s).long().clamp_min(0), s - 1)
+            if l == 0:
+                v = self.root[(c[:, 0] * shape[1] + c[:, 1]) * shape[2] + c[:, 2]].long()
+                continue
+            inner = v < 0
+            if not bool(inner.any()):
                 break
-            point_ids = point_ids[keep]
-            nodes = nodes[keep]
-            child_base = self.node_child_base[nodes].long()
-            if torch.any(child_base < 0):
-                raise RuntimeError("Packed octree traversal reached an unassigned node.")
-            shape = torch.tensor(
-                self.level_shapes[level + 1],
-                dtype=flat_points.dtype,
-                device=flat_points.device,
-            )
-            child_coords = torch.floor(
-                (flat_points[point_ids] + 1.0) * 0.5 * shape
-            ).long()
-            child_coords = torch.minimum(
-                torch.maximum(child_coords, torch.zeros_like(child_coords)),
-                shape.long() - 1,
-            )
-            child_index = (child_coords[:, 0] & 1) * 4 + (child_coords[:, 1] & 1) * 2 + (child_coords[:, 2] & 1)
-            nodes = child_base + child_index
-        return leaf_ids.reshape(points.shape[:-1])
+            slot = (c[inner, 0] & 1) * 4 + (c[inner, 1] & 1) * 2 + (c[inner, 2] & 1)
+            v[inner] = self.child_table[-1 - v[inner], slot].long()
+        return torch.where(inside, v, -1).reshape(points.shape[:-1])
+
+    def ids_of_cells(self, cells: torch.Tensor) -> torch.Tensor:
+        """Leaf indices of cells (n, 4) = level, x, y, z (each must be a leaf)."""
+        shapes = torch.tensor(self.level_shapes, dtype=torch.float32, device=cells.device)[cells[:, 0].long()]
+        return self.resolve_leaf_ids((cells[:, 1:].float() + 0.5) / shapes * 2 - 1)
+
+    def uses_cuda(self) -> bool:
+        return self.cuda_integrator and self.values.is_cuda and has_bernstein_native()
+
+    def find_leaf(self, key: Sequence[int]) -> int | None:
+        """Index of the leaf at cell (level, x, y, z), or None."""
+        level, *xyz = (int(v) for v in key)
+        if not 0 <= level < len(self.level_shapes) or any(not 0 <= c < n for c, n in zip(xyz, self.level_shapes[level])):
+            return None
+        centre = (torch.tensor(xyz, dtype=torch.float32, device=self.cells.device) + 0.5) / torch.tensor(self.level_shapes[level], device=self.cells.device) * 2 - 1
+        leaf = int(self.resolve_leaf_ids(centre[None])[0])
+        return leaf if leaf >= 0 and self.cells[leaf].tolist() == [level, *xyz] else None
+
+    # ------------------------------------------------------------------ evaluation
+    def local_coords(self, ids: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+        shapes = torch.tensor(self.level_shapes, dtype=points.dtype, device=points.device)[self.leaf_levels[ids]]
+        return (points + 1.0) * 0.5 * shapes - self.leaf_coords[ids].to(points.dtype)
 
     def forward_mu_with_leaf_ids(self, points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        original_shape = points.shape[:-1]
-        flat_points = points.reshape(-1, 3)
-        leaf_ids = self.resolve_leaf_ids(flat_points).reshape(-1)
-        values = flat_points.new_zeros((flat_points.shape[0],), dtype=torch.float32)
-        valid = leaf_ids >= 0
-        if not torch.any(valid):
-            return values.reshape(original_shape), leaf_ids.reshape(original_shape)
-
-        valid_point_ids = torch.nonzero(valid, as_tuple=False).reshape(-1)
-        valid_leaf_ids = leaf_ids[valid]
-        point_degrees = self.leaf_degrees[valid_leaf_ids]
-        # softplus(coefficient_logits) is a whole-model transform; compute it
-        # once per call instead of once per distinct degree group, otherwise a
-        # batch spanning both p0 and p1 leaves (any post-compression model)
-        # redoes it multiple times per chunk, and a full-volume/slice decode
-        # multiplies that by thousands of chunks.
-        physical_coefficients = self.coefficients()
-        for degree_tensor in unique_degree_rows(point_degrees):
-            degree = tuple(int(value) for value in degree_tensor.tolist())
-            degree_mask = torch.all(point_degrees == degree_tensor, dim=1)
-            point_ids = valid_point_ids[degree_mask]
-            group_leaf_ids = valid_leaf_ids[degree_mask]
-            levels = self.leaf_levels[group_leaf_ids]
-            resolutions = torch.tensor(
-                self.level_shapes,
-                dtype=flat_points.dtype,
-                device=flat_points.device,
-            )[levels]
-            coords = self.leaf_coords[group_leaf_ids].to(dtype=flat_points.dtype)
-            local = (flat_points[point_ids] + 1.0) * 0.5 * resolutions - coords
-            if degree == LEAF_TYPES["step"]:
-                g = self.step_geometry[group_leaf_ids]
-                s = ((local.clamp(0.0, 1.0) - 0.5) * g[:, :3]).sum(1) - g[:, 3]
-                H = torch.where(g[:, 4] > 0, torch.sigmoid(s / g[:, 4].clamp_min(1e-30)), (s > 0).to(s.dtype))
-                c = physical_coefficients[self.coefficient_offsets[group_leaf_ids, None] + torch.arange(2, device=flat_points.device)]
-                values[point_ids] = (1 - H) * c[:, 0] + H * c[:, 1]
-                continue
-            bx = bernstein_basis(degree[0], local[:, 0])
-            by = bernstein_basis(degree[1], local[:, 1])
-            bz = bernstein_basis(degree[2], local[:, 2])
-            weights = torch.einsum("ni,nj,nk->nijk", bx, by, bz).reshape(point_ids.shape[0], -1)
-            offsets = torch.arange(weights.shape[1], device=flat_points.device, dtype=torch.long)
-            coefficient_ids = self.coefficient_offsets[group_leaf_ids, None] + offsets[None, :]
-            coefficients = physical_coefficients[coefficient_ids]
-            values[point_ids] = torch.sum(coefficients * weights, dim=1)
-        return values.reshape(original_shape), leaf_ids.reshape(original_shape)
+        flat = points.reshape(-1, 3)
+        leaf = self.resolve_leaf_ids(flat)
+        out = torch.zeros(flat.shape[0], device=flat.device)
+        sel = torch.nonzero(leaf >= 0).flatten()
+        ids = leaf[sel]
+        u = self.local_coords(ids, flat[sel]).clamp(0.0, 1.0)
+        off = self.value_offsets()[ids]
+        kind = self.leaf_type()[ids]
+        v = self.values
+        out = out.index_put((sel[kind == 0],), v[off[kind == 0]])
+        t = kind == 1
+        out = out.index_put((sel[t],), (trilinear_weights(u[t]) * v[off[t, None] + torch.arange(8, device=flat.device)]).sum(1))
+        t = kind == 2
+        H = step_H(self.step_geometry[ids[t] - self.n_tri], u[t])
+        out = out.index_put((sel[t],), (1 - H) * v[off[t]] + H * v[off[t] + 1])
+        return out.reshape(points.shape[:-1]), leaf.reshape(points.shape[:-1])
 
     def forward_mu(self, points: torch.Tensor) -> torch.Tensor:
         return self.forward_mu_with_leaf_ids(points)[0]
 
-    def _parallel_ray_segments(self, ray_batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Vectorized exact cell-boundary segmentation for parallel rays."""
-        device = self.coefficient_logits.device
-        dtype = self.coefficient_logits.dtype
-        effective_angles = -ray_batch.angles.to(device=device, dtype=dtype)
-        rows = ray_batch.rows.to(device=device, dtype=dtype)
-        cols = ray_batch.cols.to(device=device, dtype=dtype)
-        ca = torch.cos(effective_angles)
-        sa = torch.sin(effective_angles)
-        directions = torch.stack([ca, sa], dim=1)
-        u_axes = torch.stack([-sa, ca], dim=1)
-        u = -1.0 + (cols + 0.5) * 2.0 / float(ray_batch.detector_w)
-        z = -1.0 + (rows + 0.5) * 2.0 / float(ray_batch.detector_h)
-        bases = u_axes * u[:, None]
+    def decoded_at_resolution(self, resolution: int | tuple[int, int, int], *, chunk: int = 1 << 20) -> torch.Tensor:
+        shape = _shape3(resolution)
+        device = self.cells.device
+        scale = torch.tensor(shape, dtype=torch.float32, device=device)
+        total, ny, nz = math.prod(shape), shape[1], shape[2]
+        out = []
+        for start in range(0, total, int(chunk)):
+            i = torch.arange(start, min(start + int(chunk), total), device=device)
+            c = torch.stack([i // (ny * nz), (i // nz) % ny, i % nz], 1).float()
+            out.append(self.forward_mu(-1.0 + (c + 0.5) * 2.0 / scale))
+        return torch.cat(out).reshape(shape)
 
-        eps = 1e-8
-        t_min = torch.full((directions.shape[0],), -1e20, dtype=dtype, device=device)
+    # ------------------------------------------------------------------ rays (PyTorch reference of the CUDA traversal)
+    @staticmethod
+    def _ray_frame(ray_batch, device, dtype):
+        a = -ray_batch.angles.to(device=device, dtype=dtype)
+        u = -1.0 + (ray_batch.cols.to(device=device, dtype=dtype) + 0.5) * 2.0 / float(ray_batch.detector_w)
+        z = -1.0 + (ray_batch.rows.to(device=device, dtype=dtype) + 0.5) * 2.0 / float(ray_batch.detector_h)
+        direction = torch.stack([torch.cos(a), torch.sin(a)], 1)
+        base = torch.stack([-torch.sin(a), torch.cos(a)], 1) * u[:, None]
+        return direction, base, z
+
+    def _parallel_ray_segments(self, ray_batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(ray, leaf, [t0, t1]) segments, cut at every finest-level cell boundary."""
+        device, dtype, eps = self.cells.device, torch.float32, 1e-8
+        direction, base, z = self._ray_frame(ray_batch, device, dtype)
+        t_min = torch.full((direction.shape[0],), -1e20, device=device)
         t_max = torch.full_like(t_min, 1e20)
-        valid_ray = torch.ones_like(t_min, dtype=torch.bool)
+        valid = torch.ones_like(t_min, dtype=torch.bool)
+        cuts = []
         for axis in range(2):
-            direction = directions[:, axis]
-            base = bases[:, axis]
-            parallel = direction.abs() < eps
-            valid_ray &= (~parallel) | ((base >= -1.0) & (base <= 1.0))
-            denominator = torch.where(parallel, torch.ones_like(direction), direction)
-            t0 = (-1.0 - base) / denominator
-            t1 = (1.0 - base) / denominator
+            d, b = direction[:, axis], base[:, axis]
+            parallel = d.abs() < eps
+            valid &= ~parallel | ((b >= -1) & (b <= 1))
+            den = torch.where(parallel, torch.ones_like(d), d)
+            t0, t1 = (-1 - b) / den, (1 - b) / den
             t_min = torch.where(parallel, t_min, torch.maximum(t_min, torch.minimum(t0, t1)))
             t_max = torch.where(parallel, t_max, torch.minimum(t_max, torch.maximum(t0, t1)))
-        valid_ray &= t_max > t_min
-
-        candidates = [t_min[:, None], t_max[:, None]]
-        for axis in range(2):
-            finest_resolution = self.level_shapes[-1][axis]
-            boundaries = -1.0 + torch.arange(
-                1,
-                finest_resolution,
-                dtype=dtype,
-                device=device,
-            ) * (2.0 / float(finest_resolution))
-            direction = directions[:, axis]
-            denominator = torch.where(direction.abs() < eps, torch.ones_like(direction), direction)
-            crossings = (boundaries[None, :] - bases[:, axis, None]) / denominator[:, None]
-            inside = (
-                (direction.abs() >= eps)[:, None]
-                & (crossings > t_min[:, None] + eps)
-                & (crossings < t_max[:, None] - eps)
-            )
-            crossings = torch.where(inside, crossings, torch.full_like(crossings, float("inf")))
-            candidates.append(crossings)
-        sorted_t = torch.sort(torch.cat(candidates, dim=1), dim=1).values
-        starts = sorted_t[:, :-1]
-        stops = sorted_t[:, 1:]
-        valid_segment = (
-            valid_ray[:, None]
-            & torch.isfinite(starts)
-            & torch.isfinite(stops)
-            & (stops > starts + eps)
-        )
-        ray_grid = torch.arange(ray_batch.num_rays, device=device)[:, None].expand_as(starts)
-        ray_ids = ray_grid[valid_segment]
-        starts = starts[valid_segment]
-        stops = stops[valid_segment]
+            n = self.level_shapes[-1][axis]
+            bounds = -1.0 + torch.arange(1, n, device=device, dtype=dtype) * (2.0 / n)
+            cuts.append(((bounds[None] - b[:, None]) / den[:, None], parallel))
+        valid &= t_max > t_min
+        cand = [t_min[:, None], t_max[:, None]]
+        for c, parallel in cuts:
+            keep = ~parallel[:, None] & (c > t_min[:, None] + eps) & (c < t_max[:, None] - eps)
+            cand.append(torch.where(keep, c, torch.full_like(c, float("inf"))))
+        t = torch.sort(torch.cat(cand, 1), 1).values
+        starts, stops = t[:, :-1], t[:, 1:]
+        ok = valid[:, None] & torch.isfinite(starts) & torch.isfinite(stops) & (stops > starts + eps)
+        ray_ids = torch.arange(ray_batch.num_rays, device=device)[:, None].expand_as(starts)[ok]
+        starts, stops = starts[ok], stops[ok]
         mid = 0.5 * (starts + stops)
-        xy = bases[ray_ids] + directions[ray_ids] * mid[:, None]
-        points = torch.stack([xy[:, 0], xy[:, 1], z[ray_ids]], dim=1)
-        leaf_ids = self.resolve_leaf_ids(points).reshape(-1)
-        valid_leaf = leaf_ids >= 0
-        return ray_ids[valid_leaf], leaf_ids[valid_leaf], torch.stack([starts[valid_leaf], stops[valid_leaf]], dim=1)
-
-    def exact_ray_cell_contributions(self, ray_batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        ray_ids, leaf_ids, intervals = self._parallel_ray_segments(ray_batch)
-        segment_integrals = intervals.new_zeros((intervals.shape[0],))
-        segment_degrees = self.leaf_degrees[leaf_ids]
-        for degree_tensor in unique_degree_rows(segment_degrees):
-            degree_mask = torch.all(segment_degrees == degree_tensor, dim=1)
-            segment_ids = torch.nonzero(degree_mask, as_tuple=False).reshape(-1)
-            degree = tuple(int(value) for value in degree_tensor.tolist())
-            if degree == LEAF_TYPES["step"]:
-                leaves, iv = leaf_ids[segment_ids], intervals[segment_ids]
-                u0 = self.segment_local_coords(ray_batch, ray_ids[segment_ids], leaves, iv[:, 0])
-                u1 = self.segment_local_coords(ray_batch, ray_ids[segment_ids], leaves, iv[:, 1])
-                g = self.step_geometry[leaves]
-                length = iv[:, 1] - iv[:, 0]
-                I = step_integral(g, ((u0 - 0.5) * g[:, :3]).sum(1), ((u1 - 0.5) * g[:, :3]).sum(1), length)
-                c = self.coefficients()[self.coefficient_offsets[leaves, None] + torch.arange(2, device=iv.device)]
-                segment_integrals[segment_ids] = c[:, 0] * (length - I) + c[:, 1] * I
-                continue
-            quadrature_order = max(1, int(math.ceil((sum(degree) + 1) / 2.0)))
-            nodes_np, weights_np = np.polynomial.legendre.leggauss(quadrature_order)
-            nodes = torch.tensor(nodes_np, dtype=intervals.dtype, device=intervals.device)
-            weights = torch.tensor(weights_np, dtype=intervals.dtype, device=intervals.device)
-            selected_intervals = intervals[segment_ids]
-            half = 0.5 * (selected_intervals[:, 1] - selected_intervals[:, 0])
-            centre = 0.5 * (selected_intervals[:, 1] + selected_intervals[:, 0])
-            t = centre[:, None] + half[:, None] * nodes[None, :]
-
-            effective_angles = -ray_batch.angles.to(device=intervals.device, dtype=intervals.dtype)
-            ca = torch.cos(effective_angles)
-            sa = torch.sin(effective_angles)
-            directions = torch.stack([ca, sa], dim=1)
-            u_axes = torch.stack([-sa, ca], dim=1)
-            cols = ray_batch.cols.to(device=intervals.device, dtype=intervals.dtype)
-            rows = ray_batch.rows.to(device=intervals.device, dtype=intervals.dtype)
-            u = -1.0 + (cols + 0.5) * 2.0 / float(ray_batch.detector_w)
-            z = -1.0 + (rows + 0.5) * 2.0 / float(ray_batch.detector_h)
-            bases = u_axes * u[:, None]
-            selected_rays = ray_ids[segment_ids]
-            xy = bases[selected_rays, None, :] + directions[selected_rays, None, :] * t[:, :, None]
-            points = torch.stack(
-                [
-                    xy[:, :, 0],
-                    xy[:, :, 1],
-                    z[selected_rays, None].expand_as(t),
-                ],
-                dim=2,
-            )
-            values = self.forward_mu(points.reshape(-1, 3)).reshape(segment_ids.shape[0], quadrature_order)
-            segment_integrals[segment_ids] = half * torch.sum(values * weights[None, :], dim=1)
-
-        keys = ray_ids * int(self.leaf_levels.shape[0]) + leaf_ids
-        unique_keys, inverse = torch.unique(keys, return_inverse=True)
-        totals = segment_integrals.new_zeros((unique_keys.shape[0],))
-        totals.scatter_add_(0, inverse, segment_integrals)
-        return (
-            torch.div(unique_keys, int(self.leaf_levels.shape[0]), rounding_mode="floor"),
-            torch.remainder(unique_keys, int(self.leaf_levels.shape[0])),
-            totals,
-        )
+        xy = base[ray_ids] + direction[ray_ids] * mid[:, None]
+        leaf = self.resolve_leaf_ids(torch.stack([xy[:, 0], xy[:, 1], z[ray_ids]], 1))
+        keep = leaf >= 0
+        return ray_ids[keep], leaf[keep], torch.stack([starts[keep], stops[keep]], 1)
 
     def segment_local_coords(self, ray_batch, ray_ids: torch.Tensor, leaf_ids: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Leaf-local coordinates u in [0, 1]^3 of the points at ray parameter t (same convention as _parallel_ray_segments)."""
-        a = -ray_batch.angles.to(device=t.device, dtype=t.dtype)[ray_ids]
-        u = -1.0 + (ray_batch.cols.to(device=t.device, dtype=t.dtype)[ray_ids] + 0.5) * 2.0 / float(ray_batch.detector_w)
-        z = -1.0 + (ray_batch.rows.to(device=t.device, dtype=t.dtype)[ray_ids] + 0.5) * 2.0 / float(ray_batch.detector_h)
-        points = torch.stack([-torch.sin(a) * u + torch.cos(a) * t, torch.cos(a) * u + torch.sin(a) * t, z], dim=1)
-        shapes = torch.tensor(self.level_shapes, dtype=t.dtype, device=t.device)[self.leaf_levels[leaf_ids]]
-        return (points + 1.0) * 0.5 * shapes - self.leaf_coords[leaf_ids].to(t.dtype)
-
-    def _can_use_cuda_integrator(self, ray_batch) -> bool:
-        return self.cuda_integrator and self.coefficient_logits.is_cuda and has_bernstein_native()
-
-    def _cuda_integrator_arguments(self, ray_batch) -> dict:
-        return {
-            "coefficient_logits": self.coefficient_logits,
-            "leaf_degrees": self.leaf_degrees,
-            "coefficient_offsets": self.coefficient_offsets,
-            "step_geometry": self.step_geometry,
-            "node_child_base": self.node_child_base,
-            "node_leaf_id": self.node_leaf_id,
-            "angles": ray_batch.angles.to(device=self.coefficient_logits.device, dtype=torch.float32),
-            "rows": ray_batch.rows.to(device=self.coefficient_logits.device, dtype=torch.long),
-            "cols": ray_batch.cols.to(device=self.coefficient_logits.device, dtype=torch.long),
-            "detector_h": int(ray_batch.detector_h),
-            "detector_w": int(ray_batch.detector_w),
-            "level_shapes": self.level_shapes,
-            "attenuation_shift": self.attenuation_shift,
-        }
-
-    def ray_cell_contributions(self, ray_batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sparse (ray, leaf, line-integral) tuples."""
-        if self._can_use_cuda_integrator(ray_batch):
-            return bernstein_octree_ray_segments(**self._cuda_integrator_arguments(ray_batch))
-        return self.exact_ray_cell_contributions(ray_batch)
+        """Leaf-local coordinates of the points at ray parameter t."""
+        direction, base, z = self._ray_frame(ray_batch, t.device, t.dtype)
+        xy = base[ray_ids] + direction[ray_ids] * t[:, None]
+        return self.local_coords(leaf_ids, torch.stack([xy[:, 0], xy[:, 1], z[ray_ids]], 1))
 
     def integrate_ray_batch(self, ray_batch) -> torch.Tensor:
-        """Exact line integrals (CUDA traversal, or the PyTorch reference implementation on CPU)."""
-        if self._can_use_cuda_integrator(ray_batch):
-            return bernstein_octree_integrate(**self._cuda_integrator_arguments(ray_batch))
-        ray_ids, _, contributions = self.exact_ray_cell_contributions(ray_batch)
-        prediction = contributions.new_zeros((ray_batch.num_rays,))
-        prediction.scatter_add_(0, ray_ids, contributions)
-        return prediction
+        """Exact line integrals (CUDA traversal, or the PyTorch reference on CPU; differentiable in values and step geometry)."""
+        if self.uses_cuda():
+            return bernstein_octree_integrate(self.values, self.step_geometry, **self.tree_arguments(), rays=ray_batch)
+        ray_ids, leaf, iv = self._parallel_ray_segments(ray_batch)
+        u0 = self.segment_local_coords(ray_batch, ray_ids, leaf, iv[:, 0])
+        u1 = self.segment_local_coords(ray_batch, ray_ids, leaf, iv[:, 1])
+        length = iv[:, 1] - iv[:, 0]
+        kind = self.leaf_type()[leaf]
+        off = self.value_offsets()[leaf]
+        v = self.values
+        seg = torch.zeros_like(length)
+        seg = seg.index_put((kind == 0,), v[off[kind == 0]] * length[kind == 0])
+        t = kind == 1
+        tri = sum(0.5 * trilinear_weights(u0[t] + (u1[t] - u0[t]) * q) for q in (0.5 - 0.5 / math.sqrt(3.0), 0.5 + 0.5 / math.sqrt(3.0)))
+        seg = seg.index_put((t,), length[t] * (tri * v[off[t, None] + torch.arange(8, device=v.device)]).sum(1))
+        t = kind == 2
+        g = self.step_geometry[leaf[t] - self.n_tri]
+        I = step_integral(g, ((u0[t] - 0.5) * g[:, :3]).sum(1), ((u1[t] - 0.5) * g[:, :3]).sum(1), length[t])
+        seg = seg.index_put((t,), v[off[t]] * (length[t] - I) + v[off[t] + 1] * I)
+        return torch.zeros(ray_batch.num_rays, device=v.device).index_add(0, ray_ids, seg)
 
-    def decoded_at_resolution(self, resolution: int | tuple[int, int, int], *, chunk: int | None = None) -> torch.Tensor:
-        if isinstance(resolution, int):
-            shape = (int(resolution),) * 3
-        else:
-            shape = tuple(int(value) for value in resolution)
-        device = self.coefficient_logits.device
-        scale = torch.tensor(shape, dtype=torch.float32, device=device)
-        if chunk is None:
-            axes = [torch.arange(value, dtype=torch.float32, device=device) for value in shape]
-            xx, yy, zz = torch.meshgrid(*axes, indexing="ij")
-            coords = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
-            points = -1.0 + (coords + 0.5) * 2.0 / scale
-            return self.forward_mu(points).reshape(shape)
+    def tree_arguments(self) -> dict:
+        return {"root": self.root, "children": self.child_table, "n_tri": self.n_tri, "n_step": self.n_step,
+                "level_shapes": self.level_shapes}
 
-        # Do not materialize a resolution^3 coordinate mesh before chunking.
-        # At 384^3, xx/yy/zz + stacked coords + points can require several
-        # GiB even though each actual query batch is small.  Decode linear
-        # indices into xyz coordinates inside each batch instead.
-        nx, ny, nz = shape
-        total = int(nx) * int(ny) * int(nz)
-        values = []
-        for start in range(0, total, int(chunk)):
-            stop = min(start + int(chunk), total)
-            linear = torch.arange(start, stop, dtype=torch.long, device=device)
-            x = torch.div(linear, int(ny) * int(nz), rounding_mode="floor")
-            remainder = linear - x * int(ny) * int(nz)
-            y = torch.div(remainder, int(nz), rounding_mode="floor")
-            z = remainder - y * int(nz)
-            coords = torch.stack([x, y, z], dim=1).to(dtype=torch.float32)
-            points = -1.0 + (coords + 0.5) * 2.0 / scale
-            values.append(self.forward_mu(points))
-        return torch.cat(values, dim=0).reshape(shape)
+    # ------------------------------------------------------------------ structure changes
+    def _rest(self, ids: torch.Tensor):
+        """Leaves other than `ids`: (levels, coords, types, values, geometry)."""
+        keep = torch.ones(self.leaf_count, dtype=torch.bool, device=self.cells.device)
+        keep[ids] = False
+        k = torch.nonzero(keep).flatten()
+        return self.leaf_levels[k], self.leaf_coords[k], self.leaf_type()[k], self.leaf_values(k), self.geometry(k)
 
-
-    @torch.no_grad()
-    def _replace_leaves(
-        self,
-        removed_leaf_ids: torch.Tensor,
-        new_levels: torch.Tensor,
-        new_coords: torch.Tensor,
-        new_degrees: torch.Tensor,
-        new_blocks: Sequence[torch.Tensor] | torch.Tensor,
-        new_geometry: torch.Tensor | None = None,
-    ) -> None:
-        device = self.coefficient_logits.device
-        removed_leaf_ids = torch.unique(removed_leaf_ids.to(device=device, dtype=torch.long))
-        removed_leaf_ids = removed_leaf_ids[(removed_leaf_ids >= 0) & (removed_leaf_ids < self.leaf_levels.shape[0])]
-        remove_leaf_mask = torch.zeros(self.leaf_levels.shape[0], dtype=torch.bool, device=device)
-        remove_leaf_mask[removed_leaf_ids] = True
-        keep_leaf_mask = ~remove_leaf_mask
-        keep_coefficient_mask = ~remove_leaf_mask[self.coefficient_leaf_ids]
-
-        physical = self.coefficients().detach()
-        kept_coefficients = physical[keep_coefficient_mask]
-        if isinstance(new_blocks, torch.Tensor):
-            appended_coefficients = new_blocks.to(device=device, dtype=physical.dtype).reshape(-1)
-        else:
-            appended_coefficients = (
-                torch.cat([block.reshape(-1).to(device=device, dtype=physical.dtype) for block in new_blocks], dim=0)
-                if new_blocks
-                else physical.new_empty((0,))
-            )
-        coefficients = torch.cat([kept_coefficients, appended_coefficients], dim=0)
-        levels = torch.cat([self.leaf_levels[keep_leaf_mask], new_levels.to(device=device, dtype=torch.long)], dim=0)
-        coords = torch.cat([self.leaf_coords[keep_leaf_mask], new_coords.to(device=device, dtype=torch.long)], dim=0)
-        degrees = torch.cat([self.leaf_degrees[keep_leaf_mask], new_degrees.to(device=device, dtype=torch.long)], dim=0)
-        if new_geometry is None:
-            new_geometry = torch.zeros((new_levels.shape[0], 5), device=device)
-        geometry = torch.cat([self.step_geometry[keep_leaf_mask], new_geometry.to(device=device, dtype=torch.float32)], dim=0)
-        counts = torch.prod(degrees + 1, dim=1)
-        offsets = torch.cat(
-            [torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(counts, dim=0)],
-            dim=0,
-        )
-        owners = torch.repeat_interleave(torch.arange(levels.shape[0], device=device), counts)
-
-        self.coefficient_logits = nn.Parameter(self._coefficients_to_logits(coefficients).contiguous())
-        self.leaf_levels = levels.contiguous()
-        self.leaf_coords = coords.contiguous()
-        self.leaf_degrees = degrees.contiguous()
-        self.coefficient_offsets = offsets.contiguous()
-        self.coefficient_leaf_ids = owners.contiguous()
-        self.step_geometry = geometry.contiguous()
-        self._rebuild_packed_topology()
+    def _replace(self, ids, levels, coords, types, values, geometry) -> None:
+        rest = self._rest(ids)
+        self._assign(*(torch.cat([a, b.to(a.device, a.dtype)]) for a, b in zip(rest, (levels, coords, types, values, geometry))))
 
     @torch.no_grad()
     def split_leaves_batch(self, leaf_ids) -> int:
@@ -698,139 +399,95 @@ class BernsteinOctree(nn.Module):
         step children keep both values with geometry n' = n, d' = 2d - n . (o - 1/2), w' = 2w (o = child offset),
         except children where one side of the step fills < 2% of the volume: those become constant (mean value).
         Returns the number of split leaves (capped by max_leaf_count)."""
-        device = self.coefficient_logits.device
-        ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=device), sorted=True)
-        ids = ids[(ids >= 0) & (ids < self.leaf_levels.shape[0])]
+        device = self.cells.device
+        ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=device))
+        ids = ids[(ids >= 0) & (ids < self.leaf_count)]
         if self.max_leaf_count is not None:
-            ids = ids[: max(0, (int(self.max_leaf_count) - int(self.leaf_levels.shape[0])) // 7)]
+            ids = ids[: max(0, (self.max_leaf_count - self.leaf_count) // 7)]
         if ids.numel() == 0:
             return 0
-        if torch.any(self.leaf_levels[ids] + 1 >= len(self.level_shapes)):
+        if bool((self.leaf_levels[ids] + 1 >= len(self.level_shapes)).any()):
             raise ValueError("At least one selected leaf is already at maximum octree depth.")
-        kind = type_ids(self.leaf_degrees[ids])
-        ids = torch.cat([ids[kind == 0], ids[kind == 1], ids[kind == 2]])  # grouped by type
-        n0, n1 = int((kind == 0).sum()), int((kind == 1).sum())
-        physical = self.coefficients().detach()
-        child_offsets = _all_coords(2, device=device)
-        constant_children = physical[self.coefficient_offsets[ids[:n0]]].repeat_interleave(8)
-        parents = physical[self.coefficient_offsets[ids[n0 : n0 + n1], None] + torch.arange(8, device=device)].reshape(-1, 2, 2, 2)
+        kind = self.leaf_type()[ids]
+        offsets = _grid_coords((2, 2, 2), device)  # child o, slot 4 x + 2 y + z
+        off = self.value_offsets()[ids]
+        v = self.values.detach()
+        types = kind.repeat_interleave(8)
+        geometry = torch.zeros((ids.numel(), 8, GEOMETRY_WIDTH), device=device)
+        vals = torch.zeros((ids.numel(), 8, 8), device=device)  # up to 8 values per child
+        c = kind == 0
+        vals[c, :, 0] = v[off[c]][:, None]
+        c = kind == 1
+        parents = v[off[c, None] + torch.arange(8, device=device)].reshape(-1, 2, 2, 2)
         half = parents.new_tensor([[1.0, 0.0], [0.5, 0.5], [0.0, 1.0]])  # corner values at 0, 1/2, 1 per axis
         lattice = torch.einsum("ai,bj,ck,nijk->nabc", half, half, half, parents)
-        trilinear_children = torch.stack(
-            [lattice[:, x : x + 2, y : y + 2, z : z + 2] for x, y, z in child_offsets.tolist()], dim=1
-        ).reshape(-1)
-        step_ids = ids[n0 + n1 :]
-        c_step = physical[self.coefficient_offsets[step_ids, None] + torch.arange(2, device=device)]  # (s, 2)
-        g = self.step_geometry[step_ids][:, None, :]
-        shift = (g[..., :3] * (child_offsets[None].float() - 0.5)).sum(-1)
-        child_geometry = torch.cat([g[..., :3].expand(-1, 8, -1), (2 * g[..., 3] - shift)[..., None], (2 * g[..., 4]).expand(-1, 8)[..., None]], -1)
+        vals[c] = torch.stack([lattice[:, x : x + 2, y : y + 2, z : z + 2].reshape(-1, 8) for x, y, z in offsets.tolist()], 1)
+        c = kind == 2
+        pair = torch.stack([v[off[c]], v[off[c] + 1]], 1)
+        g = self.step_geometry[ids[c] - self.n_tri][:, None, :]
+        shift = (g[..., :3] * (offsets[None].float() - 0.5)).sum(-1)
+        cg = torch.cat([g[..., :3].expand(-1, 8, -1), (2 * g[..., 3] - shift)[..., None], (2 * g[..., 4]).expand(-1, 8)[..., None]], -1)
         # A child where one side of the step fills < 2% of its volume becomes a constant leaf (its mean value):
         # the value on the small side would hardly affect any ray and drift unconstrained in the solve.
         q = (torch.arange(4, device=device, dtype=torch.float32) + 0.5) / 4
         u = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
-        sv = ((u[None, None] - 0.5) * child_geometry[..., None, :3]).sum(-1) - child_geometry[..., 3:4]
-        mean_h = torch.where(child_geometry[..., 4:5] > 0, torch.sigmoid(sv / child_geometry[..., 4:5].clamp_min(1e-30)), (sv > 0).float()).mean(-1)
-        flat = (torch.minimum(mean_h, 1 - mean_h) < 0.02).reshape(-1)  # (s * 8,)
-        pair = c_step[:, None, :].expand(-1, 8, -1).reshape(-1, 2)
-        mean_value = ((1 - mean_h) * c_step[:, None, 0] + mean_h * c_step[:, None, 1]).reshape(-1)
-        counts = torch.where(flat, 1, 2)
-        starts = torch.cumsum(counts, 0) - counts
-        step_children = torch.zeros(int(counts.sum()), device=device)
-        step_children[starts[flat]] = mean_value[flat]
-        step_children[starts[~flat]] = pair[~flat, 0]
-        step_children[starts[~flat] + 1] = pair[~flat, 1]
-        degrees = self.leaf_degrees[ids][:, None, :].expand(-1, 8, -1).reshape(-1, 3).clone()
-        degrees[(n0 + n1) * 8 :][flat] = 0
-        geometry = torch.zeros((ids.numel() * 8, 5), device=device)
-        geometry[(n0 + n1) * 8 :] = torch.where(flat[:, None], 0.0, child_geometry.reshape(-1, 5))
-        self._replace_leaves(
-            ids,
-            (self.leaf_levels[ids][:, None] + 1).expand(-1, 8).reshape(-1),
-            (self.leaf_coords[ids][:, None, :] * 2 + child_offsets[None]).reshape(-1, 3),
-            degrees,
-            torch.cat([constant_children, trilinear_children, step_children]),
-            geometry,
-        )
+        sv = ((u[None, None] - 0.5) * cg[..., None, :3]).sum(-1) - cg[..., 3:4]
+        mean_h = torch.where(cg[..., 4:5] > 0, torch.sigmoid(sv / cg[..., 4:5].clamp_min(1e-30)), (sv > 0).float()).mean(-1)
+        flat = torch.minimum(mean_h, 1 - mean_h) < 0.02
+        vals[c, :, 0] = torch.where(flat, (1 - mean_h) * pair[:, None, 0] + mean_h * pair[:, None, 1], pair[:, None, 0].expand(-1, 8))
+        vals[c, :, 1] = pair[:, None, 1]
+        geometry[c] = pad_geometry(cg.reshape(-1, 5)).reshape(-1, 8, GEOMETRY_WIDTH)
+        kc = types.reshape(-1, 8)
+        kc[c] = torch.where(flat, 0, 2)
+        types = kc.reshape(-1)
+        counts = torch.tensor(VALUE_COUNT, device=device)[types]
+        values = vals.reshape(-1, 8)[torch.arange(8, device=device)[None] < counts[:, None]]
+        self._replace(ids, (self.leaf_levels[ids] + 1).repeat_interleave(8), (self.leaf_coords[ids][:, None] * 2 + offsets[None]).reshape(-1, 3),
+                      types, values, geometry.reshape(-1, GEOMETRY_WIDTH))
         return int(ids.numel())
 
     @torch.no_grad()
-    def set_types(self, leaf_ids, types: torch.Tensor, values: torch.Tensor, geometry: torch.Tensor) -> None:
-        """Replace leaves in place (same cell) by leaves of type ``types`` (0 constant, 1 trilinear, 2 step) with
-        the given physical values (concatenated in leaf order) and step geometry (rows used only by step leaves)."""
-        device = self.coefficient_logits.device
+    def set_types(self, leaf_ids, types, values: torch.Tensor, geometry: torch.Tensor) -> None:
+        """Replace leaves (same cells) by leaves of type `types` with the given values (concatenated in leaf order)
+        and geometry rows (n, >= 5; used by step leaves)."""
+        device = self.cells.device
         ids = torch.as_tensor(leaf_ids, dtype=torch.long, device=device)
         types = torch.as_tensor(types, dtype=torch.long, device=device)
         if ids.numel() == 0:
             return
-        allowed = torch.tensor([name in self.leaf_types for name in TYPE_NAMES], device=device)
+        allowed = torch.tensor([t in self.leaf_types for t in TYPE_NAMES], device=device)
         if not bool(allowed[types].all()):
             raise ValueError(f"leaf types outside {self.leaf_types}")
-        degrees = torch.tensor([LEAF_TYPES[name] for name in TYPE_NAMES], device=device)[types]
-        self._replace_leaves(ids, self.leaf_levels[ids], self.leaf_coords[ids], degrees, values, geometry)
+        self._replace(ids, self.leaf_levels[ids], self.leaf_coords[ids], types, values, pad_geometry(geometry.to(device).float()))
 
     @torch.no_grad()
     def to_trilinear(self, leaf_ids) -> None:
-        """Turn constant leaves into trilinear leaves with all 8 corners equal to the constant (same function)."""
-        device = self.coefficient_logits.device
-        ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=device))
-        ids = ids[type_ids(self.leaf_degrees[ids]) == 0]
-        values = self.coefficients().detach()[self.coefficient_offsets[ids]]
-        self.set_types(ids, torch.ones_like(ids), values[:, None].expand(-1, 8).reshape(-1), torch.zeros((ids.numel(), 5), device=device))
+        """Constant leaves -> trilinear leaves with all 8 corners equal to the constant (same function)."""
+        ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=self.cells.device))
+        ids = ids[self.leaf_type()[ids] == 0]
+        c = self.values.detach()[self.value_offsets()[ids]]
+        self.set_types(ids, torch.ones_like(ids), c.repeat_interleave(8), torch.zeros((ids.numel(), 5)))
 
-    def stats(self) -> BernsteinStats:
-        active_by_level = [
-            int(torch.sum(self.leaf_levels == level).item()) for level in range(len(self.level_shapes))
-        ]
-        parameter_count = int(self.coefficient_logits.numel())
-        model_bytes = int(self.coefficient_logits.numel() * self.coefficient_logits.element_size())
-        model_bytes += sum(
-            int(buffer.numel() * buffer.element_size())
-            for buffer in (
-                self.leaf_levels,
-                self.leaf_coords,
-                self.leaf_degrees,
-                self.coefficient_offsets,
-                self.coefficient_leaf_ids,
-                self.node_child_base,
-                self.node_leaf_id,
-            )
-        )
-        return BernsteinStats(
-            parameter_count=parameter_count,
-            model_bytes=model_bytes,
-            l0_cells=math.prod(self.l0_shape),
-            l0_active=active_by_level[0] if active_by_level else 0,
-            l1_active=active_by_level[1] if len(active_by_level) > 1 else 0,
-            l2_active=active_by_level[2] if len(active_by_level) > 2 else 0,
-            l3_active=active_by_level[3] if len(active_by_level) > 3 else 0,
-            active_by_level=tuple(active_by_level),
-            leaf_cells=int(self.leaf_levels.shape[0]),
-            max_depth=max((level for level, count in enumerate(active_by_level) if count > 0), default=0),
-            representation=self.representation,
-            coefficient_count=parameter_count,
+    def stats(self) -> OctreeStats:
+        by_level = tuple(int((self.cells[:, 0] == l).sum()) for l in range(len(self.level_shapes)))
+        return OctreeStats(
+            leaf_cells=self.leaf_count,
+            active_by_level=by_level,
+            max_depth=max((l for l, n in enumerate(by_level) if n), default=0),
+            value_count=int(self.values.numel()),
             leaf_types=self.leaf_types,
-            leaf_type_counts=tuple(torch.bincount(type_ids(self.leaf_degrees), minlength=3).tolist()),
+            leaf_type_counts=(self.n_const, self.n_tri, self.n_step),
         )
 
+    # ------------------------------------------------------------------ checkpoints
     def prepare_sparse_from_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
-        required = {
-            "coefficient_logits",
-            "leaf_levels",
-            "leaf_coords",
-            "leaf_degrees",
-            "coefficient_offsets",
-            "coefficient_leaf_ids",
-            "step_geometry",
-        }
-        missing = sorted(required.difference(state_dict))
-        if missing:
-            raise ValueError(f"Bernstein checkpoint is missing fields: {missing}.")
-        device = self.coefficient_logits.device
-        self.coefficient_logits = nn.Parameter(torch.empty_like(state_dict["coefficient_logits"], device=device))
-        for name in required.difference({"coefficient_logits"}):
+        """Resize the leaf arrays to a checkpoint before load_state_dict."""
+        device = self.cells.device
+        self.values = nn.Parameter(torch.empty_like(state_dict["values"], device=device), requires_grad=False)
+        for name in ("cells", "type_counts", "step_geometry"):
             setattr(self, name, torch.empty_like(state_dict[name], device=device))
 
     def load_state_dict(self, state_dict, strict: bool = True):
         result = super().load_state_dict(state_dict, strict=strict)
-        self._rebuild_packed_topology()
+        self._rebuild_tree()
         return result

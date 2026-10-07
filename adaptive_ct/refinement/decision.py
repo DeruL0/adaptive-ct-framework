@@ -31,7 +31,7 @@ import torch
 from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
 from adaptive_ct.core.projector import bernstein_octree_decision_accumulate
-from adaptive_ct.representation.octree import TYPE_NAMES, step_integral, type_ids
+from adaptive_ct.representation.octree import TYPE_NAMES, pad_geometry, step_integral, trilinear_weights
 from adaptive_ct.training.regularizer import basis_rows, face_samples
 
 OPTIONS = ("constant", "trilinear", "step", "split")  # column order of gains / extra bytes
@@ -54,7 +54,7 @@ def resolvable_mask(model, *, detector_h: int, detector_w: int, min_footprint_px
 
 @torch.no_grad()
 def candidate_step_geometry(model, *, detector_w: int, grid: int = 5, chunk: int = 20000) -> torch.Tensor:
-    """(N, 5) step geometry (n, d, w) per leaf from the current reconstruction: n = main direction of the
+    """(N, GEOMETRY_WIDTH) step geometry (n, d, w) per leaf from the current reconstruction: n = main direction of the
     gradient second-moment matrix over the leaf and a quarter-leaf margin, d = gradient-weighted centre along
     n, w = half a detector pixel (in leaf units)."""
     device = model.leaf_levels.device
@@ -76,7 +76,7 @@ def candidate_step_geometry(model, *, detector_w: int, grid: int = 5, chunk: int
         d = (weight * s).sum(1) / weight.sum(1).clamp_min(1e-12)
         d = torch.maximum(torch.minimum(d, 0.8 * extent), -0.8 * extent)
         out[a:b] = torch.cat([n, d[:, None], (0.5 * shapes[a:b, 0] / detector_w)[:, None]], 1)
-    return out
+    return pad_geometry(out)
 
 
 def decision_views(split, count: int, offset: int) -> list[int]:
@@ -100,19 +100,15 @@ def _accumulate_reference(model, batch, residual, fold, candidate, acc):
     """PyTorch reference of the CUDA accumulation (used on CPU)."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
-    kind = type_ids(model.leaf_degrees)
-    coeff = model.coefficients().detach()
-    offs = model.coefficient_offsets
+    kind = model.leaf_type()
+    coeff = model.values.detach()
+    offs = model.value_offsets()
     ray_ids, leaf_ids, iv = model._parallel_ray_segments(batch)
     u0 = model.segment_local_coords(batch, ray_ids, leaf_ids, iv[:, 0])
     u1 = model.segment_local_coords(batch, ray_ids, leaf_ids, iv[:, 1])
     L = iv[:, 1] - iv[:, 0]
     S = L.numel()
-    tri = torch.zeros((S, 8), device=device)
-    for qq in (0.5 - 0.5 / math.sqrt(3.0), 0.5 + 0.5 / math.sqrt(3.0)):  # exact: cubic along the segment
-        u = u0 + (u1 - u0) * qq
-        p = torch.stack([1 - u, u], -1)
-        tri += 0.5 * L[:, None] * (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(S, 8)
+    tri = sum(0.5 * L[:, None] * trilinear_weights(u0 + (u1 - u0) * q) for q in (0.5 - 0.5 / math.sqrt(3.0), 0.5 + 0.5 / math.sqrt(3.0)))
 
     def step_weights(g):
         I = step_integral(g, ((u0 - 0.5) * g[:, :3]).sum(1), ((u1 - 0.5) * g[:, :3]).sum(1), L)
@@ -129,7 +125,7 @@ def _accumulate_reference(model, batch, residual, fold, candidate, acc):
     m = k == 1
     cur[m] = (tri[m] * coeff[offs[leaf_ids[m], None] + torch.arange(8, device=device)]).sum(1)
     m = k == 2
-    cur[m] = (step_weights(model.step_geometry[leaf_ids])[m] * coeff[offs[leaf_ids[m], None] + torch.arange(2, device=device)]).sum(1)
+    cur[m] = (step_weights(model.geometry(leaf_ids))[m] * coeff[offs[leaf_ids[m], None] + torch.arange(2, device=device)]).sum(1)
     uniq, inv = torch.unique(ray_ids * N + leaf_ids, return_inverse=True)
     feat = torch.zeros((uniq.numel(), 20), device=device).index_add_(
         0, inv, torch.cat([L[:, None], tri, step_weights(candidate[leaf_ids]), child, cur[:, None]], 1))
@@ -158,7 +154,7 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor) -> torch.Te
     plus the faces between the 8 children (current jump 0, alpha = area)."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
-    coeff = model.coefficients().detach()
+    coeff = model.values.detach()
     acc = torch.zeros((N, STRIDE), device=device)
 
     def value(ids, u):
@@ -169,8 +165,7 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor) -> torch.Te
         fi, fj = value(i_ids, ui), value(j_ids, uj)
         s = (area * (float(delta) / (fi - fj).abs().clamp_min(1e-30)).clamp(max=1.0)).sqrt()
         for ids, u, f, g in ((i_ids, ui, fi, fj), (j_ids, uj, fj, fi)):
-            p = torch.stack([1 - u, u], -1)
-            tri = (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(-1, 8)
+            tri = trilinear_weights(u)
             cg = candidate[ids]
             H = torch.sigmoid((((u - 0.5) * cg[:, :3]).sum(1) - cg[:, 3]) / cg[:, 4].clamp_min(1e-30))
             child = torch.nn.functional.one_hot((u[:, 0] > 0.5).long() * 4 + (u[:, 1] > 0.5).long() * 2 + (u[:, 2] > 0.5).long(), 8).float()
@@ -204,9 +199,9 @@ def local_statistics(model, split, views: list[int], candidate: torch.Tensor, pr
         batch = parallel_rays(split.angles[v].expand(rows.numel()), rows, cols, detector_h=h, detector_w=w,
                               targets=split.projections[v].reshape(-1))
         residual = model.integrate_ray_batch(batch).detach() - batch.target
-        if model._can_use_cuda_integrator(batch):
-            bernstein_octree_decision_accumulate(**model._cuda_integrator_arguments(batch), candidate_geometry=candidate, residual=residual,
-                                                 fold=torch.full((rows.numel(),), position % 2, device=device), accum=acc)
+        if model.uses_cuda():
+            bernstein_octree_decision_accumulate(model.values, model.step_geometry, **model.tree_arguments(), rays=batch, candidate_geometry=candidate,
+                                                 residual=residual, fold=torch.full((rows.numel(),), position % 2, device=device), accum=acc)
         else:
             _accumulate_reference(model, batch, residual, position % 2, candidate, acc)
     out = {"b2": acc[:, :, 95].double(), "r2": acc[:, :, 96].double()}
@@ -343,21 +338,21 @@ def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: 
 
 
 @torch.no_grad()
-def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, quantization, action_share, min_footprint_px,
+def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, action_share, min_footprint_px,
                      penalty_weight, penalty_delta, frozen=None) -> tuple[dict, torch.Tensor]:
     """One structure / type decision on a solved model; applies the chosen batch.  `frozen` (N,) marks leaves
     that may not change type.  Returns a report and the cells (level, x, y, z) whose type changed."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
-    kind = type_ids(model.leaf_degrees)
+    kind = model.leaf_type()
     candidate = candidate_step_geometry(model, detector_w=detector_w)
     prior = 0.5 * float(penalty_weight) * penalty_statistics(model, penalty_delta, candidate) if penalty_weight > 0 else None
     acc = local_statistics(model, split, views, candidate, prior)
     del prior
     gains = evaluate_options(acc, -child_minimum(model))
-    per_leaf = leaf_bytes(quantization).to(device)
+    per_leaf = leaf_bytes().to(device)
     extra = torch.stack([per_leaf[0] - per_leaf[kind], per_leaf[1] - per_leaf[kind], per_leaf[2] - per_leaf[kind],
-                         split_bytes(kind, quantization)], 1).double()
+                         split_bytes(kind)], 1)
     type_allowed = torch.tensor([t in model.leaf_types for t in TYPE_NAMES], device=device)
     allowed = torch.zeros((N, 4), dtype=torch.bool, device=device)
     allowed[:, :3] = type_allowed[None, :] & (torch.arange(3, device=device)[None, :] != kind[:, None])
@@ -367,7 +362,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     if frozen is not None:
         allowed[:, :3] &= ~frozen[:, None]
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
-    bytes_now = model_bytes(model, quantization)
+    bytes_now = model_bytes(model)
     remaining = float(byte_budget - bytes_now)
     ids, option, lam = choose(gains, extra, allowed, action_share * max(remaining, 0.0))
     if model.max_leaf_count is not None:  # leaf-count cap: drop splits beyond it
@@ -390,15 +385,14 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     change = option < 3
     t_ids, t_new = ids[change], option[change]
     changed_cells = torch.cat([model.leaf_levels[t_ids, None], model.leaf_coords[t_ids]], 1)
+    split_cells = model.cells[ids[~change]].long()  # leaf indices change with every edit; cells do not
     if t_ids.numel():
         geometry = torch.where((t_new == 2)[:, None], candidate[t_ids], torch.zeros_like(candidate[t_ids]))
         vals = project_onto_types(model, t_ids, t_new, geometry)
         model.set_types(t_ids, t_new, vals, geometry)
-    # 2. splits (function preserving); leaf ids shifted by the replaced leaves
-    s_ids = ids[~change]
-    if s_ids.numel():
-        removed = torch.sort(t_ids).values
-        model.split_leaves_batch(s_ids - torch.searchsorted(removed, s_ids))
-    report["bytes_after"] = model_bytes(model, quantization)
-    report["leaf_type_counts"] = dict(zip(TYPE_NAMES, torch.bincount(type_ids(model.leaf_degrees), minlength=3).tolist()))
+    # 2. splits (function preserving)
+    if split_cells.numel():
+        model.split_leaves_batch(model.ids_of_cells(split_cells))
+    report["bytes_after"] = model_bytes(model)
+    report["leaf_type_counts"] = dict(zip(TYPE_NAMES, torch.bincount(model.leaf_type(), minlength=3).tolist()))
     return report, changed_cells

@@ -10,7 +10,6 @@ def build_model(config: Dict) -> BernsteinOctree:
     return BernsteinOctree(
         levels=model_cfg["levels"],
         leaf_types=tuple(model_cfg["leaf_types"]),
-        attenuation_shift=float(model_cfg.get("attenuation_shift", -3.0)),
         cuda_integrator=bool(model_cfg.get("cuda_integrator", True)),
         max_leaf_count=model_cfg.get("max_leaf_count"),
     )

@@ -5,35 +5,33 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from adaptive_ct.codec.artifact import export_compact_octree_artifact, load_compact_octree_state_dict
+from adaptive_ct.codec.artifact import SCHEMA, export_octree_artifact, load_octree_artifact
+from adaptive_ct.codec.budget import model_bytes
 from adaptive_ct.codec.quantize import quantize_roundtrip_
 from adaptive_ct.representation.octree import BernsteinOctree
 from tests.representation.test_octree import make_step
 
 
-class CompactFileTests(unittest.TestCase):
+class StoredFileTests(unittest.TestCase):
     def _round_trip(self, levels, build):
-        model = BernsteinOctree(levels=levels, leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+        model = BernsteinOctree(levels=levels, leaf_types=("constant", "trilinear", "step"))
         build(model)
         with torch.no_grad():
-            model.coefficient_logits.copy_(model._coefficients_to_logits(0.1 + 0.8 * torch.rand_like(model.coefficient_logits)))
-        quantize_roundtrip_(model, "float16")  # the file must reproduce the deployed (fp16) model
+            model.values.copy_(0.1 + 0.8 * torch.rand_like(model.values))
+        quantize_roundtrip_(model)  # the file must reproduce the deployed model exactly
         points = torch.rand((512, 3)) * 1.998 - 0.999
         expected = model.forward_mu(points).detach()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "model.npz"
-            export_compact_octree_artifact(model, path, quantization="float16")
+            export_octree_artifact(model, path)
             with np.load(path, allow_pickle=False) as payload:
-                self.assertEqual([list(row) for row in payload["level_shapes"].tolist()],
-                                 [list(s) for s in model.level_shapes])
-                self.assertNotIn("leaf_coords", payload.files)  # recovered from the packed hierarchy
-            restored = BernsteinOctree(levels=levels, leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
-            state, metadata = load_compact_octree_state_dict(restored, path)
-            restored.prepare_sparse_from_state_dict(state)
-            restored.load_state_dict(state)
+                raw = sum(payload[k].nbytes for k in ("root_bits", "masks", "types", "trilinear", "step", "step_geometry", "constant"))
+            restored = BernsteinOctree(levels=levels, leaf_types=("constant", "trilinear", "step"))
+            header = load_octree_artifact(restored, path)
             actual = restored.forward_mu(points).detach()
-        self.assertEqual(metadata["schema"], "compact_octree_typed_v4")
-        self.assertTrue(torch.allclose(actual, expected, atol=1e-5))
+        self.assertEqual(header["schema"], SCHEMA)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertLessEqual(raw, model_bytes(model))  # the budget counts every stored byte
 
     def test_anisotropic_three_type_round_trip(self):
         def build(model):

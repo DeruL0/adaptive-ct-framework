@@ -1,5 +1,9 @@
-"""Compact file of the deployed octree: packed hierarchy (node arrays), leaf types, physical coefficients and
-step geometry (direction angles, d, w of the step leaves) in fp16."""
+"""Stored file of the deployed octree (the format codec/budget.py counts).
+
+Breadth-first order: root cells in raster order, then the children of every internal node (slot 4 x + 2 y + z)
+level by level.  Stored: one bit per root cell (1 = internal), one 8-bit mask per internal node (bit j = child j
+is internal), a 2-bit type per leaf, and the leaves' values by type in fp16 (step geometry packed, codec/quantize.py).
+No pointers or coordinates: the decoder recovers them from the order."""
 
 from __future__ import annotations
 
@@ -10,114 +14,96 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from adaptive_ct.codec.quantize import angles_to_direction, direction_to_angles
-from adaptive_ct.representation.octree import type_ids
+from adaptive_ct.codec.budget import model_bytes
+from adaptive_ct.codec.quantize import pack_geometry, unpack_geometry
+from adaptive_ct.representation.octree import GEOMETRY_WIDTH, VALUE_COUNT, pad_geometry
 
-SCHEMA = "compact_octree_typed_v4"
+SCHEMA = "typed_octree_bfs_v5"
 
 
 @dataclass(frozen=True)
-class CompactOctreeSummary:
+class ArtifactSummary:
     leaf_count: int
-    coefficient_count: int
-    quantization: str
-    raw_payload_bytes: int
+    value_count: int
+    stored_bytes: int
     file_bytes: int
 
 
-def _all_coords_np(shape) -> np.ndarray:
-    axes = [np.arange(value, dtype=np.int64) for value in shape]
-    return np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+def _pack2(t: np.ndarray) -> np.ndarray:
+    t = np.concatenate([t, np.zeros((-len(t)) % 4, dtype=np.uint8)]).reshape(-1, 4)
+    return (t[:, 0] | (t[:, 1] << 2) | (t[:, 2] << 4) | (t[:, 3] << 6)).astype(np.uint8)
 
 
-def _children_np(parent_coords: np.ndarray) -> np.ndarray:
-    offsets = _all_coords_np((2, 2, 2))
-    return (parent_coords[:, None, :] * 2 + offsets[None, :, :]).reshape(-1, 3)
+def _unpack2(b: np.ndarray, n: int) -> np.ndarray:
+    return np.stack([(b >> s) & 3 for s in (0, 2, 4, 6)], 1).reshape(-1)[:n]
 
 
 @torch.no_grad()
-def export_compact_octree_artifact(model, path: str | Path, *, quantization: str = "float16") -> CompactOctreeSummary:
-    quantization = str(quantization).lower()
-    if quantization not in {"float16", "float32"}:
-        raise ValueError("compact octree quantization must be 'float16' or 'float32'.")
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    coefficients = model.coefficients().detach().float().cpu().numpy()
+def export_octree_artifact(model, path: str | Path) -> ArtifactSummary:
+    entries = model.root.long()
+    root_bits = (entries < 0).cpu().numpy()
+    masks, order = [], []
+    while entries.numel():
+        order.append(entries[entries >= 0])
+        rows = model.child_table[-1 - entries[entries < 0]].long()
+        masks.append(((rows < 0).long() << torch.arange(8, device=rows.device)).sum(1))
+        entries = rows.reshape(-1)
+    order = torch.cat(order)
+    types = model.leaf_type()[order]
+    off = model.value_offsets()[order]
+    v = model.values.detach()
+    tri, step, const = order[types == 1], off[types == 2], off[types == 0]
     arrays = {
-        "node_child_base": model.node_child_base.detach().cpu().numpy().astype(np.int32),
-        "node_leaf_id": model.node_leaf_id.detach().cpu().numpy().astype(np.int32),
-        "leaf_degrees": model.leaf_degrees.detach().cpu().numpy().astype(np.uint8),
-        "leaf_count": np.asarray([int(model.leaf_levels.shape[0])], dtype=np.uint32),
-        "level_shapes": np.asarray(model.level_shapes, dtype=np.uint16),
-        "attenuation_shift": np.asarray([float(model.attenuation_shift)], dtype=np.float32),
-        "coefficients": coefficients.astype(np.float16 if quantization == "float16" else np.float32),
+        "root_bits": np.packbits(root_bits),
+        "masks": torch.cat(masks).to(torch.uint8).cpu().numpy(),
+        "types": _pack2(types.to(torch.uint8).cpu().numpy()),
+        "trilinear": v[(8 * tri)[:, None] + torch.arange(8, device=v.device)].half().cpu().numpy(),
+        "step": torch.stack([v[step], v[step + 1]], 1).half().cpu().numpy(),
+        "step_geometry": pack_geometry(model.step_geometry[order[types == 2] - model.n_tri]).to(torch.int64).cpu().numpy().astype(np.uint32),
+        "constant": v[const].half().cpu().numpy(),
+        "header": np.asarray([json.dumps({"schema": SCHEMA, "levels": [list(s) for s in model.level_shapes], "leaves": model.leaf_count})]),
     }
-    step = (type_ids(model.leaf_degrees) == 2).detach().cpu()
-    g = model.step_geometry.detach().float().cpu()[step]
-    arrays["step_geometry"] = torch.cat([direction_to_angles(g[:, :3]), g[:, 3:]], 1).numpy().astype(arrays["coefficients"].dtype)
-    metadata = {"schema": SCHEMA, "quantization": quantization}
-    arrays["metadata_json"] = np.asarray([json.dumps(metadata, sort_keys=True)], dtype="<U1024")
-    np.savez_compressed(output_path, **arrays)
-    return CompactOctreeSummary(
-        leaf_count=int(model.leaf_levels.shape[0]),
-        coefficient_count=int(coefficients.size),
-        quantization=quantization,
-        raw_payload_bytes=int(sum(value.nbytes for value in arrays.values())),
-        file_bytes=int(output_path.stat().st_size),
-    )
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **arrays)
+    return ArtifactSummary(model.leaf_count, int(model.values.numel()), model_bytes(model), path.stat().st_size)
 
 
-def load_compact_octree_state_dict(model, path: str | Path, *, device=None) -> tuple[dict[str, torch.Tensor], dict]:
-    """Reconstruct a BernsteinOctree state_dict from a compact `.npz` file."""
-    target_device = torch.device(device) if device is not None else model.coefficient_logits.device
-    with np.load(Path(path), allow_pickle=False) as payload:
-        metadata = json.loads(str(payload["metadata_json"][0]))
-        if metadata.get("schema") != SCHEMA:
-            raise ValueError(f"Unsupported compact octree schema: {metadata.get('schema')!r}")
-        shapes = [tuple(int(v) for v in row) for row in payload["level_shapes"].tolist()]
-        if shapes != [tuple(s) for s in model.level_shapes]:
-            raise ValueError(f"Compact octree levels {shapes} do not match model config {model.level_shapes}.")
-        model.attenuation_shift = float(payload["attenuation_shift"][0])
-        node_child_base = payload["node_child_base"].astype(np.int64)
-        node_leaf_id = payload["node_leaf_id"].astype(np.int64)
-        leaf_count = int(payload["leaf_count"][0])
-        leaf_degrees = payload["leaf_degrees"].astype(np.int64)
-        coefficients = payload["coefficients"].astype(np.float32)
-        step_rows = torch.from_numpy(payload["step_geometry"].astype(np.float32))
-
-    # Walk the packed hierarchy level by level to recover each leaf's level and coordinates.
-    leaf_levels = np.full((leaf_count,), -1, dtype=np.int64)
-    leaf_coords = np.full((leaf_count, 3), -1, dtype=np.int64)
-    node_ids = np.arange(int(np.prod(shapes[0])), dtype=np.int64)
-    coords = _all_coords_np(shapes[0])
-    for level in range(len(shapes)):
-        leaves = node_leaf_id[node_ids]
-        is_leaf = leaves >= 0
-        leaf_levels[leaves[is_leaf]] = level
-        leaf_coords[leaves[is_leaf]] = coords[is_leaf]
-        if is_leaf.all():
-            break
-        if level + 1 >= len(shapes):
-            raise ValueError("Packed hierarchy continues beyond configured levels.")
-        bases = node_child_base[node_ids[~is_leaf]]
-        node_ids = (bases[:, None] + np.arange(8)[None, :]).reshape(-1)
-        coords = _children_np(coords[~is_leaf])
-    if np.any(leaf_levels < 0):
-        raise ValueError("Packed hierarchy did not reconstruct every leaf.")
-    counts = np.prod(leaf_degrees + 1, axis=1)
-    offsets = np.concatenate([[0], np.cumsum(counts)])
-    if int(offsets[-1]) != coefficients.size:
-        raise ValueError("Compact octree coefficient count does not match the leaf degrees.")
-    t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device=target_device)
-    step_geometry = torch.zeros((leaf_count, 5))
-    step_geometry[type_ids(torch.from_numpy(leaf_degrees)) == 2] = torch.cat([angles_to_direction(step_rows[:, :2]), step_rows[:, 2:]], 1)
-    state_dict = {
-        "coefficient_logits": model._coefficients_to_logits(t(coefficients)).contiguous(),
-        "leaf_levels": t(leaf_levels),
-        "leaf_coords": t(leaf_coords),
-        "leaf_degrees": t(leaf_degrees),
-        "coefficient_offsets": t(offsets.astype(np.int64)),
-        "coefficient_leaf_ids": t(np.repeat(np.arange(leaf_count), counts)),
-        "step_geometry": step_geometry.to(target_device),
-    }
-    return state_dict, metadata
+@torch.no_grad()
+def load_octree_artifact(model, path: str | Path) -> dict:
+    """Fill `model` (same level shapes) from a stored file; returns the header."""
+    with np.load(Path(path), allow_pickle=False) as f:
+        header = json.loads(str(f["header"][0]))
+        if header["schema"] != SCHEMA:
+            raise ValueError(f"Unsupported octree file schema: {header['schema']!r}")
+        if [tuple(s) for s in header["levels"]] != [tuple(s) for s in model.level_shapes]:
+            raise ValueError(f"Octree file levels {header['levels']} do not match the model {model.level_shapes}.")
+        a = {k: f[k] for k in f.files}
+    shape = model.l0_shape
+    coords = np.stack(np.meshgrid(*[np.arange(n) for n in shape], indexing="ij"), -1).reshape(-1, 3)
+    internal = np.unpackbits(a["root_bits"])[: coords.shape[0]].astype(bool)
+    masks, used = a["masks"], 0
+    slots = np.stack(np.meshgrid(np.arange(2), np.arange(2), np.arange(2), indexing="ij"), -1).reshape(-1, 3)
+    levels, leaf_coords, level = [], [], 0
+    while coords.shape[0]:
+        levels.append(np.full((~internal).sum(), level))
+        leaf_coords.append(coords[~internal])
+        parents = coords[internal]
+        bits = masks[used : used + parents.shape[0]]
+        used += parents.shape[0]
+        coords = (parents[:, None] * 2 + slots[None]).reshape(-1, 3)
+        internal = ((bits[:, None] >> np.arange(8)) & 1).astype(bool).reshape(-1)
+        level += 1
+    levels, leaf_coords = np.concatenate(levels), np.concatenate(leaf_coords)
+    types = _unpack2(a["types"], levels.shape[0]).astype(np.int64)
+    counts = np.asarray(VALUE_COUNT)[types]
+    starts = np.cumsum(counts) - counts
+    values = np.zeros(int(counts.sum()), dtype=np.float32)
+    for t, block in ((0, a["constant"][:, None]), (1, a["trilinear"]), (2, a["step"])):
+        idx = starts[types == t][:, None] + np.arange(VALUE_COUNT[t])
+        values[idx.reshape(-1)] = block.astype(np.float32).reshape(-1)
+    geometry = torch.zeros((types.shape[0], GEOMETRY_WIDTH))
+    geometry[torch.from_numpy(types == 2)] = pad_geometry(unpack_geometry(torch.from_numpy(a["step_geometry"].astype(np.int64))))
+    t = lambda x: torch.from_numpy(np.ascontiguousarray(x))
+    model._assign(t(levels), t(leaf_coords), t(types), t(values), geometry)
+    return header

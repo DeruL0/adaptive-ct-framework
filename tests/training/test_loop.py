@@ -23,10 +23,10 @@ def _render(model, angle):
 
 def _write_dataset(root: Path, train_views: int = 12) -> Path:
     torch.manual_seed(11)
-    truth = BernsteinOctree(levels=[2, 4, 8], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0, cuda_integrator=False)
+    truth = BernsteinOctree(levels=[2, 4, 8], leaf_types=("constant", "trilinear", "step"), cuda_integrator=False)
     truth.to_trilinear(torch.arange(truth.leaf_levels.shape[0]))
     with torch.no_grad():
-        truth.coefficient_logits.copy_(truth._coefficients_to_logits(0.02 + 0.4 * torch.rand(truth.coefficient_logits.shape[0])))
+        truth.values.copy_(0.02 + 0.4 * torch.rand(truth.values.shape[0]))
     dataset_root = root / "dataset"
     dataset_root.mkdir()
     np.save(dataset_root / "volume.npy", np.ones((8, 8, 8), dtype=np.float32) * 0.1)
@@ -52,16 +52,15 @@ def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
     return {
         "device": "cpu",
         "dataset": {"root": str(dataset_root), "dev_views": 3, "dev_seed": 1},
-        "model": {"levels": [2, 4, 8], "leaf_types": types, "cuda_integrator": False, "attenuation_shift": 0.0},
+        "model": {"levels": [2, 4, 8], "leaf_types": types, "cuda_integrator": False},
         "training": {
             "seed": 3,
             "eval_ray_chunk": 4096,
             "solver": {"groups": 3, "first_group_passes": 2, "group_passes": 1, "round_tol": 1e-3, "round_passes": 6, "final_tol": 1e-4, "final_passes": 8,
                        "min_leaf_px": 2.5, "extrapolate": True, "edge_penalty": {"weight": 2300, "delta": 0.02}},
-            "refinement": {"action_share": 0.5, "stop_below_remaining": 0.01, "decision_views": 6, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3, "quantization": "float16"},
+            "refinement": {"action_share": 0.5, "stop_below_remaining": 0.01, "decision_views": 6, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3},
         },
         "metrics": {"compute_projection_metrics": True, "compute_volume_metrics": False, "compute_boundary_metrics": False},
-        "export": {"compact_octree": {"enabled": True, "artifact_name": "ANVO.npz", "quantization": "float16"}},
         "output": {"dir": str(output_root)},
     }
 
@@ -74,7 +73,7 @@ class PipelineTests(unittest.TestCase):
             config_path = root / "config.yaml"
             config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
             report = run_training(config_path)
-            artifacts = {name: (root / "output" / name).exists() for name in ("checkpoint.pt", "ANVO.npz", "training_report.json")}
+            artifacts = {name: (root / "output" / name).exists() for name in ("checkpoint.pt", "model.npz", "training_report.json")}
         return report, artifacts
 
     def test_three_type_run_refines_from_projections_and_stores_fp16(self):
@@ -92,7 +91,7 @@ class PipelineTests(unittest.TestCase):
         report, artifacts = self._run(types=["constant"])
         self.assertGreaterEqual(len([e for e in report["growth_events"] if sum(e["actions"].values())]), 1)
         self.assertEqual(list(report["model"]["leaf_type_counts"][1:]), [0, 0])
-        self.assertTrue(artifacts["ANVO.npz"])
+        self.assertTrue(artifacts["model.npz"])
 
 
 if __name__ == "__main__":

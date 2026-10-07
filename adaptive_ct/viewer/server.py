@@ -24,7 +24,7 @@ import torch
 from PIL import Image
 
 from adaptive_ct.core.projector import project_dense_parallel
-from adaptive_ct.codec.artifact import load_compact_octree_state_dict
+from adaptive_ct.codec.artifact import load_octree_artifact
 from adaptive_ct.core.config import load_config
 from adaptive_ct.data.dataset import ProjectionSplit, load_r2_dataset
 from adaptive_ct.evaluation.metrics import mae, projection_metrics, psnr
@@ -168,8 +168,7 @@ def _synthesize_model_config(model_path: Path) -> dict[str, Any] | None:
     if suffix == ".npz":
         try:
             with np.load(model_path, allow_pickle=False) as payload:
-                levels = [int(shape[0]) for shape in payload["level_shapes"].tolist()]
-                attenuation_shift = float(payload["attenuation_shift"][0])
+                levels = [list(shape) for shape in json.loads(str(payload["header"][0]))["levels"]]
         except Exception:
             return None
         return {
@@ -177,7 +176,6 @@ def _synthesize_model_config(model_path: Path) -> dict[str, Any] | None:
             "model": {
                 "levels": levels,
                 "leaf_types": ["constant", "trilinear", "step"],
-                "attenuation_shift": attenuation_shift,
                 "cuda_integrator": False,
             },
         }
@@ -448,7 +446,7 @@ def _leaf_geometry_payload(model, *, max_leaves: int | None = None, min_mu: floa
 
     levels_np = leaf_levels.detach().cpu().numpy().astype(np.int64)
     coords_np = leaf_coords.detach().cpu().numpy().astype(np.float64)
-    mu_np = model._leaf_mu().detach().cpu().numpy().astype(np.float32)
+    mu_np = model.leaf_mean().detach().cpu().numpy().astype(np.float32)
     res_np = np.asarray(resolutions, dtype=np.float64)
 
     level_counts = [int(np.count_nonzero(levels_np == level)) for level in range(len(resolutions))]
@@ -535,22 +533,17 @@ def _leaf_corner_values(
     fitting needed). Any other, currently unused, degree combination falls
     back to the flat mean for that leaf rather than guessing.
     """
-    leaf_degrees = getattr(model, "leaf_degrees", None)
-    if leaf_degrees is None:
-        return None
-    device = leaf_degrees.device
+    device = model.cells.device
     leaf_ids = torch.as_tensor(leaf_ids_np, dtype=torch.long, device=device)
-    degrees = leaf_degrees[leaf_ids]
-    degrees_np = degrees.detach().cpu().numpy()
-    is_p1 = np.all(degrees_np == 1, axis=1)
+    is_p1 = (model.leaf_type()[leaf_ids] == 1).cpu().numpy()
     if not np.any(is_p1):
         return None
     corners = np.repeat(selected_mu_np[:, None], 8, axis=1).astype(np.float32)
     p1_rows_np = np.nonzero(is_p1)[0]
     p1_rows = torch.as_tensor(p1_rows_np, dtype=torch.long, device=device)
     p1_leaf_ids = leaf_ids[p1_rows]
-    local_rows = model.coefficient_offsets[p1_leaf_ids, None] + torch.arange(8, device=device)[None, :]
-    values = model.coefficients()[local_rows]
+    local_rows = model.value_offsets()[p1_leaf_ids, None] + torch.arange(8, device=device)[None, :]
+    values = model.values[local_rows]
     corners[p1_rows_np] = values.detach().float().cpu().numpy()
     return corners
 
@@ -579,7 +572,7 @@ def _leaf_geometry_binary(model, *, max_leaves: int | None = None, min_mu: float
 
     levels_np = leaf_levels.detach().cpu().numpy().astype(np.uint8, copy=False)
     coords_np = leaf_coords.detach().cpu().numpy().astype(np.uint16, copy=False)
-    mu_np = model._leaf_mu().detach().cpu().numpy().astype(np.float32, copy=False)
+    mu_np = model.leaf_mean().detach().cpu().numpy().astype(np.float32, copy=False)
     total = int(levels_np.shape[0])
     idx = np.flatnonzero(mu_np >= float(min_mu))
     if idx.size == 0:
@@ -1033,16 +1026,12 @@ class ViewerState:
             return
         try:
             if self.checkpoint_path.suffix.lower() == ".npz":
-                state_dict, _metadata = load_compact_octree_state_dict(
-                    self.model,
-                    self.checkpoint_path,
-                    device=self.device,
-                )
+                load_octree_artifact(self.model, self.checkpoint_path)
             else:
                 payload = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
                 state_dict = payload.get("model", payload)
-            self.model.prepare_sparse_from_state_dict(state_dict)
-            self.model.load_state_dict(state_dict, strict=False)
+                self.model.prepare_sparse_from_state_dict(state_dict)
+                self.model.load_state_dict(state_dict, strict=False)
         except Exception as exc:
             self.checkpoint_error = f"Could not load checkpoint: {exc}"
             self.checkpoint_loaded = False
@@ -1165,7 +1154,7 @@ class ViewerState:
             "source_path": str(single.paths[0]),
             "elapsed_ms": elapsed_ms,
             "device": str(self.device),
-            "native_cuda_integrator": bool(self.model.cuda_integrator and self.model.coefficient_logits.is_cuda),
+            "native_cuda_integrator": bool(self.model.cuda_integrator and self.model.values.is_cuda),
             "metrics": _array_stats(pred, target),
             "images": {
                 "prediction": _encode_gray_png(pred, vmin=vmin, vmax=vmax),

@@ -1,6 +1,6 @@
 """Fixed-tree solver for  min_{c >= 0}  J(c) = 1/2 * || A c - y ||^2  over the physical leaf coefficients c.
 
-A is the exact projector of the current octree (linear in c, nonnegative entries).
+A is the exact projector of the current octree (linear in c = model.values, nonnegative entries).
   gradient     g = A^T (A c - y)                       (back-projection of the residual)
   step scale   d = A^T A 1                             (bounds the curvature per coefficient, so
                                                         c - g/d never increases J)
@@ -30,12 +30,7 @@ CHUNK = 1 << 20  # rays per kernel call (one 1024x1024 view, or several binned v
 
 def _set(model, c):
     with torch.no_grad():
-        model.coefficient_logits.copy_(model._coefficients_to_logits(c.clamp_min(1e-12)))
-
-
-def _physical_grad(model):
-    s = torch.sigmoid(model.coefficient_logits.detach() + model.attenuation_shift)
-    return model.coefficient_logits.grad / s.clamp_min(1e-30)
+        model.values.copy_(c)
 
 
 def binned(split, b):
@@ -44,12 +39,12 @@ def binned(split, b):
 
 
 def _sweep(model, angles, projections, views, residual):
-    """One pass over `views`: accumulates d/dlogits of 1/2 sum residual(pred, target)^2, CHUNK rays per call."""
+    """One pass over `views`: accumulates into model.values.grad the gradient of 1/2 sum residual(pred, target)^2, CHUNK rays per call."""
     h, w = projections.shape[1:]
     rows, cols = detector_grid(h, w, projections.device)
     n = rows.numel()
     views = torch.as_tensor(views, device=projections.device)
-    model.coefficient_logits.grad = None
+    model.values.grad = None
     total = 0.0
     for s in range(0, views.numel() * n, CHUNK):
         idx = torch.arange(s, min(s + CHUNK, views.numel() * n), device=projections.device)
@@ -64,10 +59,10 @@ def _sweep(model, angles, projections, views, residual):
 
 def curvature(model, angles, projections, views):
     """d = A^T A 1 for the current tree (one pass)."""
-    c_old = model.coefficients().detach().clone()
+    c_old = model.values.detach().clone()
     _set(model, torch.ones_like(c_old))
     _sweep(model, angles, projections, views, lambda pred, target: pred)
-    d = _physical_grad(model).clone()
+    d = model.values.grad.clone()
     _set(model, c_old)
     return d.clamp_min(1e-12)
 
@@ -75,7 +70,7 @@ def curvature(model, angles, projections, views):
 def gradient(model, c, angles, projections, views):
     _set(model, c)
     J = _sweep(model, angles, projections, views, lambda pred, target: pred - target)
-    return _physical_grad(model).clone(), J
+    return model.values.grad.clone(), J
 
 
 def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolate=True, detector_bin=1, on_pass=None,
@@ -89,12 +84,12 @@ def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolat
     views = list(range(int(angles.numel())))
     order = sorted(views, key=lambda v: float(angles[v]))
     view_groups = [order[g::groups] for g in range(groups)]
-    model.coefficient_logits.requires_grad_(True)
+    model.values.requires_grad_(True)
     d = curvature(model, angles, projections, views)
     beta = float(penalty_weight) / detector_bin**2 if penalty is not None else 0.0
     if beta > 0:
         d = d + beta * penalty.curvature()
-    c = model.coefficients().detach().clone()
+    c = model.values.detach().clone()
 
     def penalised(g, J, at):
         if beta == 0:
@@ -139,5 +134,5 @@ def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolat
             converged = True
             break
     _set(model, c)
-    model.coefficient_logits.requires_grad_(False)
+    model.values.requires_grad_(False)
     return c, history, converged

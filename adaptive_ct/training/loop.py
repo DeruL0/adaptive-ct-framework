@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from adaptive_ct.codec.artifact import export_compact_octree_artifact
+from adaptive_ct.codec.artifact import export_octree_artifact
 from adaptive_ct.codec.budget import model_bytes
 from adaptive_ct.core.config import load_config
 from adaptive_ct.data.dataset import load_r2_dataset
@@ -28,7 +28,7 @@ from adaptive_ct.training.validate import validate_config
 
 @torch.no_grad()
 def _initialize_constant_mu(model, value: torch.Tensor) -> None:
-    model.coefficient_logits.copy_(model._coefficients_to_logits(torch.full_like(model.coefficient_logits, float(value.item()))))
+    model.values.fill_(float(value.item()))
 
 
 def _split_dev_views(dataset, dataset_cfg: dict, seed: int):
@@ -66,7 +66,7 @@ def run_training(config_path: str | Path) -> dict:
     # constant start value comes directly from the projections.
     _initialize_constant_mu(model, (dataset.train.projections.mean() * 0.5).clamp_min(1e-8))
     if "trilinear" in model.leaf_types:  # main line: every root leaf starts trilinear
-        model.to_trilinear(torch.arange(model.leaf_levels.shape[0], device=device))
+        model.to_trilinear(torch.arange(model.leaf_count, device=device))
 
     train_cfg = config["training"]
     solver_cfg = train_cfg["solver"]
@@ -120,8 +120,8 @@ def run_training(config_path: str | Path) -> dict:
             "solve_seconds": time.perf_counter() - t0,
             "objective": last.get("objective_at_eval_point"),
             "optimality_residual": last.get("optimality_residual"),
-            "leaves": int(model.leaf_levels.shape[0]),
-            "bytes": model_bytes(model, controller.quantization),
+            "leaves": model.leaf_count,
+            "bytes": model_bytes(model),
             "leaf_type_counts": list(model.stats().leaf_type_counts),
             "held_out_projection": held_out_metric(),
             "gpu_peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0.0,
@@ -138,7 +138,7 @@ def run_training(config_path: str | Path) -> dict:
         print(json.dumps({"grow": event}, default=float), flush=True)
 
     elapsed = time.perf_counter() - start_time
-    codec_summary = deploy(model, dataset, controller.quantization, detector_h=detector_h, detector_w=detector_w, ray_chunk=eval_chunk)
+    codec_summary = deploy(model, dataset, detector_h=detector_h, detector_w=detector_w, ray_chunk=eval_chunk)
     stats = model.stats()
     metrics_cfg = config.get("metrics", {}) or {}
     if bool(metrics_cfg.get("compute_projection_metrics", True)):
@@ -175,11 +175,7 @@ def run_training(config_path: str | Path) -> dict:
     checkpoint_path = out_dir / "checkpoint.pt"  # the deployed model (coefficients rounded to fp16)
     torch.save({"model": model.state_dict(), "config": config, "rounds": len(rounds)}, checkpoint_path)
     export_summary = {}
-    compact_cfg = (config.get("export", {}) or {}).get("compact_octree", {}) or {}
-    if bool(compact_cfg.get("enabled", True)):
-        compact_summary = export_compact_octree_artifact(model, out_dir / str(compact_cfg.get("artifact_name", "compact_octree.npz")),
-                                                         quantization=str(compact_cfg.get("quantization", "float16")))
-        export_summary["compact_octree"] = compact_summary.__dict__
+    export_summary["stored_file"] = export_octree_artifact(model, out_dir / "model.npz").__dict__  # what the budget counts
     export_summary["visual_slice"] = export_center_slice_png(model, out_dir / "center_slice.png", dataset.volume_shape)
     export_summary["visual_slice_fullres"] = export_center_slice_png(model, out_dir / "center_slice_fullres.png", finest_model_shape(model))
 
@@ -205,7 +201,6 @@ def run_training(config_path: str | Path) -> dict:
         "training_objective": {
             "form": "min_{c>=0} 1/2 ||A c - y||^2 + beta R(c) per fixed tree; tree and leaf types chosen by held-out refits of the same objective under the byte budget",
             "byte_budget": int(ref_cfg["byte_budget"]),
-            "quantization": controller.quantization,
             "solver": solver_cfg,
             "dense_volume_loaded_during_training": False,
         },

@@ -41,7 +41,7 @@ GT = np.load(ROOT / "output/figure473_dicom_orig_r2_convergence/vol_gt.npy", mma
 D, H, W = GT.shape
 CK = torch.load(ROOT / "output" / RUN / "checkpoint.pt", map_location="cpu")
 CFG = CK["config"]
-SPLIT_BYTES = 64 + 7 * 19  # one split of a trilinear leaf, fp16 (codec.budget)
+SPLIT_BYTES = 1 + 7 * 16.25  # one split of a trilinear leaf (codec.budget)
 BUDGET = 8_388_608
 TAU, BAND_R = 0.1, 3
 
@@ -133,7 +133,7 @@ def evaluate_volume(model):
         "band_sse_share": se["band"] / tot,
         "band_rmse": math.sqrt(se["band"] / cnt["band"]),
         "far_rmse": math.sqrt(se["far"] / cnt["far"]),
-        "leaves": int(model.leaf_levels.shape[0]),
+        "leaves": model.leaf_count,
         "bytes": model_bytes(model),
     }
 
@@ -142,7 +142,7 @@ def evaluate_volume(model):
 def base_model(dataset_train):
     m = build_model(CFG).to(dev)
     _initialize_constant_mu(m, (dataset_train.projections.mean() * 0.5).clamp_min(1e-8))
-    m.to_trilinear(torch.arange(m.leaf_levels.shape[0], device=dev))
+    m.to_trilinear(torch.arange(m.leaf_count, device=dev))
     return m
 
 
@@ -169,9 +169,9 @@ def our_tree_model(dataset_train):
 
 
 def set_coefficients(m, coef):  # coef (N, 8), leaf order == model leaf order, 8 contiguous per leaf
-    assert int(m.coefficient_logits.numel()) == coef.shape[0] * 8
+    assert int(m.values.numel()) == coef.shape[0] * 8
     with torch.no_grad():
-        m.coefficient_logits.copy_(m._coefficients_to_logits(coef.clamp_min(1e-6)).reshape(-1))
+        m.values.copy_(coef.clamp_min(0).reshape(-1))
 
 
 def get_dataset():
@@ -185,9 +185,9 @@ def stage_ls_eval(ds):
     """Cells of the run's tree, every leaf trilinear, values fitted to GT: how good the chosen cells are."""
     m = our_tree_model(ds.train).eval()
     save("our_tree_current", evaluate_volume(m))
-    N = int(m.leaf_levels.shape[0])
+    N = m.leaf_count
     m.set_types(torch.arange(N, device=dev), torch.ones(N, dtype=torch.long, device=dev), torch.zeros(N * 8, device=dev), torch.zeros(N, 5, device=dev))
-    N = int(m.leaf_levels.shape[0])
+    N = m.leaf_count
     A = torch.zeros(N, 64, device=dev)
     B = torch.zeros(N, 8, device=dev)
     s2 = torch.zeros(N, dtype=torch.float64, device=dev)
@@ -272,7 +272,7 @@ def stage_oracle(ds):
     s1 = torch.nonzero(d1.reshape(-1)).flatten()
     m = oracle_model(ds.train, s0, s1)
     # assign GT-LS coefficients leaf by leaf
-    N = int(m.leaf_levels.shape[0])
+    N = m.leaf_count
     coef = torch.empty(N, 8, device=dev)
     for L in (0, 1, 2):
         mask = m.leaf_levels == L
@@ -342,8 +342,8 @@ def stage_edge_penalty(ds):
     dh, dw = ds.detector_shape
     delta = 0.02
     m0 = load_checkpoint(ROOT / "output" / RUN / "checkpoint.pt")
-    m0.coefficient_logits.requires_grad_(True)
-    c0 = m0.coefficients().detach().clone()
+    m0.values.requires_grad_(True)
+    c0 = m0.values.detach().clone()
     _, J = gradient(m0, c0, ds.train.angles, ds.train.projections, list(range(int(ds.train.angles.numel()))))
     R, _ = EdgePenalty(m0, delta).value_and_gradient(c0)
     print(f"start: data term {J:.4g}, penalty {R:.4g}", flush=True)
@@ -393,7 +393,7 @@ def stage_profile(ds):
     (values >= 0, parameters rounded to fp16), then the best leaf type per leaf under the 8 MiB budget,
     direct fp16 bytes: constant 5, trilinear 19, step 15, split 64. Same tree for every variant."""
     m = oracle_tree_for(ds).eval()
-    N = int(m.leaf_levels.shape[0])
+    N = m.leaf_count
     shapes = torch.tensor(m.level_shapes, dtype=torch.float32, device=dev)
     NB, NN = 48, 9  # distance bins along a direction; candidate directions per leaf
     edges = torch.linspace(-0.87, 0.87, NB + 1, device=dev)

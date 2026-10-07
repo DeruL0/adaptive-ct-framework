@@ -19,7 +19,6 @@ model:
   max_leaf_count: 6000000
   leaf_types: [constant, trilinear, step]
   cuda_integrator: true
-  attenuation_shift: -3.0
 
 training:
   seed: 20260702
@@ -42,20 +41,13 @@ training:
     stop_below_remaining: 0.01  # stop refining when less than this share of the budget is left
     decision_views: 240     # all pixels of all training views; alternate views (by angle) = the two halves
     min_footprint_px: 1.0   # children must span >= 1 detector pixel
-    byte_budget: 8388608
+    byte_budget: 8388608    # bytes of the stored file (codec/budget.py): leaf 2.25 / 16.25 / 8.25 B, split 1 B + 7 leaves
     max_rounds: 32
-    quantization: float16   # bytes counted for what is stored: constant 5, trilinear 19, step 15 per leaf
 
 metrics:
   compute_projection_metrics: true
   compute_volume_metrics: true
   compute_boundary_metrics: false
-
-export:
-  compact_octree:
-    enabled: true
-    artifact_name: ANVO.npz
-    quantization: float16
 
 output:
   dir: output\main_p1_256v

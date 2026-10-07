@@ -13,27 +13,23 @@ from __future__ import annotations
 
 import torch
 
-from adaptive_ct.representation.octree import type_ids
+from adaptive_ct.representation.octree import VALUE_COUNT, step_H, trilinear_weights
 
 
 def basis_rows(model, leaf_ids: torch.Tensor, u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """(n, 8) basis weights of each leaf's function at leaf-local points u (n, 3) and the coefficient index per
-    weight (padding weights are 0 and point at the leaf's first coefficient)."""
+    """(n, 8) basis weights of each leaf's function at leaf-local points u (n, 3) and the value index per
+    weight (padding weights are 0 and point at the leaf's first value)."""
     u = u.clamp(0.0, 1.0)
-    kind = type_ids(model.leaf_degrees[leaf_ids])
+    kind = model.leaf_type()[leaf_ids]
     w = torch.zeros((leaf_ids.numel(), 8), device=u.device)
     w[kind == 0, 0] = 1.0
-    p = torch.stack([1 - u, u], -1)
-    tri = (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(-1, 8)
-    w[kind == 1] = tri[kind == 1]
-    g = model.step_geometry[leaf_ids]
-    s = ((u - 0.5) * g[:, :3]).sum(1) - g[:, 3]
-    H = torch.where(g[:, 4] > 0, torch.sigmoid(s / g[:, 4].clamp_min(1e-30)), (s > 0).float())
+    w[kind == 1] = trilinear_weights(u[kind == 1])
     step = kind == 2
-    w[step, 0], w[step, 1] = 1 - H[step], H[step]
-    count = torch.tensor([1, 8, 2], device=u.device)[kind]
+    H = step_H(model.geometry(leaf_ids[step]), u[step])
+    w[step, 0], w[step, 1] = 1 - H, H
+    count = torch.tensor(VALUE_COUNT, device=u.device)[kind]
     k = torch.arange(8, device=u.device)[None]
-    idx = model.coefficient_offsets[leaf_ids, None] + torch.where(k < count[:, None], k, 0)
+    idx = model.value_offsets()[leaf_ids, None] + torch.where(k < count[:, None], k, 0)
     return w, idx
 
 
@@ -79,7 +75,7 @@ class EdgePenalty:
         self.idx_i, self.idx_j = torch.cat(rows_i), torch.cat(rows_j)
         self.w_i, self.w_j = torch.cat(w_i), torch.cat(w_j)
         self.area = torch.cat(area)
-        self.size = int(model.coefficient_logits.numel())
+        self.size = int(model.values.numel())
 
     @property
     def samples(self) -> int:

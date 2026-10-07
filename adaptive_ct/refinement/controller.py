@@ -18,7 +18,6 @@ class RefinementController:
     def __init__(self, *, spec, edge_penalty, estimator_split, detector_h, detector_w, seed, byte_budget):
         self.spec = dict(spec)
         self.edge_penalty = dict(edge_penalty)
-        self.quantization = str(spec["quantization"])
         self.estimator_split = estimator_split
         self.detector_h, self.detector_w = int(detector_h), int(detector_w)
         self.seed = int(seed)
@@ -37,7 +36,7 @@ class RefinementController:
     def refine(self, model) -> dict:
         self.round_index += 1
         event = {"round": self.round_index}
-        remaining = (self.byte_budget - model_bytes(model, self.quantization)) / self.byte_budget
+        remaining = (self.byte_budget - model_bytes(model)) / self.byte_budget
         if remaining < float(self.spec["stop_below_remaining"]):
             return self._stop(event, "byte_budget_nearly_spent")
         frozen = None
@@ -48,7 +47,7 @@ class RefinementController:
         t0 = time.perf_counter()
         report, self.changed_cells = decide_and_apply(
             model, self.estimator_split, views, detector_h=self.detector_h, detector_w=self.detector_w,
-            byte_budget=self.byte_budget, quantization=self.quantization, frozen=frozen,
+            byte_budget=self.byte_budget, frozen=frozen,
             action_share=float(self.spec["action_share"]), min_footprint_px=float(self.spec["min_footprint_px"]),
             penalty_weight=float(self.edge_penalty["weight"]), penalty_delta=float(self.edge_penalty["delta"]))
         event.update(report)

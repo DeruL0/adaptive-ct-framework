@@ -101,13 +101,13 @@ class ViewerVolume3DTests(unittest.TestCase):
         self.assertIsNone(header["corners_offset"])
 
     def test_leaf_geometry_binary_carries_p1_corners_for_non_constant_leaves(self):
-        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"))
         model.to_trilinear([model.find_leaf((0, 0, 0, 0))])
         leaf_id = model.find_leaf((0, 0, 0, 0))
         with torch.no_grad():
             corner_values = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
-            start = int(model.coefficient_offsets[leaf_id])
-            model.coefficient_logits[start : start + 8].copy_(model._coefficients_to_logits(corner_values))
+            start = int(model.value_offsets()[leaf_id])
+            model.values[start : start + 8].copy_(corner_values)
 
         encoded = _leaf_geometry_binary(model)
         header_size = struct.unpack("<I", encoded[8:12])[0]

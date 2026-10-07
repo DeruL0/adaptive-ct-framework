@@ -8,7 +8,7 @@ from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
 from adaptive_ct.data.dataset import ProjectionSplit
 from adaptive_ct.refinement.decision import candidate_step_geometry, decide_and_apply, decision_views, local_statistics, resolvable_mask
-from adaptive_ct.representation.octree import BernsteinOctree, type_ids
+from adaptive_ct.representation.octree import BernsteinOctree
 from adaptive_ct.training.solve import solve
 
 DETECTOR = 8
@@ -16,7 +16,7 @@ ALL = ("constant", "trilinear", "step")
 
 
 def _model(levels=(2, 4, 8), types=ALL, trilinear=True):
-    model = BernsteinOctree(levels=list(levels), leaf_types=types, attenuation_shift=0.0, cuda_integrator=False)
+    model = BernsteinOctree(levels=list(levels), leaf_types=types, cuda_integrator=False)
     if trilinear:
         model.to_trilinear(torch.arange(model.leaf_levels.shape[0]))
     return model
@@ -35,7 +35,7 @@ def _split_from(truth, views=16):
 
 
 def _decide(model, split, **kw):
-    kw = {"quantization": "float16", "action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, **kw}
+    kw = {"action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, **kw}
     report, _ = decide_and_apply(model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, **kw)
     return report
 
@@ -43,23 +43,23 @@ def _decide(model, split, **kw):
 def _random_values(model, seed):
     torch.manual_seed(seed)
     with torch.no_grad():
-        model.coefficient_logits.copy_(model._coefficients_to_logits(0.05 + 0.5 * torch.rand(model.coefficient_logits.shape[0])))
+        model.values.copy_(0.05 + 0.5 * torch.rand(model.values.shape[0]))
 
 
 class ByteModelTests(unittest.TestCase):
     def test_bytes_per_leaf_type_and_per_split(self):
-        self.assertEqual(leaf_bytes("float16").tolist(), [5, 19, 15])
+        self.assertEqual(leaf_bytes().tolist(), [2.25, 16.25, 8.25])
         model = _model(trilinear=False)
         before = model_bytes(model)
         model.to_trilinear([0, 1])
         self.assertEqual(model_bytes(model) - before, 2 * 14)
         before = model_bytes(model)
-        kind = type_ids(model.leaf_degrees)
+        kind = model.leaf_type()
         ids = torch.tensor([int(torch.nonzero(kind == 1)[0]), int(torch.nonzero(kind == 0)[0])])
-        expected = int(split_bytes(kind[ids]).sum())
+        expected = float(split_bytes(kind[ids]).sum())
         model.split_leaves_batch(ids)
-        self.assertEqual(model_bytes(model) - before, expected)
-        self.assertEqual(expected, (64 + 7 * 19) + (64 + 7 * 5))
+        self.assertLessEqual(abs(model_bytes(model) - before - expected), 1)  # whole bytes of the 2-bit types
+        self.assertEqual(expected, (1 + 7 * 16.25) + (1 + 7 * 2.25))
 
     def test_resolvable_mask_follows_pixel_footprint(self):
         model = _model(trilinear=False)
@@ -86,7 +86,7 @@ class DecisionTests(unittest.TestCase):
         solve(model, split, passes=60, tol=1e-6)  # trilinear fit: a ramp along x
         report = _decide(model, split, byte_budget=10**9, action_share=1.0)
         self.assertEqual(report["actions"]["step"], 1)
-        self.assertEqual(type_ids(model.leaf_degrees).tolist(), [2])
+        self.assertEqual(model.leaf_type().tolist(), [2])
         self.assertGreater(abs(float(model.step_geometry[0, 0])), 0.9)  # direction along x
         err = (_render(model, split.angles) - split.projections).square().mean()
         self.assertLess(float(err), 0.05 * float(split.projections.square().mean()))
@@ -107,13 +107,13 @@ class DecisionTests(unittest.TestCase):
     def test_no_split_gain_that_needs_negative_attenuation(self):
         truth = _model(levels=(2, 4, 8), trilinear=False)
         with torch.no_grad():
-            truth.coefficient_logits.copy_(truth._coefficients_to_logits(torch.full_like(truth.coefficient_logits, 1e-12)))
+            truth.values.zero_()
         split = _split_from(truth)  # empty object: all projections ~0
         model = _model(levels=(2, 4, 8), trilinear=False)
         with torch.no_grad():
-            values = torch.full_like(model.coefficient_logits, 1e-12)
+            values = torch.zeros_like(model.values)
             values[0] = 0.3  # one wrong leaf; every other leaf already sits at the bound 0
-            model.coefficient_logits.copy_(model._coefficients_to_logits(values))
+            model.values.copy_(values)
         report = _decide(model, split, byte_budget=10**9, action_share=1.0)
         # only the wrong leaf can improve; its zero-valued neighbours would need negative values
         self.assertLessEqual(sum(report["actions"].values()), 1)
@@ -132,7 +132,7 @@ class DecisionTests(unittest.TestCase):
 class DecisionCudaTests(unittest.TestCase):
     def test_cuda_statistics_match_reference(self):
         from tests.representation.test_octree import make_step
-        model = BernsteinOctree(levels=[2, 4, 8], leaf_types=ALL, attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[2, 4, 8], leaf_types=ALL)
         model.to_trilinear([0, 3, 5, 6])
         model.split_leaves_batch([model.find_leaf((0, 0, 0, 0)), model.find_leaf((0, 1, 1, 0))])
         make_step(model, [model.find_leaf((1, 1, 1, 1)), model.find_leaf((0, 1, 0, 1))], seed=2)

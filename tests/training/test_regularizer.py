@@ -8,7 +8,7 @@ from tests.representation.test_octree import make_step
 
 
 def _tree():
-    model = BernsteinOctree(levels=[2, 4, 8], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0, cuda_integrator=False)
+    model = BernsteinOctree(levels=[2, 4, 8], leaf_types=("constant", "trilinear", "step"), cuda_integrator=False)
     model.split_leaves_batch([0, 5])
     model.to_trilinear([1, 2, 9, 18])
     make_step(model, [3, 15], seed=2)
@@ -19,9 +19,9 @@ class EdgePenaltyTests(unittest.TestCase):
     def test_constant_field_has_no_penalty_and_every_face_is_sampled(self):
         model = _tree()
         with torch.no_grad():
-            model.coefficient_logits.copy_(model._coefficients_to_logits(torch.full_like(model.coefficient_logits, 0.4)))
+            model.values.fill_(0.4)
         penalty = EdgePenalty(model, delta=0.05)
-        value, grad = penalty.value_and_gradient(model.coefficients().detach())
+        value, grad = penalty.value_and_gradient(model.values.detach())
         self.assertAlmostEqual(value, 0.0, places=9)
         self.assertLess(float(grad.abs().max()), 1e-6)
         # 2x2 samples per shared face patch, from the finer side: sampled area = interior face area
@@ -32,7 +32,7 @@ class EdgePenaltyTests(unittest.TestCase):
         torch.manual_seed(0)
         model = _tree()
         penalty = EdgePenalty(model, delta=0.05)
-        c = 0.05 + 0.5 * torch.rand(model.coefficient_logits.numel(), dtype=torch.float32)
+        c = 0.05 + 0.5 * torch.rand(model.values.numel(), dtype=torch.float32)
         value, grad = penalty.value_and_gradient(c)
         step = 1e-3 * torch.randn_like(c)
         numeric = penalty.value_and_gradient(c + step)[0] - penalty.value_and_gradient(c - step)[0]
@@ -45,26 +45,25 @@ class EdgePenaltyTests(unittest.TestCase):
 
     def test_decision_statistics_match_the_penalty(self):
         from adaptive_ct.refinement.decision import penalty_statistics
-        from adaptive_ct.representation.octree import type_ids
         torch.manual_seed(1)
         model = _tree()
         with torch.no_grad():
-            model.coefficient_logits.copy_(model._coefficients_to_logits(0.05 + 0.5 * torch.rand(model.coefficient_logits.numel())))
-        c = model.coefficients().detach()
+            model.values.copy_(0.05 + 0.5 * torch.rand(model.values.numel()))
+        c = model.values.detach()
         candidate = torch.tensor([[1.0, 0.0, 0.0, 0.1, 0.05]]).repeat(model.leaf_levels.numel(), 1)
         delta = 10.0  # every jump in the quadratic range: the surrogate is the penalty itself
         acc = penalty_statistics(model, delta, candidate).double()
         R = EdgePenalty(model, delta).value_and_gradient(c)[0]
         self.assertAlmostEqual(float(acc[:, 96].sum()), 4 * R, delta=1e-5 * max(1.0, R))  # each sample on both leaves, phi = t^2/2
         iu, ju = torch.triu_indices(8, 8)
-        for leaf in torch.nonzero(type_ids(model.leaf_degrees) == 1).flatten().tolist():  # refit option = current values: t unchanged
+        for leaf in torch.nonzero(model.leaf_type() == 1).flatten().tolist():  # refit option = current values: t unchanged
             G = torch.zeros(8, 8, dtype=torch.float64)
             G[iu, ju] = acc[leaf, 2:38]
             G[ju, iu] = acc[leaf, 2:38]
-            v = c[model.coefficient_offsets[leaf] + torch.arange(8)].double()
+            v = c[model.value_offsets()[leaf] + torch.arange(8)].double()
             self.assertAlmostEqual(float(v @ G @ v - 2 * acc[leaf, 38:46] @ v + acc[leaf, 95]), float(acc[leaf, 96]), places=5)
     def test_large_jumps_cost_linearly(self):
-        model = BernsteinOctree(levels=[2], leaf_types=("constant",), attenuation_shift=0.0, cuda_integrator=False)
+        model = BernsteinOctree(levels=[2], leaf_types=("constant",), cuda_integrator=False)
         values = torch.full((8,), 0.1)
         values[model.find_leaf((0, 1, 0, 0))] = 0.1 + 1.0
         small = values.clone()

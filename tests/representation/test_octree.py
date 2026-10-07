@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from adaptive_ct.core.geometry import parallel_rays
-from adaptive_ct.representation.octree import BernsteinOctree, bernstein_basis, type_ids
+from adaptive_ct.representation.octree import BernsteinOctree
 
 
 def _rays(angles, rows, cols, h, w):
@@ -41,29 +41,21 @@ def make_step(model, ids, seed, width=0.1):
 def _random_values(model, seed):
     torch.manual_seed(seed)
     with torch.no_grad():
-        model.coefficient_logits.copy_(model._coefficients_to_logits(0.05 + 0.9 * torch.rand_like(model.coefficient_logits)))
+        model.values.copy_(0.05 + 0.9 * torch.rand_like(model.values))
 
 
 class BernsteinOctreeTests(unittest.TestCase):
     def test_anisotropic_dyadic_levels_use_all_three_axes(self):
-        model = BernsteinOctree(levels=[[2, 3, 4], [4, 6, 8], [8, 12, 16]], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[[2, 3, 4], [4, 6, 8], [8, 12, 16]], leaf_types=("constant", "trilinear", "step"))
         self.assertEqual(model.level_shapes, [(2, 3, 4), (4, 6, 8), (8, 12, 16)])
-        self.assertEqual(model.stats().l0_cells, 24)
         model.split_leaves_batch([model.find_leaf((0, 0, 0, 0))])
         model.split_leaves_batch([model.find_leaf((1, 0, 0, 0))])
         leaf_ids = model.resolve_leaf_ids(torch.tensor([[-0.99, -0.99, -0.99], [0.99, 0.99, 0.99]]))
         self.assertEqual(int(model.leaf_levels[leaf_ids[0]]), 2)
         self.assertEqual(int(model.leaf_levels[leaf_ids[1]]), 0)
 
-    def test_basis_is_nonnegative_partition_of_unity(self):
-        x = torch.linspace(0.0, 1.0, 31)
-        for degree in (0, 1):
-            basis = bernstein_basis(degree, x)
-            self.assertTrue(torch.all(basis >= 0.0))
-            self.assertTrue(torch.allclose(basis.sum(dim=1), torch.ones_like(x), atol=1e-6))
-
     def test_to_trilinear_and_mixed_batch_split_preserve_the_field(self):
-        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"))
         _random_values(model, 40)
         points = torch.rand((4096, 3)) * 1.998 - 0.999
         before = model.forward_mu(points).detach()
@@ -71,20 +63,20 @@ class BernsteinOctreeTests(unittest.TestCase):
         self.assertTrue(torch.allclose(before, model.forward_mu(points).detach(), atol=1e-6))
         _random_values(model, 41)
         before = model.forward_mu(points).detach()
-        trilinear = torch.nonzero(model.leaf_degrees[:, 0] == 1).flatten()[:2]
-        constant = torch.nonzero(model.leaf_degrees[:, 0] == 0).flatten()[:2]
+        trilinear = torch.nonzero(model.leaf_type() == 1).flatten()[:2]
+        constant = torch.nonzero(model.leaf_type() == 0).flatten()[:2]
         self.assertEqual(model.split_leaves_batch(torch.cat([trilinear, constant])), 4)
-        self.assertEqual(int(model.leaf_levels.shape[0]), 8 + 4 * 7)
+        self.assertEqual(model.leaf_count, 8 + 4 * 7)
         self.assertTrue(torch.allclose(before, model.forward_mu(points).detach(), atol=2e-6, rtol=2e-6))
 
     def test_step_split_preserves_the_field(self):
-        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"))
         make_step(model, [0, 3], seed=1)
         make_step(model, [4], seed=2, width=0.0)
         _random_values(model, 3)
         points = torch.rand((4096, 3)) * 1.998 - 0.999
         before = model.forward_mu(points).detach()
-        steps = torch.nonzero(type_ids(model.leaf_degrees) == 2).flatten()
+        steps = torch.nonzero(model.leaf_type() == 2).flatten()
         self.assertEqual(model.split_leaves_batch(steps), 3)
         counts = model.stats().leaf_type_counts
         self.assertEqual(sum(counts), 5 + 24)  # children with < 2% of one side become constant
@@ -93,25 +85,25 @@ class BernsteinOctreeTests(unittest.TestCase):
         self.assertLess(float((before - model.forward_mu(points).detach()).abs().max()), 0.02)
 
     def test_exact_projector_integrates_constant_field(self):
-        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant",), attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant",))
         with torch.no_grad():
-            model.coefficient_logits.copy_(model._coefficients_to_logits(torch.full_like(model.coefficient_logits, 0.35)))
+            model.values.fill_(0.35)
         angles, rows, cols = [0.0, math.pi / 7.0, math.pi / 3.0], [1, 2, 3], [2, 1, 3]
         prediction = model.integrate_ray_batch(_rays(angles, rows, cols, 4, 4)).detach()
         for i in range(3):
             self.assertAlmostEqual(float(prediction[i]), _sampled_integral(model, angles[i], rows[i], cols[i], 4, 4), places=3)
 
     def test_exact_projector_integrates_linear_field(self):
-        model = BernsteinOctree(levels=[1, 2], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[1, 2], leaf_types=("constant", "trilinear", "step"))
         model.to_trilinear([0])
         corners = torch.tensor([0.1] * 4 + [0.9] * 4)  # value 0.1 at x = -1, 0.9 at x = +1
         with torch.no_grad():
-            model.coefficient_logits.copy_(model._coefficients_to_logits(corners))
+            model.values.copy_(corners)
         # A ray along x: length 2 times the mean value 0.5.
         self.assertAlmostEqual(float(model.integrate_ray_batch(_rays([0.0], [1], [1], 2, 2))[0].detach()), 1.0, places=6)
 
     def test_exact_projector_matches_dense_quadrature_on_a_mixed_tree(self):
-        model = BernsteinOctree(levels=[1, 2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+        model = BernsteinOctree(levels=[1, 2, 4], leaf_types=("constant", "trilinear", "step"))
         model.split_leaves_batch([0])
         model.to_trilinear([0, 3, 6])
         model.split_leaves_batch([model.find_leaf((1, 0, 0, 0))])
@@ -122,28 +114,27 @@ class BernsteinOctreeTests(unittest.TestCase):
             exact = float(model.integrate_ray_batch(_rays([angle], [row], [col], 4, 4))[0].detach())
             self.assertAlmostEqual(exact, _sampled_integral(model, angle, row, col, 4, 4), places=3)
 
-    def test_checkpoint_rebuilds_packed_topology(self):
-        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+    def test_checkpoint_rebuilds_the_tree(self):
+        model = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"))
         model.to_trilinear([0])
         model.split_leaves_batch([model.find_leaf((0, 0, 0, 1))])
         state = model.state_dict()
-        restored = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+        restored = BernsteinOctree(levels=[2, 4], leaf_types=("constant", "trilinear", "step"))
         restored.prepare_sparse_from_state_dict(state)
         restored.load_state_dict(state)
         points = torch.rand((256, 3)) * 1.998 - 0.999
         self.assertTrue(torch.allclose(model.forward_mu(points), restored.forward_mu(points)))
         self.assertEqual(model.stats(), restored.stats())
 
-    def test_four_level_topology_is_packed_and_never_allocates_dense_finest_index(self):
-        model = BernsteinOctree(levels=[2, 4, 8, 16], leaf_types=("constant", "trilinear", "step"), attenuation_shift=0.0)
+    def test_four_level_tree_stores_only_internal_nodes(self):
+        model = BernsteinOctree(levels=[2, 4, 8, 16], leaf_types=("constant", "trilinear", "step"))
         for level in range(3):
             model.split_leaves_batch([model.find_leaf((level, 0, 0, 0))])
-        self.assertFalse(any(name.endswith("_index") for name, _ in model.named_buffers()))
-        self.assertLess(model.node_child_base.numel(), 16**3)
+        self.assertEqual(model.child_table.shape, (3, 8))  # one row per internal node
         leaf_ids = model.resolve_leaf_ids(torch.tensor([[-0.99, -0.99, -0.99], [0.75, 0.75, 0.75]]))
         self.assertEqual(int(model.leaf_levels[leaf_ids[0]]), 3)
         self.assertEqual(int(model.leaf_levels[leaf_ids[1]]), 0)
-        self.assertEqual(model.stats().l3_active, 8)
+        self.assertEqual(model.stats().active_by_level[3], 8)
 
 
 if __name__ == "__main__":
