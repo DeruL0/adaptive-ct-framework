@@ -281,14 +281,20 @@ def child_minimum(model, inset: float = 1e-4) -> torch.Tensor:
 
 
 def evaluate_options(acc: torch.Tensor, split_lower: torch.Tensor, kind: torch.Tensor, chunk: int = 1 << 17) -> torch.Tensor:
-    """Held-out gains (N, 4) for OPTIONS:  J(leaf's own type, values refitted) - J(option, refitted),  J = residual
-    energy on the held-out half of the rays (fits on one half, evaluated on the other and back, summed).  Refitting the
-    current type is the baseline, so gain from simply solving the values further is not credited to a type change
-    or a split.  Every fit respects what the solve can reach: type values >= 0, and split corrections >=
-    split_lower (= -child minimum, so the children stay nonnegative).  A step leaf's baseline uses its current
-    geometry, its step option the newly estimated one.  (A split adds corrections to the current function and
-    cannot take the value refit along, so its gain is conservative.)  Gains below the accuracy of the statistics
-    (1e-6 of the residual energy, 1e-7 of b^2: the kernel's float32 weights) count as zero.  Processed in chunks of leaves."""
+    """Held-out gains (N, 4) for OPTIONS.  J = residual energy on the held-out half of the rays (fits on one half,
+    evaluated on the other and back, summed).
+      type options (constant / trilinear / step):  J(leaf's own type, values refitted) - J(option, refitted).  The
+        option replaces the leaf's function, so the refit of the current type is the baseline: gain from simply solving
+        the values further is not credited to a type change.  A step leaf's baseline uses its current geometry, its
+        step option the newly estimated one.
+      split:  J(current function) - J(current function + one constant correction per child).  The corrections are
+        added to the current function; the family has no refit of the parent values, so the refit baseline is not
+        subtracted (measured: with it, 8 MiB drops from 37.38 to 35.57 dB - splits, which cannot take the refit
+        along, lose against a baseline their own family does not contain).  A joint fit of parent values and
+        corrections would settle it (cross moments of parent basis and children).
+    Every fit respects what the solve can reach: type values >= 0, and split corrections >= split_lower (= -child
+    minimum, so the children stay nonnegative).  Gains below the accuracy of the statistics (1e-6 of the residual
+    energy, 1e-7 of b^2: the kernel's float32 weights) count as zero.  Processed in chunks of leaves."""
     def held_out(st, name, base, lower):
         G, h = st[f"G_{name}"], st[f"h_{name}"]
         total = torch.zeros_like(st["r2"][0])
@@ -305,9 +311,9 @@ def evaluate_options(acc: torch.Tensor, split_lower: torch.Tensor, kind: torch.T
         zero = lambda name: torch.zeros_like(st[f"h_{name}"][0])
         totals = {o: held_out(st, o, st["r2"] if o == "split" else st["b2"], split_lower[a:b] if o == "split" else zero(o)) for o in OPTIONS}
         k = kind[a:b]
-        old = torch.where(k == 0, totals["constant"], torch.where(k == 1, totals["trilinear"], held_out(st, "cur_step", st["b2"], zero("cur_step"))))
-        g = torch.stack([old - totals[o] for o in OPTIONS], 1)
         r2, b2 = st["r2"].sum(0), st["b2"].sum(0)
+        own = torch.where(k == 0, totals["constant"], torch.where(k == 1, totals["trilinear"], held_out(st, "cur_step", st["b2"], zero("cur_step"))))
+        g = torch.stack([own - totals["constant"], own - totals["trilinear"], own - totals["step"], r2 - totals["split"]], 1)
         noise = 1e-6 * (r2 + r2.mean()) + 1e-7 * b2  # float32 weights of the kernel: 6e-8 relative to b^2
         gains[a:b] = torch.where(g.abs() <= noise[:, None], torch.zeros_like(g), g)
     return gains

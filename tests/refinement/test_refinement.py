@@ -81,8 +81,9 @@ class DecisionTests(unittest.TestCase):
 
     def test_value_refit_alone_earns_no_structure_change(self):
         # Data from a trilinear tree; the model has that tree with the values of one leaf perturbed.  Refitting the
-        # values of that leaf (same type) removes all its error, so no split or type change may be credited for it.
-        # (Neighbouring leaves may still gain: with the perturbed leaf fixed, finer cells compensate for its error.)
+        # values of that leaf (same type) removes all its error, so no type change may be credited for it.
+        # (Neighbouring leaves may still gain: with the perturbed leaf fixed, finer cells compensate for its error.
+        # A split adds corrections to the current function and is measured against it, see evaluate_options.)
         truth = _model(levels=(2, 4, 8))
         _random_values(truth, 21)
         split = _split_from(truth)
@@ -94,7 +95,7 @@ class DecisionTests(unittest.TestCase):
         acc = local_statistics(model, split, decision_views(split, 16, 0), candidate)
         self.assertGreater(float(acc[:, 3, 96].sum()), 1e-3)  # the leaf's rays do show an error
         gains = evaluate_options(acc, -child_minimum(model), model.leaf_type())
-        self.assertLessEqual(float(gains[3].max()), 0.0, gains[3].tolist())
+        self.assertLessEqual(float(gains[3, :3].max()), 0.0, gains[3].tolist())
 
     def test_candidate_equal_to_the_current_type_has_zero_gain(self):
         model = _model(levels=(2, 4, 8), trilinear=False)
