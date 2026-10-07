@@ -38,18 +38,23 @@ def binned(split, b):
     return split.projections if b == 1 else F.avg_pool2d(split.projections[:, None], b)[:, 0]
 
 
-def _sweep(model, angles, projections, views, residual):
-    """One pass over `views`: accumulates into model.values.grad the gradient of 1/2 sum residual(pred, target)^2, CHUNK rays per call."""
+def ray_batches(angles, projections, views):
+    """All pixels of `views`, CHUNK rays per batch (one ray through each (binned) pixel centre)."""
     h, w = projections.shape[1:]
     rows, cols = detector_grid(h, w, projections.device)
     n = rows.numel()
     views = torch.as_tensor(views, device=projections.device)
-    model.values.grad = None
-    total = 0.0
     for s in range(0, views.numel() * n, CHUNK):
         idx = torch.arange(s, min(s + CHUNK, views.numel() * n), device=projections.device)
         v, p = views[idx // n], idx % n
-        batch = parallel_rays(angles[v], rows[p], cols[p], detector_h=h, detector_w=w, targets=projections[v, rows[p], cols[p]])
+        yield parallel_rays(angles[v], rows[p], cols[p], detector_h=h, detector_w=w, targets=projections[v, rows[p], cols[p]])
+
+
+def _sweep(model, angles, projections, views, residual):
+    """One pass over `views`: accumulates into model.values.grad the gradient of 1/2 sum residual(pred, target)^2."""
+    model.values.grad = None
+    total = 0.0
+    for batch in ray_batches(angles, projections, views):
         e = residual(model.integrate_ray_batch(batch), batch.target)
         loss = 0.5 * (e * e).sum()
         loss.backward()

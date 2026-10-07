@@ -169,31 +169,48 @@ __device__ void traverse(const Tree& T, const Rays& R, int ray, Visit&& visit) {
     const float bx = -dy * u, by = dx * u;
     float tmin = -1.0e20f, tmax = 1.0e20f;
     const float b2[2] = {bx, by}, d2[2] = {dx, dy};
+    bool push[2] = {false, false};  // the segment starts on a cell face of this axis
     for (int axis = 0; axis < 2; ++axis) {
         if (fabsf(d2[axis]) < 1.0e-8f) {
             if (b2[axis] < -1.0f || b2[axis] > 1.0f) return;
             continue;
         }
         const float t0 = (-1.0f - b2[axis]) / d2[axis], t1 = (1.0f - b2[axis]) / d2[axis];
-        tmin = fmaxf(tmin, fminf(t0, t1));
+        if (fminf(t0, t1) > tmin) {
+            tmin = fminf(t0, t1);
+            push[0] = push[1] = false;
+            push[axis] = true;
+        }
         tmax = fminf(tmax, fmaxf(t0, t1));
     }
     if (z < -1.0f || z > 1.0f || tmax <= tmin) return;
     const float eps = 1.0e-6f;
+    // The cell after a crossing is found from a probe point pushed PUSH across the face just crossed (along that
+    // axis only): nudging along the ray instead fails at shallow angles, where the slow coordinate moves less than
+    // its float resolution (seen at 0.47 degrees: segments assigned to the cell before the crossing).
+    const float PUSH = 1.0e-5f;  // far below the finest cell (2/768), far above float resolution near 1
     float t = tmin;
     for (int n = 0; n < R.max_segments && t < tmax - eps; ++n) {
-        // A one-ULP probe can stay in the previous cell after a shallow crossing: nudge it, far below a leaf width.
-        const float remaining = tmax - t;
-        const float probe = t + fminf(fmaxf(1.0e-5f, remaining * 1.0e-5f), remaining * 0.5f);
+        // The probe can still sit on a face of the other axis (rounding): then push that axis as well and look again.
         int r[3], c[3];
-        const int64_t leaf = lookup_leaf(T, bx + dx * probe, by + dy * probe, z, r, c);
-        if (leaf < 0) return;
-        float next = tmax;
-        if (dx > eps) next = fminf(next, (-1.0f + 2.0f * (c[0] + 1) / r[0] - bx) / dx);
-        else if (dx < -eps) next = fminf(next, (-1.0f + 2.0f * c[0] / r[0] - bx) / dx);
-        if (dy > eps) next = fminf(next, (-1.0f + 2.0f * (c[1] + 1) / r[1] - by) / dy);
-        else if (dy < -eps) next = fminf(next, (-1.0f + 2.0f * c[1] / r[1] - by) / dy);
+        int64_t leaf = -1;
+        float cx = 1.0e30f, cy = 1.0e30f;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const float px = bx + dx * t + (push[0] ? copysignf(PUSH, dx) : 0.0f);
+            const float py = by + dy * t + (push[1] ? copysignf(PUSH, dy) : 0.0f);
+            leaf = lookup_leaf(T, px, py, z, r, c);
+            if (leaf < 0) return;
+            cx = dx > eps ? (-1.0f + 2.0f * (c[0] + 1) / r[0] - bx) / dx : (dx < -eps ? (-1.0f + 2.0f * c[0] / r[0] - bx) / dx : 1.0e30f);
+            cy = dy > eps ? (-1.0f + 2.0f * (c[1] + 1) / r[1] - by) / dy : (dy < -eps ? (-1.0f + 2.0f * c[1] / r[1] - by) / dy : 1.0e30f);
+            const bool again_x = cx <= t + eps && !push[0], again_y = cy <= t + eps && !push[1];
+            if (!again_x && !again_y) break;
+            push[0] |= again_x;
+            push[1] |= again_y;
+        }
+        const float next = fminf(tmax, fminf(cx > t + eps ? cx : 1.0e30f, cy > t + eps ? cy : 1.0e30f));
         if (!(next > t)) return;
+        push[0] = cx == next;
+        push[1] = cy == next;
         visit(Segment{leaf, r[0], r[1], r[2], c[0], c[1], c[2], bx, by, dx, dy, z, t, next});
         t = next;
     }
@@ -288,6 +305,53 @@ __global__ void decision_kernel(Tree T, Rays R, const float* candidate, const fl
     traverse(T, R, ray, [&](const Segment& s) { segment_decision(T, s, candidate, accum, leaf_count, fold[ray], residual[ray]); });
 }
 
+// Step geometry normal equations (training/geometry.py): for every segment in a step leaf the derivative of the
+// segment's contribution c0 (L - I) + c1 I with respect to the geometry (n (3), d, w),
+//   D = (c1 - c0) dI/dtheta,  I = L F(a0, a1),  F = (softplus(a1) - softplus(a0)) / (a1 - a0),  a = (n . v - d) / w,
+// v = u - 1/2 at the segment ends.  Per step leaf: GEOMETRY_STATS = 5 gradient (sum residual * D) + 15 (upper
+// triangle of sum D D^T, row major).  Hard steps (w = 0) have no derivative and are skipped.
+constexpr int GEOMETRY_STATS = 20;
+
+__device__ void segment_geometry(const Tree& T, const Segment& s, float residual, float* accum) {
+    const int64_t j = s.leaf - T.n_tri;
+    const float* row = T.geometry + 8 * j;
+    const float4 g = reinterpret_cast<const float4*>(row)[0];
+    const float w = row[4];
+    if (w <= 0.0f) return;
+    const float2 c = reinterpret_cast<const float2*>(T.values + 8 * T.n_tri + 2 * j)[0];
+    const float v0[3] = {s.ux(s.t0) - 0.5f, s.uy(s.t0) - 0.5f, s.uz() - 0.5f};
+    const float v1[3] = {s.ux(s.t1) - 0.5f, s.uy(s.t1) - 0.5f, v0[2]};
+    const float a0 = (g.x * v0[0] + g.y * v0[1] + g.z * v0[2] - g.w) / w;
+    const float a1 = (g.x * v1[0] + g.y * v1[1] + g.z * v1[2] - g.w) / w;
+    float F0, F1;  // dF/da0, dF/da1
+    if (fabsf(a1 - a0) < 1.0e-2f) {
+        const float m = sigmoid_stable(0.5f * (a0 + a1));
+        F0 = F1 = 0.5f * m * (1.0f - m);
+    } else {
+        const float F = (softplus_stable(a1) - softplus_stable(a0)) / (a1 - a0);
+        F0 = (F - sigmoid_stable(a0)) / (a1 - a0);
+        F1 = (sigmoid_stable(a1) - F) / (a1 - a0);
+    }
+    const float k = (c.y - c.x) * (s.t1 - s.t0) / w;
+    const float D[5] = {k * (F0 * v0[0] + F1 * v1[0]), k * (F0 * v0[1] + F1 * v1[1]), k * (F0 * v0[2] + F1 * v1[2]),
+                        -k * (F0 + F1), -k * (F0 * a0 + F1 * a1)};
+    const cg::coalesced_group peers = cg::labeled_partition(cg::coalesced_threads(), static_cast<unsigned int>(j));
+    float* slot = accum + j * GEOMETRY_STATS;
+    for (int i = 0; i < 5; ++i) warp_add(peers, slot + i, residual * D[i]);
+    int n = 5;
+    for (int i = 0; i < 5; ++i)
+        for (int l = i; l < 5; ++l) warp_add(peers, slot + n++, D[i] * D[l]);
+}
+
+__global__ void geometry_kernel(Tree T, Rays R, const float* residual, float* accum) {
+    const int ray = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ray >= R.count) return;
+    const float r = residual[ray];
+    traverse(T, R, ray, [&](const Segment& s) {
+        if (leaf_kind(T, s.leaf) == 2) segment_geometry(T, s, r, accum);
+    });
+}
+
 void check(const at::Tensor& t, at::ScalarType type, const char* name) {
     TORCH_CHECK(t.is_cuda() && t.scalar_type() == type && t.is_contiguous(), name, " must be a contiguous CUDA tensor of type ", type);
 }
@@ -367,5 +431,17 @@ at::Tensor bernstein_octree_decision_accumulate_cuda(TREE_ARGS, at::Tensor candi
         decision_kernel<<<blocks, THREADS, 0, stream>>>(T, R, candidate.data_ptr<float>(), residual.data_ptr<float>(),
                                                         fold.data_ptr<int32_t>(), accum.data_ptr<float>(), leaf_count);
     launched("octree decision kernel");
+    return accum;
+}
+
+at::Tensor bernstein_octree_geometry_accumulate_cuda(TREE_ARGS, at::Tensor residual, at::Tensor accum) {
+    MAKE_TREE_RAYS
+    check(residual, at::kFloat, "residual");
+    check(accum, at::kFloat, "accum");
+    TORCH_CHECK(residual.numel() == R.count, "residual must match the rays.");
+    TORCH_CHECK(accum.numel() == n_step * GEOMETRY_STATS, "accum must be (n_step, 20).");
+    if (R.count && n_step)
+        geometry_kernel<<<blocks, THREADS, 0, stream>>>(T, R, residual.data_ptr<float>(), accum.data_ptr<float>());
+    launched("octree geometry kernel");
     return accum;
 }

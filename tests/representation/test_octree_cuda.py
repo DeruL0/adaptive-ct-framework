@@ -53,6 +53,20 @@ class BernsteinCudaTests(unittest.TestCase):
         model = BernsteinOctree(levels=[24, 48, 96], leaf_types=("constant",))
         self._compare(model, _rays(128, 96, 20260628, full_turn=True), atol=2e-5)
 
+    def test_shallow_angles_next_to_finer_leaves(self):
+        # At shallow angles the slow coordinate moves less than its float resolution per probe nudge along the
+        # ray: the cell after a crossing must come from a probe pushed across the crossed face (0.47 deg failed).
+        model = BernsteinOctree(levels=[16, 32, 64], leaf_types=("constant", "trilinear", "step"))
+        torch.manual_seed(0)
+        model.split_leaves_batch(torch.randperm(model.leaf_count)[:900])
+        model.split_leaves_batch(torch.nonzero(model.leaf_levels == 1).flatten()[torch.randperm(7200)[:2000]])
+        angles = torch.tensor([0.0082, 0.0123, 0.0614, 0.3068, 1.5790, 3.1293, 3.1416 - 0.0041], device="cuda")
+        rows, cols = torch.meshgrid(torch.arange(0, 96, 3, device="cuda"), torch.arange(96, device="cuda"), indexing="ij")
+        n = rows.numel()
+        rays = parallel_rays(angles.repeat_interleave(n), rows.reshape(-1).repeat(7), cols.reshape(-1).repeat(7),
+                             detector_h=96, detector_w=96, targets=torch.zeros(7 * n, device="cuda"))
+        self._compare(model, rays, atol=1e-4)  # gradients: sums over many rays in a different order
+
     def test_four_level_tree(self):
         model = BernsteinOctree(levels=[2, 4, 8, 16], leaf_types=("constant", "trilinear", "step"))
         for level in range(3):

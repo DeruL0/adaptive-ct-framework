@@ -12,7 +12,7 @@ def validate_config(config: dict) -> None:
     # Every main-line setting is stated in the config: a missing key is an error, never a silent fallback.
     solver = train_cfg.get("solver")
     keys = ("round_tol", "round_passes", "final_tol", "final_passes", "groups", "first_group_passes", "group_passes",
-            "min_leaf_px", "extrapolate", "edge_penalty")
+            "min_leaf_px", "extrapolate", "edge_penalty", "geometry_steps")
     if not isinstance(solver, dict) or any(k not in solver for k in keys):
         errors.append("training.solver needs " + ", ".join(keys))
     elif not isinstance(solver["edge_penalty"], dict) or {"weight", "delta"} - set(solver["edge_penalty"]):

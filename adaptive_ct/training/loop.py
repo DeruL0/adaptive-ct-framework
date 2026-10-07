@@ -21,6 +21,7 @@ from adaptive_ct.evaluation.volume import boundary_sharpness_metrics, material_v
 from adaptive_ct.refinement.controller import RefinementController
 from adaptive_ct.representation.factory import build_model
 from adaptive_ct.training.export import deploy, export_center_slice_png, finest_model_shape
+from adaptive_ct.training.geometry import geometry_step
 from adaptive_ct.training.regularizer import EdgePenalty
 from adaptive_ct.training.solve import solve
 from adaptive_ct.training.validate import validate_config
@@ -102,9 +103,12 @@ def run_training(config_path: str | Path) -> dict:
         finest = model.level_shapes[int(model.leaf_levels.max())]
         leaf_px = min(detector_h / finest[2], detector_w / finest[0])
         detector_bin = 1 if final else max([1] + [b for b in (2, 4) if leaf_px / b >= float(solver_cfg["min_leaf_px"])])
-        t0 = time.perf_counter()
         edge = solver_cfg["edge_penalty"]
         weight = float(edge["weight"])
+        # step geometry first, with the values solved in the previous round; then the values for the new geometry
+        geometry = [geometry_step(model, dataset.train, detector_bin=detector_bin, penalty_weight=weight, penalty_delta=float(edge["delta"]))
+                    for _ in range(int(solver_cfg["geometry_steps"])) if model.n_step]
+        t0 = time.perf_counter()
         penalty = EdgePenalty(model, float(edge["delta"])) if weight > 0 else None
         _, hist, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg["groups"]),
                                    group_passes=group_passes, extrapolate=bool(solver_cfg["extrapolate"]),
@@ -118,6 +122,7 @@ def run_training(config_path: str | Path) -> dict:
             "converged": converged,
             "detector_bin": detector_bin,
             "solve_seconds": time.perf_counter() - t0,
+            "geometry": geometry,
             "objective": last.get("objective_at_eval_point"),
             "optimality_residual": last.get("optimality_residual"),
             "leaves": model.leaf_count,
@@ -199,7 +204,7 @@ def run_training(config_path: str | Path) -> dict:
         "boundary_sharpness": boundary_sharpness,
         "model": stats.__dict__,
         "training_objective": {
-            "form": "min_{c>=0} 1/2 ||A c - y||^2 + beta R(c) per fixed tree; tree and leaf types chosen by held-out refits of the same objective under the byte budget",
+            "form": "min_{c>=0} 1/2 ||A(theta) c - y||^2 + beta R per fixed tree (values c by the solve, step geometry theta by Gauss-Newton steps); tree and leaf types chosen by held-out refits of the same objective under the byte budget",
             "byte_budget": int(ref_cfg["byte_budget"]),
             "solver": solver_cfg,
             "dense_volume_loaded_during_training": False,

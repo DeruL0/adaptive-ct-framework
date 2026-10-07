@@ -33,6 +33,7 @@ training:
     final_passes: 150
     min_leaf_px: 2.5        # bin the detector 2x2 / 4x4 while the finest leaf spans >= this many binned pixels
     extrapolate: true
+    geometry_steps: 1       # Gauss-Newton steps on the step geometry (n, d, w) per round, before the value solve
     edge_penalty:           # neighbouring leaves: jumps <= delta penalised quadratically, larger ones linearly
       weight: 2300          # chosen on the held-out views (f474847 tree: 0 / 23 / 231 / 2311 / 7704 -> 2311 best)
       delta: 0.02
