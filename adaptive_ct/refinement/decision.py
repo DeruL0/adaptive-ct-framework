@@ -29,7 +29,7 @@ import math
 import torch
 
 from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
-from adaptive_ct.core.geometry import detector_grid, parallel_rays
+from adaptive_ct.core.geometry import parallel_rays, traversal_grid
 from adaptive_ct.core.projector import bernstein_octree_decision_accumulate
 from adaptive_ct.representation.octree import TYPE_NAMES, pad_geometry, step_integral, trilinear_weights
 from adaptive_ct.training.regularizer import basis_rows, face_samples
@@ -194,10 +194,10 @@ def local_statistics(model, split, views: list[int], candidate: torch.Tensor, pr
     N = int(model.leaf_levels.shape[0])
     acc = torch.zeros((2, N, STRIDE), device=device) if prior is None else prior[None].repeat(2, 1, 1)
     h, w = split.projections.shape[1:]
-    rows, cols = detector_grid(h, w, device)
+    rows, cols = traversal_grid(h, w, device)
     for position, v in enumerate(views):
         batch = parallel_rays(split.angles[v].expand(rows.numel()), rows, cols, detector_h=h, detector_w=w,
-                              targets=split.projections[v].reshape(-1))
+                              targets=split.projections[v, rows, cols])
         residual = model.integrate_ray_batch(batch).detach() - batch.target
         if model.uses_cuda():
             bernstein_octree_decision_accumulate(model.values, model.step_geometry, **model.tree_arguments(), rays=batch, candidate_geometry=candidate,

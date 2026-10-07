@@ -94,6 +94,7 @@ def run_training(config_path: str | Path) -> dict:
     rounds, history, growth_events = [], [], []
     max_rounds = int(ref_cfg["max_rounds"])
     start_time = time.perf_counter()
+    alpha = 1.0  # first step size of the next geometry step
     for r in range(max_rounds + 1):
         final = controller.stopped or r == max_rounds
         passes = int(solver_cfg["final_passes"] if final else solver_cfg["round_passes"])
@@ -106,8 +107,11 @@ def run_training(config_path: str | Path) -> dict:
         edge = solver_cfg["edge_penalty"]
         weight = float(edge["weight"])
         # step geometry first, with the values solved in the previous round; then the values for the new geometry
-        geometry = [geometry_step(model, dataset.train, detector_bin=detector_bin, penalty_weight=weight, penalty_delta=float(edge["delta"]))
-                    for _ in range(int(solver_cfg["geometry_steps"])) if model.n_step]
+        geometry = []
+        for _ in range(int(solver_cfg["geometry_steps"]) if model.n_step else 0):
+            geometry.append(geometry_step(model, dataset.train, detector_bin=detector_bin, penalty_weight=weight,
+                                          penalty_delta=float(edge["delta"]), alpha=alpha))
+            alpha = geometry[-1]["accepted_step"] or alpha / 8  # next first try: the step accepted now
         t0 = time.perf_counter()
         penalty = EdgePenalty(model, float(edge["delta"])) if weight > 0 else None
         _, hist, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg["groups"]),

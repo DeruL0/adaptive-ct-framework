@@ -6,7 +6,8 @@ Per step leaf L, with D_ray = d(prediction of the ray)/d theta_L (5 numbers, CUD
   delta_L = -(G_L + 0.1 diag(G_L) + eps I)^-1 g_L, each part capped (|dn| <= 0.25, |dd| <= 0.1, w within [w/2, 2w]).
 Constraints after the step: n renormalised (d, w scaled with it, same function), w >= a quarter detector pixel,
 the plane inside the leaf, and both sides >= 2% of the leaf (otherwise the leaf keeps its geometry).
-The whole step is accepted only if J decreases; otherwise it is halved, up to three tries.
+The whole step is accepted only if J decreases; otherwise it is halved, up to three tries.  The first try uses
+`alpha` (the loop passes the step accepted last time: later rounds accept 1/2 or 1/4, so starting at 1 wastes passes).
 """
 
 from __future__ import annotations
@@ -76,7 +77,7 @@ def statistics(model, angles, projections, views) -> tuple[torch.Tensor, float]:
 
 
 @torch.no_grad()
-def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, penalty_delta: float, tries: int = 3) -> dict:
+def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, penalty_delta: float, alpha: float = 1.0, tries: int = 3) -> dict:
     t0 = time.perf_counter()
     if model.n_step == 0:
         return {"step_leaves": 0}
@@ -103,10 +104,10 @@ def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, pen
     delta[:, 4] = torch.maximum(torch.minimum(delta[:, 4], w), -0.5 * w)
     shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=old.device)[model.leaf_levels[model.n_tri : model.n_tri + model.n_step]]
     w_min = 0.25 * shapes[:, 0] / split.projections.shape[2]  # a quarter detector pixel, in leaf units
-    report = {"step_leaves": model.n_step, "objective_before": J0, "accepted_step": 0.0}
+    report = {"step_leaves": model.n_step, "objective_before": J0, "first_step": alpha, "accepted_step": 0.0}
     for k in range(tries):
-        alpha = 0.5**k
-        g = old[:, :5] + alpha * delta
+        step = alpha * 0.5**k
+        g = old[:, :5] + step * delta
         s = g[:, :3].norm(dim=1, keepdim=True).clamp_min(1e-30)
         g = g / s
         g[:, 4] = torch.maximum(g[:, 4], w_min)
@@ -116,7 +117,7 @@ def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, pen
         model.step_geometry[:, :5] = torch.where(ok[:, None], g, old[:, :5])
         J = objective()
         if J < J0:
-            report.update(accepted_step=alpha, objective_after=J, leaves_moved=int(ok.sum()))
+            report.update(accepted_step=step, objective_after=J, leaves_moved=int(ok.sum()))
             break
         model.step_geometry.copy_(old)
     else:

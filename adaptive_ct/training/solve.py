@@ -23,7 +23,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from adaptive_ct.core.geometry import detector_grid, parallel_rays
+from adaptive_ct.core.geometry import parallel_rays, traversal_grid
 
 CHUNK = 1 << 20  # rays per kernel call (one 1024x1024 view, or several binned views)
 
@@ -41,7 +41,7 @@ def binned(split, b):
 def ray_batches(angles, projections, views):
     """All pixels of `views`, CHUNK rays per batch (one ray through each (binned) pixel centre)."""
     h, w = projections.shape[1:]
-    rows, cols = detector_grid(h, w, projections.device)
+    rows, cols = traversal_grid(h, w, projections.device)
     n = rows.numel()
     views = torch.as_tensor(views, device=projections.device)
     for s in range(0, views.numel() * n, CHUNK):

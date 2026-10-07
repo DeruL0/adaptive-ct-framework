@@ -17,6 +17,8 @@ namespace {
 
 namespace cg = cooperative_groups;
 
+constexpr int THREADS = 128;  // threads per block (the decision kernel uses DECISION_THREADS)
+
 struct Tree {
     const float* values;
     const float* geometry;
@@ -155,9 +157,30 @@ __device__ float segment_value(const Tree& T, const Segment& s) {
 }
 
 // Neighbouring rays of a warp usually cross the same leaf: sum within the warp, one atomic add per group.
+// Terms that are zero for the whole group are skipped (most of the split option's child products: a segment
+// crosses 1 to 3 of the 8 children).
 __device__ __forceinline__ void warp_add(const cg::coalesced_group& peers, float* slot, float value) {
+    if (!peers.any(value != 0.0f)) return;
     if (peers.size() > 1) value = cg::reduce(peers, value, cg::plus<float>());
     if (peers.thread_rank() == 0) atomicAdd(slot, value);
+}
+
+// Threads of the warp at segments with the same key (leaf) split the n columns of their rows (shared memory, row
+// stride `stride`, odd to avoid bank conflicts) among themselves: each sums its columns over the group's rows and
+// adds them once.  Far fewer operations than one warp reduction per column (decision statistics 300 -> 210 ms).
+__device__ void group_add(const float* shared_rows, int n, int stride, unsigned long long key, float* slot) {
+    const unsigned active = __activemask();
+    const unsigned group = __match_any_sync(active, key);
+    __syncwarp(active);
+    const int lane = threadIdx.x & 31;
+    const int rank = __popc(group & ((1u << lane) - 1u)), size = __popc(group);
+    const float* warp_rows = shared_rows + (threadIdx.x - lane) * stride;
+    for (int e = rank; e < n; e += size) {
+        float sum = 0.0f;
+        for (unsigned m = group; m; m &= m - 1) sum += warp_rows[(__ffs(m) - 1) * stride + e];
+        if (sum != 0.0f) atomicAdd(slot + e, sum);
+    }
+    __syncwarp(active);
 }
 
 template <typename Visit>
@@ -245,9 +268,10 @@ __global__ void backward_kernel(Tree T, Rays R, const float* grad_out, float* gr
 //   0 L*L, 1 L*b | 2..37 trilinear G (upper, row major), 38..45 trilinear*b | 46..48 step G (00, 01, 11),
 //   49..50 step*b | 51..86 split G (upper), 87..94 split*(-residual) | 95 b*b | 96 residual^2
 constexpr int DECISION_STRIDE = 97;
+constexpr int DECISION_THREADS = 64;  // 64 rows of 97 floats of shared memory per block
 
 __device__ void segment_decision(const Tree& T, const Segment& s, const float* candidate, float* accum, int64_t leaf_count,
-                                 int fold, float residual) {
+                                 int fold, float residual, float* shared_rows) {
     const float length = s.t1 - s.t0;
     const float b = segment_value(T, s) - residual;
     float tri[8];
@@ -278,31 +302,33 @@ __device__ void segment_decision(const Tree& T, const Segment& s, const float* c
         const float tm = 0.5f * (cuts[c] + cuts[c + 1]);
         child[(s.ux(tm) > 0.5f ? 4 : 0) + (s.uy(tm) > 0.5f ? 2 : 0) + cz] += cuts[c + 1] - cuts[c];
     }
-    const cg::coalesced_group peers = cg::labeled_partition(cg::coalesced_threads(), static_cast<unsigned int>(s.leaf * 2 + fold));
-    float* slot = accum + (static_cast<int64_t>(fold) * leaf_count + s.leaf) * DECISION_STRIDE;
+    float* row = shared_rows + threadIdx.x * DECISION_STRIDE;  // this thread's statistics, then summed per leaf
     int k = 0;
-    warp_add(peers, slot + k++, length * length);
-    warp_add(peers, slot + k++, length * b);
+    row[k++] = length * length;
+    row[k++] = length * b;
     for (int i = 0; i < 8; ++i)
-        for (int j = i; j < 8; ++j) warp_add(peers, slot + k++, tri[i] * tri[j]);
-    for (int i = 0; i < 8; ++i) warp_add(peers, slot + k++, tri[i] * b);
-    warp_add(peers, slot + k++, st[0] * st[0]);
-    warp_add(peers, slot + k++, st[0] * st[1]);
-    warp_add(peers, slot + k++, st[1] * st[1]);
-    warp_add(peers, slot + k++, st[0] * b);
-    warp_add(peers, slot + k++, st[1] * b);
+        for (int j = i; j < 8; ++j) row[k++] = tri[i] * tri[j];
+    for (int i = 0; i < 8; ++i) row[k++] = tri[i] * b;
+    row[k++] = st[0] * st[0];
+    row[k++] = st[0] * st[1];
+    row[k++] = st[1] * st[1];
+    row[k++] = st[0] * b;
+    row[k++] = st[1] * b;
     for (int i = 0; i < 8; ++i)
-        for (int j = i; j < 8; ++j) warp_add(peers, slot + k++, child[i] * child[j]);
-    for (int i = 0; i < 8; ++i) warp_add(peers, slot + k++, -child[i] * residual);
-    warp_add(peers, slot + k++, b * b);
-    warp_add(peers, slot + k++, residual * residual);
+        for (int j = i; j < 8; ++j) row[k++] = child[i] * child[j];
+    for (int i = 0; i < 8; ++i) row[k++] = -child[i] * residual;
+    row[k++] = b * b;
+    row[k++] = residual * residual;
+    group_add(shared_rows, DECISION_STRIDE, DECISION_STRIDE, static_cast<unsigned long long>(s.leaf * 2 + fold),
+              accum + (static_cast<int64_t>(fold) * leaf_count + s.leaf) * DECISION_STRIDE);
 }
 
 __global__ void decision_kernel(Tree T, Rays R, const float* candidate, const float* residual, const int32_t* fold, float* accum,
                                 int64_t leaf_count) {
+    __shared__ float rows[DECISION_THREADS * DECISION_STRIDE];
     const int ray = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray >= R.count) return;
-    traverse(T, R, ray, [&](const Segment& s) { segment_decision(T, s, candidate, accum, leaf_count, fold[ray], residual[ray]); });
+    traverse(T, R, ray, [&](const Segment& s) { segment_decision(T, s, candidate, accum, leaf_count, fold[ray], residual[ray], rows); });
 }
 
 // Step geometry normal equations (training/geometry.py): for every segment in a step leaf the derivative of the
@@ -311,8 +337,9 @@ __global__ void decision_kernel(Tree T, Rays R, const float* candidate, const fl
 // v = u - 1/2 at the segment ends.  Per step leaf: GEOMETRY_STATS = 5 gradient (sum residual * D) + 15 (upper
 // triangle of sum D D^T, row major).  Hard steps (w = 0) have no derivative and are skipped.
 constexpr int GEOMETRY_STATS = 20;
+constexpr int GEOMETRY_ROW = 21;  // shared-memory row stride (odd: no bank conflicts)
 
-__device__ void segment_geometry(const Tree& T, const Segment& s, float residual, float* accum) {
+__device__ void segment_geometry(const Tree& T, const Segment& s, float residual, float* accum, float* shared_rows) {
     const int64_t j = s.leaf - T.n_tri;
     const float* row = T.geometry + 8 * j;
     const float4 g = reinterpret_cast<const float4*>(row)[0];
@@ -335,20 +362,21 @@ __device__ void segment_geometry(const Tree& T, const Segment& s, float residual
     const float k = (c.y - c.x) * (s.t1 - s.t0) / w;
     const float D[5] = {k * (F0 * v0[0] + F1 * v1[0]), k * (F0 * v0[1] + F1 * v1[1]), k * (F0 * v0[2] + F1 * v1[2]),
                         -k * (F0 + F1), -k * (F0 * a0 + F1 * a1)};
-    const cg::coalesced_group peers = cg::labeled_partition(cg::coalesced_threads(), static_cast<unsigned int>(j));
-    float* slot = accum + j * GEOMETRY_STATS;
-    for (int i = 0; i < 5; ++i) warp_add(peers, slot + i, residual * D[i]);
+    float* out = shared_rows + threadIdx.x * GEOMETRY_ROW;
+    for (int i = 0; i < 5; ++i) out[i] = residual * D[i];
     int n = 5;
     for (int i = 0; i < 5; ++i)
-        for (int l = i; l < 5; ++l) warp_add(peers, slot + n++, D[i] * D[l]);
+        for (int l = i; l < 5; ++l) out[n++] = D[i] * D[l];
+    group_add(shared_rows, GEOMETRY_STATS, GEOMETRY_ROW, static_cast<unsigned long long>(j), accum + j * GEOMETRY_STATS);
 }
 
 __global__ void geometry_kernel(Tree T, Rays R, const float* residual, float* accum) {
+    __shared__ float rows[THREADS * GEOMETRY_ROW];
     const int ray = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray >= R.count) return;
     const float r = residual[ray];
     traverse(T, R, ray, [&](const Segment& s) {
-        if (leaf_kind(T, s.leaf) == 2) segment_geometry(T, s, r, accum);
+        if (leaf_kind(T, s.leaf) == 2) segment_geometry(T, s, r, accum, rows);
     });
 }
 
@@ -381,7 +409,6 @@ Rays make_rays(const at::Tensor& angles, const at::Tensor& rows, const at::Tenso
                 static_cast<int>(dh), static_cast<int>(dw), max_segments};
 }
 
-constexpr int THREADS = 128;
 
 void launched(const char* name) {
     const auto error = cudaGetLastError();
@@ -428,7 +455,7 @@ at::Tensor bernstein_octree_decision_accumulate_cuda(TREE_ARGS, at::Tensor candi
     TORCH_CHECK(residual.numel() == R.count && fold.numel() == R.count, "residual / fold must match the rays.");
     TORCH_CHECK(accum.numel() == 2 * leaf_count * DECISION_STRIDE, "accum must be (2, N, 97).");
     if (R.count)
-        decision_kernel<<<blocks, THREADS, 0, stream>>>(T, R, candidate.data_ptr<float>(), residual.data_ptr<float>(),
+        decision_kernel<<<(R.count + DECISION_THREADS - 1) / DECISION_THREADS, DECISION_THREADS, 0, stream>>>(T, R, candidate.data_ptr<float>(), residual.data_ptr<float>(),
                                                         fold.data_ptr<int32_t>(), accum.data_ptr<float>(), leaf_count);
     launched("octree decision kernel");
     return accum;
