@@ -84,12 +84,11 @@ def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, pen
     views = list(range(int(angles.numel())))
     beta = float(penalty_weight) / detector_bin**2
 
-    def objective() -> float:
-        R = EdgePenalty(model, penalty_delta).value_and_gradient(model.values.detach())[0] if beta > 0 else 0.0
-        return data_term(model, angles, projections, views) + beta * R
-
+    penalty = EdgePenalty(model, penalty_delta) if beta > 0 else None  # samples fixed; weights follow the geometry
+    R = lambda: penalty.value_and_gradient(model.values.detach())[0] if penalty is not None else 0.0
+    objective = lambda: data_term(model, angles, projections, views) + beta * R()
     accum, J_data = statistics(model, angles, projections, views)
-    J0 = J_data + (beta * EdgePenalty(model, penalty_delta).value_and_gradient(model.values.detach())[0] if beta > 0 else 0.0)
+    J0 = J_data + beta * R()
     iu, ju = torch.triu_indices(5, 5, device=accum.device)
     G = torch.zeros((model.n_step, 5, 5), dtype=torch.float64, device=accum.device)
     G[:, iu, ju] = accum[:, 5:].double()

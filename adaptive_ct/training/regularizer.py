@@ -7,6 +7,9 @@ R(c) = sum over shared-face sample points p of  area_p * phi(f_i(p) - f_j(p))
 Each face patch between two leaves is sampled at 2 x 2 points from the finer leaf (equal sizes: once).
 Separable curvature bound for the solver: a_p = b_i(p) - b_j(p) has |a_p| summing to 2 (two nonnegative
 weight sets summing to 1 each) and phi'' <= 1, so  sum_p area_p a_p a_p^T <= diag(sum_p 2 area_p |a_p|).
+Stored per sample: the two leaf indices (int32), both leaf-local points (fp16: dyadic, exact) and the area,
+24 bytes; the basis weights are evaluated in chunks at every use from the model's current types, values and
+step geometry (so the same samples serve a geometry update).
 """
 
 from __future__ import annotations
@@ -16,11 +19,12 @@ import torch
 from adaptive_ct.representation.octree import VALUE_COUNT, step_H, trilinear_weights
 
 
-def basis_rows(model, leaf_ids: torch.Tensor, u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def basis_rows(model, leaf_ids: torch.Tensor, u: torch.Tensor, kind_all=None, offsets_all=None) -> tuple[torch.Tensor, torch.Tensor]:
     """(n, 8) basis weights of each leaf's function at leaf-local points u (n, 3) and the value index per
-    weight (padding weights are 0 and point at the leaf's first value)."""
+    weight (padding weights are 0 and point at the leaf's first value).  kind_all / offsets_all: the model's
+    leaf_type() / value_offsets(), when already at hand."""
     u = u.clamp(0.0, 1.0)
-    kind = model.leaf_type()[leaf_ids]
+    kind = (model.leaf_type() if kind_all is None else kind_all)[leaf_ids]
     w = torch.zeros((leaf_ids.numel(), 8), device=u.device)
     w[kind == 0, 0] = 1.0
     w[kind == 1] = trilinear_weights(u[kind == 1])
@@ -29,7 +33,7 @@ def basis_rows(model, leaf_ids: torch.Tensor, u: torch.Tensor) -> tuple[torch.Te
     w[step, 0], w[step, 1] = 1 - H, H
     count = torch.tensor(VALUE_COUNT, device=u.device)[kind]
     k = torch.arange(8, device=u.device)[None]
-    idx = model.value_offsets()[leaf_ids, None] + torch.where(k < count[:, None], k, 0)
+    idx = (model.value_offsets() if offsets_all is None else offsets_all)[leaf_ids, None] + torch.where(k < count[:, None], k, 0)
     return w, idx
 
 
@@ -61,41 +65,46 @@ def face_samples(model):
 
 
 class EdgePenalty:
+    CHUNK = 1 << 21
+
     def __init__(self, model, delta: float):
-        self.delta = float(delta)
-        rows_i, rows_j, w_i, w_j, area = [], [], [], [], []
-        for i_ids, j_ids, ui, uj, a in face_samples(model):
-            wi, ii = basis_rows(model, i_ids, ui)
-            wj, jj = basis_rows(model, j_ids, uj)
-            rows_i.append(ii)
-            rows_j.append(jj)
-            w_i.append(wi)
-            w_j.append(wj)
-            area.append(a)
-        self.idx_i, self.idx_j = torch.cat(rows_i), torch.cat(rows_j)
-        self.w_i, self.w_j = torch.cat(w_i), torch.cat(w_j)
-        self.area = torch.cat(area)
-        self.size = int(model.values.numel())
+        self.model, self.delta = model, float(delta)
+        parts = [(i.int(), j.int(), ui.half(), uj.half(), a) for i, j, ui, uj, a in face_samples(model)]
+        self.leaf_i, self.leaf_j, self.u_i, self.u_j, self.area = (torch.cat(x) for x in zip(*parts))
 
     @property
     def samples(self) -> int:
         return int(self.area.numel())
 
+    def _chunks(self):
+        """(slice, w_i, idx_i, w_j, idx_j) per chunk of samples, at the model's current state."""
+        kind, off = self.model.leaf_type(), self.model.value_offsets()
+        for s in range(0, self.samples, self.CHUNK):
+            sl = slice(s, s + self.CHUNK)
+            wi, ii = basis_rows(self.model, self.leaf_i[sl].long(), self.u_i[sl].float(), kind, off)
+            wj, jj = basis_rows(self.model, self.leaf_j[sl].long(), self.u_j[sl].float(), kind, off)
+            yield sl, wi, ii, wj, jj
+
     def differences(self, c: torch.Tensor) -> torch.Tensor:
-        return (self.w_i * c[self.idx_i]).sum(1) - (self.w_j * c[self.idx_j]).sum(1)
+        return torch.cat([(wi * c[ii]).sum(1) - (wj * c[jj]).sum(1) for _, wi, ii, wj, jj in self._chunks()])
 
     def value_and_gradient(self, c: torch.Tensor) -> tuple[float, torch.Tensor]:
-        t = self.differences(c)
         d = self.delta
-        value = torch.where(t.abs() <= d, 0.5 * t * t, d * (t.abs() - 0.5 * d))
-        slope = (self.area * t.clamp(-d, d))[:, None]
-        g = torch.zeros(self.size, device=c.device)
-        g.index_add_(0, self.idx_i.reshape(-1), (slope * self.w_i).reshape(-1))
-        g.index_add_(0, self.idx_j.reshape(-1), (-slope * self.w_j).reshape(-1))
-        return float((self.area * value).sum()), g
+        value = 0.0
+        g = torch.zeros_like(c)
+        for sl, wi, ii, wj, jj in self._chunks():
+            t = (wi * c[ii]).sum(1) - (wj * c[jj]).sum(1)
+            area = self.area[sl]
+            value += float((area * torch.where(t.abs() <= d, 0.5 * t * t, d * (t.abs() - 0.5 * d))).sum())
+            slope = (area * t.clamp(-d, d))[:, None]
+            g.index_add_(0, ii.reshape(-1), (slope * wi).reshape(-1))
+            g.index_add_(0, jj.reshape(-1), (-slope * wj).reshape(-1))
+        return value, g
 
     def curvature(self) -> torch.Tensor:
-        d = torch.zeros(self.size, device=self.area.device)
-        d.index_add_(0, self.idx_i.reshape(-1), (2.0 * self.area[:, None] * self.w_i).reshape(-1))
-        d.index_add_(0, self.idx_j.reshape(-1), (2.0 * self.area[:, None] * self.w_j).reshape(-1))
+        d = torch.zeros(int(self.model.values.numel()), device=self.area.device)
+        for sl, wi, ii, wj, jj in self._chunks():
+            a = 2.0 * self.area[sl, None]
+            d.index_add_(0, ii.reshape(-1), (a * wi).reshape(-1))
+            d.index_add_(0, jj.reshape(-1), (a * wj).reshape(-1))
         return d
