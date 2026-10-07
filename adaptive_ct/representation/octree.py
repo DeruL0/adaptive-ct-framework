@@ -112,6 +112,7 @@ class BernsteinOctree(nn.Module):
         self.l0_shape = self.level_shapes[0]
         self.cuda_integrator = bool(cuda_integrator)
         self.max_leaf_count = int(max_leaf_count) if max_leaf_count is not None else None
+        self.last_split_report: dict = {}  # what the last split_leaves_batch changed beyond the function (2 % rule)
         self._morton_bits = max(1, math.ceil(math.log2(max(self.level_shapes[-1]))))
         coords = _grid_coords(self.l0_shape)
         n = coords.shape[0]
@@ -432,8 +433,16 @@ class BernsteinOctree(nn.Module):
         q = (torch.arange(4, device=device, dtype=torch.float32) + 0.5) / 4
         u = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
         sv = ((u[None, None] - 0.5) * cg[..., None, :3]).sum(-1) - cg[..., 3:4]
-        mean_h = torch.where(cg[..., 4:5] > 0, torch.sigmoid(sv / cg[..., 4:5].clamp_min(1e-30)), (sv > 0).float()).mean(-1)
+        Hs = torch.where(cg[..., 4:5] > 0, torch.sigmoid(sv / cg[..., 4:5].clamp_min(1e-30)), (sv > 0).float())
+        mean_h = Hs.mean(-1)
         flat = torch.minimum(mean_h, 1 - mean_h) < 0.02
+        # what this lossy rule changes: |c1 - c0| times the deviation of H from its mean, over the flattened children
+        jump = (pair[:, None, 1] - pair[:, None, 0]).abs()
+        deviation = (Hs - mean_h[..., None]).abs()
+        self.last_split_report = {
+            "step_children": int(flat.numel()), "children_to_constant": int(flat.sum()),
+            "max_abs_change": float((deviation.amax(-1) * jump)[flat].max()) if bool(flat.any()) else 0.0,
+            "rms_change": float(((deviation ** 2).mean(-1) * jump ** 2)[flat].mean().sqrt()) if bool(flat.any()) else 0.0}
         vals[c, :, 0] = torch.where(flat, (1 - mean_h) * pair[:, None, 0] + mean_h * pair[:, None, 1], pair[:, None, 0].expand(-1, 8))
         vals[c, :, 1] = pair[:, None, 1]
         geometry[c] = pad_geometry(cg.reshape(-1, 5)).reshape(-1, 8, GEOMETRY_WIDTH)

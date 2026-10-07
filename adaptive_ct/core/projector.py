@@ -76,12 +76,12 @@ def bernstein_octree_integrate(values, step_geometry, *, root, children, n_tri, 
 
 
 def bernstein_octree_decision_accumulate(values, step_geometry, *, root, children, n_tri, n_step, level_shapes, rays,
-                                         candidate_geometry, residual, fold, accum) -> torch.Tensor:
-    """Add the decision statistics of the rays (see segment_decision in bernstein_octree.cu) into accum (2, N, 97)."""
+                                         candidate_geometry, residual, accum) -> torch.Tensor:
+    """Add the decision statistics of the rays (see segment_decision in bernstein_octree.cu) into accum (N, 102) (float32; one view per call)."""
     require_native()
     return _NATIVE.bernstein_octree_decision_accumulate(
         *_tree_args(values, step_geometry, root, children, n_tri, n_step, level_shapes, rays), candidate_geometry.contiguous(),
-        residual.contiguous(), fold.to(torch.int32).contiguous(), accum, int(candidate_geometry.shape[0]))
+        residual.contiguous(), accum, int(candidate_geometry.shape[0]))
 
 
 def bernstein_octree_geometry_accumulate(values, step_geometry, *, root, children, n_tri, n_step, level_shapes, rays, residual,

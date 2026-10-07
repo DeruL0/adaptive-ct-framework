@@ -264,14 +264,16 @@ __global__ void backward_kernel(Tree T, Rays R, const float* grad_out, float* gr
 //   constant: L · trilinear: 8 corner basis integrals · step: (L - I, I) with the candidate geometry ·
 //   split: length inside each of the 8 children (current function + one constant per child)
 // and b = (this leaf's current contribution) - (ray residual), the data seen by a refit of this leaf with all
-// other leaves fixed.  Accumulated per leaf and ray half (fold) into DECISION_STRIDE floats:
+// other leaves fixed.  Accumulated per leaf into DECISION_STRIDE floats (one view per call; the caller adds the
+// views up in double: statistics that are subtracted later lose their digits when summed in float):
 //   0 L*L, 1 L*b | 2..37 trilinear G (upper, row major), 38..45 trilinear*b | 46..48 step G (00, 01, 11),
-//   49..50 step*b | 51..86 split G (upper), 87..94 split*(-residual) | 95 b*b | 96 residual^2
-constexpr int DECISION_STRIDE = 97;
-constexpr int DECISION_THREADS = 64;  // 64 rows of 97 floats of shared memory per block
+//   49..50 step*b | 51..86 split G (upper), 87..94 split*(-residual) | 95 b*b | 96 residual^2 |
+//   97..99 current-geometry step G (00, 01, 11), 100..101 current step*b (zero for leaves that are not steps)
+constexpr int DECISION_STRIDE = 102;
+constexpr int DECISION_THREADS = 64;  // 64 rows of DECISION_STRIDE floats of shared memory per block
 
 __device__ void segment_decision(const Tree& T, const Segment& s, const float* candidate, float* accum, int64_t leaf_count,
-                                 int fold, float residual, float* shared_rows) {
+                                 float residual, float* shared_rows) {
     const float length = s.t1 - s.t0;
     const float b = segment_value(T, s) - residual;
     float tri[8];
@@ -319,16 +321,27 @@ __device__ void segment_decision(const Tree& T, const Segment& s, const float* c
     for (int i = 0; i < 8; ++i) row[k++] = -child[i] * residual;
     row[k++] = b * b;
     row[k++] = residual * residual;
-    group_add(shared_rows, DECISION_STRIDE, DECISION_STRIDE, static_cast<unsigned long long>(s.leaf * 2 + fold),
-              accum + (static_cast<int64_t>(fold) * leaf_count + s.leaf) * DECISION_STRIDE);
+    float cur[2] = {0.0f, 0.0f};  // the leaf's own step with its current geometry: the baseline of a step leaf's options
+    if (leaf_kind(T, s.leaf) == 2) {
+        const float Ic = step_integral(T.geometry + 8 * (s.leaf - T.n_tri), s);
+        cur[0] = length - Ic;
+        cur[1] = Ic;
+    }
+    row[k++] = cur[0] * cur[0];
+    row[k++] = cur[0] * cur[1];
+    row[k++] = cur[1] * cur[1];
+    row[k++] = cur[0] * b;
+    row[k++] = cur[1] * b;
+    group_add(shared_rows, DECISION_STRIDE, DECISION_STRIDE, static_cast<unsigned long long>(s.leaf),
+              accum + s.leaf * DECISION_STRIDE);
 }
 
-__global__ void decision_kernel(Tree T, Rays R, const float* candidate, const float* residual, const int32_t* fold, float* accum,
+__global__ void decision_kernel(Tree T, Rays R, const float* candidate, const float* residual, float* accum,
                                 int64_t leaf_count) {
     __shared__ float rows[DECISION_THREADS * DECISION_STRIDE];
     const int ray = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray >= R.count) return;
-    traverse(T, R, ray, [&](const Segment& s) { segment_decision(T, s, candidate, accum, leaf_count, fold[ray], residual[ray], rows); });
+    traverse(T, R, ray, [&](const Segment& s) { segment_decision(T, s, candidate, accum, leaf_count, residual[ray], rows); });
 }
 
 // Step geometry normal equations (training/geometry.py): for every segment in a step leaf the derivative of the
@@ -444,19 +457,18 @@ at::Tensor bernstein_octree_integrate_backward_cuda(TREE_ARGS, at::Tensor grad_o
     return grad;
 }
 
-at::Tensor bernstein_octree_decision_accumulate_cuda(TREE_ARGS, at::Tensor candidate, at::Tensor residual, at::Tensor fold, at::Tensor accum,
+at::Tensor bernstein_octree_decision_accumulate_cuda(TREE_ARGS, at::Tensor candidate, at::Tensor residual, at::Tensor accum,
                                                      int64_t leaf_count) {
     MAKE_TREE_RAYS
     check(candidate, at::kFloat, "candidate_geometry");
     check(residual, at::kFloat, "residual");
-    check(fold, at::kInt, "fold");
     check(accum, at::kFloat, "accum");
     TORCH_CHECK(candidate.dim() == 2 && candidate.size(0) == leaf_count && candidate.size(1) == 8, "candidate_geometry must be (N, 8).");
-    TORCH_CHECK(residual.numel() == R.count && fold.numel() == R.count, "residual / fold must match the rays.");
-    TORCH_CHECK(accum.numel() == 2 * leaf_count * DECISION_STRIDE, "accum must be (2, N, 97).");
+    TORCH_CHECK(residual.numel() == R.count, "residual must match the rays.");
+    TORCH_CHECK(accum.numel() == leaf_count * DECISION_STRIDE, "accum must be (N, 102).");
     if (R.count)
         decision_kernel<<<(R.count + DECISION_THREADS - 1) / DECISION_THREADS, DECISION_THREADS, 0, stream>>>(T, R, candidate.data_ptr<float>(), residual.data_ptr<float>(),
-                                                        fold.data_ptr<int32_t>(), accum.data_ptr<float>(), leaf_count);
+                                                        accum.data_ptr<float>(), leaf_count);
     launched("octree decision kernel");
     return accum;
 }

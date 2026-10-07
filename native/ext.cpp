@@ -11,7 +11,7 @@ at::Tensor project_dense_parallel_forward_cuda(
 #define TREE_ARGS at::Tensor values, at::Tensor geometry, at::Tensor root, at::Tensor children, int64_t n_tri, int64_t n_step,     int64_t levels, int64_t rx, int64_t ry, int64_t rz, at::Tensor angles, at::Tensor rows, at::Tensor cols, int64_t dh, int64_t dw
 at::Tensor bernstein_octree_integrate_forward_cuda(TREE_ARGS);
 at::Tensor bernstein_octree_integrate_backward_cuda(TREE_ARGS, at::Tensor grad_output);
-at::Tensor bernstein_octree_decision_accumulate_cuda(TREE_ARGS, at::Tensor candidate, at::Tensor residual, at::Tensor fold, at::Tensor accum,
+at::Tensor bernstein_octree_decision_accumulate_cuda(TREE_ARGS, at::Tensor candidate, at::Tensor residual, at::Tensor accum,
                                                      int64_t leaf_count);
 
 at::Tensor bernstein_octree_geometry_accumulate_cuda(TREE_ARGS, at::Tensor residual, at::Tensor accum);

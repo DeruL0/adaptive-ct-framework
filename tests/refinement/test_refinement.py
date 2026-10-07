@@ -7,7 +7,8 @@ from adaptive_ct.core.projector import has_bernstein_native
 from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
 from adaptive_ct.data.dataset import ProjectionSplit
-from adaptive_ct.refinement.decision import candidate_step_geometry, decide_and_apply, decision_views, local_statistics, resolvable_mask
+from adaptive_ct.refinement.decision import (candidate_step_geometry, child_minimum, decide_and_apply, decision_views, evaluate_options,
+                                             local_statistics, resolvable_mask)
 from adaptive_ct.representation.octree import BernsteinOctree
 from adaptive_ct.training.solve import solve
 
@@ -77,6 +78,37 @@ class DecisionTests(unittest.TestCase):
         _random_values(truth, 3)
         report = _decide(truth, _split_from(truth), byte_budget=10**9)
         self.assertEqual(sum(report["actions"].values()), 0)
+
+    def test_value_refit_alone_earns_no_structure_change(self):
+        # Data from a trilinear tree; the model has that tree with the values of one leaf perturbed.  Refitting the
+        # values of that leaf (same type) removes all its error, so no split or type change may be credited for it.
+        # (Neighbouring leaves may still gain: with the perturbed leaf fixed, finer cells compensate for its error.)
+        truth = _model(levels=(2, 4, 8))
+        _random_values(truth, 21)
+        split = _split_from(truth)
+        model = _model(levels=(2, 4, 8))
+        with torch.no_grad():
+            model.values.copy_(truth.values)
+            model.values[8 * 3 : 8 * 3 + 8] += 0.25 * torch.rand(8)
+        candidate = candidate_step_geometry(model, detector_w=DETECTOR)
+        acc = local_statistics(model, split, decision_views(split, 16, 0), candidate)
+        self.assertGreater(float(acc[:, 3, 96].sum()), 1e-3)  # the leaf's rays do show an error
+        gains = evaluate_options(acc, -child_minimum(model), model.leaf_type())
+        self.assertLessEqual(float(gains[3].max()), 0.0, gains[3].tolist())
+
+    def test_candidate_equal_to_the_current_type_has_zero_gain(self):
+        model = _model(levels=(2, 4, 8), trilinear=False)
+        _random_values(model, 5)
+        model.set_types([0, 3], [2, 2], torch.tensor([0.1, 0.6, 0.2, 0.7]),
+                        torch.tensor([[0.6, 0.8, 0.0, 0.1, 0.05], [0.0, 0.6, 0.8, -0.1, 0.0]]))
+        truth = _model(levels=(2, 4, 8))
+        _random_values(truth, 8)
+        split = _split_from(truth)
+        candidate = model.geometry(torch.arange(model.leaf_count))  # candidate geometry = the current one
+        acc = local_statistics(model, split, decision_views(split, 16, 0), candidate)
+        gains = evaluate_options(acc, -child_minimum(model), model.leaf_type())
+        steps = torch.nonzero(model.leaf_type() == 2).flatten()
+        self.assertTrue(torch.allclose(gains[steps, 2], torch.zeros(steps.numel(), dtype=gains.dtype), atol=1e-9))
 
     def test_planar_step_inside_a_leaf_becomes_a_step_leaf(self):
         truth = _model(levels=(1, 2, 4), trilinear=False)
@@ -148,9 +180,10 @@ class DecisionCudaTests(unittest.TestCase):
         cuda = local_statistics(model, split, views, candidate)
         model.cuda_integrator = False
         reference = local_statistics(model, split, views, candidate)
-        for key in reference:
-            scale = float(reference[key].abs().max()) + 1e-12
-            self.assertLess(float((cuda[key] - reference[key]).abs().max()) / scale, 2e-4, key)
+        self.assertEqual(cuda.dtype, torch.float64)
+        for column in range(cuda.shape[-1]):  # every statistic: the kernel (float32 per view) against the reference
+            scale = float(reference[..., column].abs().max()) + 1e-12
+            self.assertLess(float((cuda[..., column] - reference[..., column]).abs().max()) / scale, 2e-4, column)
 
 
 if __name__ == "__main__":
