@@ -133,6 +133,7 @@ def stage_solve(run_dir, repeats, max_seconds):
         views = list(range(int(ds.train.angles.numel())))
         c = model.values.detach().clone()
         g, J = gradient(model, c, ds.train.angles, ds.train.projections, views)
+        J = float(J)
         R, gR = penalty.value_and_gradient(c)
         d_ref = sstate["d"]
         rho = float((c - (c - (g + weight * gR) / d_ref).clamp_min(0)).norm() / c.norm())

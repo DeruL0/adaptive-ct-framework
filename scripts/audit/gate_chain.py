@@ -345,6 +345,7 @@ def stage_edge_penalty(ds):
     m0.values.requires_grad_(True)
     c0 = m0.values.detach().clone()
     _, J = gradient(m0, c0, ds.train.angles, ds.train.projections, list(range(int(ds.train.angles.numel()))))
+    J = float(J)
     R, _ = EdgePenalty(m0, delta).value_and_gradient(c0)
     print(f"start: data term {J:.4g}, penalty {R:.4g}", flush=True)
     out = {"delta": delta, "data_term_start": J, "penalty_start": R}

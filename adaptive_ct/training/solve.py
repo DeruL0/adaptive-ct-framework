@@ -59,7 +59,7 @@ def _sweep(model, angles, projections, views, residual):
         e = residual(model.integrate_ray_batch(batch), batch.target)
         loss = 0.5 * (e * e).sum()
         loss.backward()
-        total += float(loss.detach())
+        total = total + loss.detach()  # on the device: a host read per batch stalls the GPU queue
     return total
 
 
@@ -126,7 +126,7 @@ def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolat
     while spent < passes:
         if pending is None:
             g, J = gradient(model, z, angles, projections, views)
-            g, J, R = penalised(g, J, z)
+            g, J, R = penalised(g, float(J), z)
             spent += 1
         else:  # the gradient at z was taken by the last convergence check
             (g, J, R), pending = pending, None
@@ -145,7 +145,7 @@ def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolat
                "seconds": time.time() - t0, "detector_bin": detector_bin, "penalty": R}
         if resid <= tol:
             gv, Jv = gradient(model, c, angles, projections, views)
-            gv, Jv, Rv = penalised(gv, Jv, c)
+            gv, Jv, Rv = penalised(gv, float(Jv), c)
             spent += 1
             row["pass"] = spent  # the check took a pass of its own
             rho = float((c - (c - gv / d).clamp_min(0)).norm() / c.norm().clamp_min(1e-30))

@@ -248,6 +248,7 @@ __global__ void forward_kernel(Tree T, Rays R, float* out) {
 }
 
 __global__ void backward_kernel(Tree T, Rays R, const float* grad_out, float* grad_values) {
+    __shared__ float rows[THREADS * 9];  // one row per thread: the segment's up to 8 gradient terms (odd stride)
     const int ray = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray >= R.count) return;
     const float g = grad_out[ray];
@@ -255,8 +256,8 @@ __global__ void backward_kernel(Tree T, Rays R, const float* grad_out, float* gr
         float w[8];
         int64_t off;
         const int n = segment_weights(T, s, w, &off);
-        const cg::coalesced_group peers = cg::labeled_partition(cg::coalesced_threads(), static_cast<unsigned int>(s.leaf));
-        for (int k = 0; k < n; ++k) warp_add(peers, grad_values + off + k, g * w[k]);
+        for (int k = 0; k < n; ++k) rows[threadIdx.x * 9 + k] = g * w[k];
+        group_add(rows, n, 9, static_cast<unsigned long long>(s.leaf), grad_values + off);
     });
 }
 

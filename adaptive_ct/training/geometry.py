@@ -57,7 +57,7 @@ def _reference_accumulate(model, batch, residual, accum):
 
 @torch.no_grad()
 def data_term(model, angles, projections, views) -> float:
-    return sum(0.5 * float(((model.integrate_ray_batch(b) - b.target) ** 2).sum()) for b in ray_batches(angles, projections, views))
+    return float(sum(0.5 * ((model.integrate_ray_batch(b) - b.target) ** 2).sum() for b in ray_batches(angles, projections, views)))
 
 
 @torch.no_grad()
@@ -67,13 +67,13 @@ def statistics(model, angles, projections, views) -> tuple[torch.Tensor, float]:
     J = 0.0
     for batch in ray_batches(angles, projections, views):
         r = model.integrate_ray_batch(batch) - batch.target
-        J += 0.5 * float((r * r).sum())
+        J = J + 0.5 * (r * r).sum()
         if model.uses_cuda():
             bernstein_octree_geometry_accumulate(model.values, model.step_geometry, **model.tree_arguments(), rays=batch, residual=r, accum=accum)
         else:
             with torch.enable_grad():
                 _reference_accumulate(model, batch, r, accum)
-    return accum, J
+    return accum, float(J)
 
 
 @torch.no_grad()
