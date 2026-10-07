@@ -313,9 +313,9 @@ def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: 
     shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=device)[model.leaf_levels[ids]]
     size = 2.0 / shapes
     points = (-1.0 + model.leaf_coords[ids].float() * size)[:, None, :] + u[None] * size[:, None, :]
-    f = model.forward_mu(points.reshape(-1, 3)).reshape(ids.numel(), -1)  # (n, P)
-    p = torch.stack([1 - u, u], -1)
-    tri = (p[:, 0, :, None, None] * p[:, 1, None, :, None] * p[:, 2, None, None, :]).reshape(-1, 8)
+    f = torch.cat([model.forward_mu(points[a : a + 32768].reshape(-1, 3)).reshape(-1, u.shape[0])  # (n, P), in chunks of leaves
+                   for a in range(0, ids.numel(), 32768)])
+    tri = trilinear_weights(u)
     counts = torch.tensor([1, 8, 2], device=device)[types]
     starts = torch.cumsum(counts, 0) - counts
     out = torch.zeros(int(counts.sum()), device=device)
@@ -328,10 +328,12 @@ def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: 
             s = ((u[None] - 0.5) * gs[:, None, :3]).sum(-1) - gs[:, 3:4]
             H = torch.sigmoid(s / gs[:, 4:5].clamp_min(1e-30))
             B = torch.stack([1 - H, H], -1)  # (n, P, 2)
-        else:
-            B = (torch.ones((samples ** 3, 1), device=device) if t == 0 else tri)[None].expand(sel.numel(), -1, -1)
-        G = torch.einsum("npi,npj->nij", B, B).reshape(sel.numel(), -1)
-        h = torch.einsum("npi,np->ni", B, f[sel])
+            G = torch.einsum("npi,npj->nij", B, B).reshape(sel.numel(), -1)
+            h = torch.einsum("npi,np->ni", B, f[sel])
+        else:  # the same basis in every leaf
+            B = torch.ones((samples ** 3, 1), device=device) if t == 0 else tri
+            G = (B.T @ B).reshape(1, -1).expand(sel.numel(), -1)
+            h = f[sel] @ B
         c = _fit(G, h, torch.zeros_like(h))
         out[(starts[sel, None] + torch.arange(c.shape[1], device=device)).reshape(-1)] = c.reshape(-1)
     return out
@@ -350,6 +352,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     acc = local_statistics(model, split, views, candidate, prior)
     del prior
     gains = evaluate_options(acc, -child_minimum(model))
+    del acc  # free the statistics before the edits
     per_leaf = leaf_bytes().to(device)
     extra = torch.stack([per_leaf[0] - per_leaf[kind], per_leaf[1] - per_leaf[kind], per_leaf[2] - per_leaf[kind],
                          split_bytes(kind)], 1)
