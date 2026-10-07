@@ -1,0 +1,9 @@
+# Diagnostic: main pipeline with twice the byte budget (16 MiB).
+extends: p1.yaml
+
+training:
+  refinement:
+    byte_budget: 16777216
+
+output:
+  dir: output\main_p1_16mib
