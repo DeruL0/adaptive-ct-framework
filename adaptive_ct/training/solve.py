@@ -6,7 +6,8 @@ A is the exact projector of the current octree (linear in c = model.values, nonn
                                                         c - g/d never increases J)
   update       c <- max(0, c - g / d)                  (truncation = the legal projection onto c >= 0)
 Speed-ups that keep the same solution:
-  groups       views split into G angle-interleaved groups; each update uses one group (gradient x G)
+  groups       views split into G angle-interleaved groups; each update uses one group (gradient x G; the
+               penalty gradient is evaluated once per grouped pass)
   extrapolate  evaluate the gradient at  z = max(0, c + beta (c - c_prev))  with beta from the standard
                (t-1)/t_next sequence; drop the extrapolation when the step turns against the last move
 Convergence is measured by the optimality residual ||z - max(0, z - g/d)|| / ||c|| at the feasible point z;
@@ -105,10 +106,10 @@ def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolat
     history, spent, t0, converged = [], 1.0, time.time(), False  # the curvature pass counts as one pass
 
     while spent < 1 + group_passes:
+        gR = penalty.value_and_gradient(c)[1] if beta > 0 else 0.0  # once per pass, shared by the groups (24 evaluations cost ~2.5 s)
         for grp in view_groups:
             g, _ = gradient(model, c, angles, projections, grp)
-            g, _, _ = penalised(groups * g, 0.0, c)
-            c = (c - g / d).clamp_min(0)
+            c = (c - (groups * g + beta * gR) / d).clamp_min(0)
         spent += 1
         if on_pass:
             history.append({"pass": spent, "phase": "grouped", "seconds": time.time() - t0, **on_pass(c)})
