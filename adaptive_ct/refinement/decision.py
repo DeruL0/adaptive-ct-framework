@@ -155,6 +155,16 @@ def _accumulate_reference(model, batch, residual, candidate, acc, slot):
     acc.index_add_(0, slot[pair_leaf[keep]].long(), rows[keep])
 
 
+def step_side_fraction(geometry: torch.Tensor, samples: int = 4) -> torch.Tensor:
+    """Volume fraction of the smaller side of each step (mean of H or 1 - H over samples^3 points of the leaf)."""
+    q = (torch.arange(samples, device=geometry.device, dtype=torch.float32) + 0.5) / samples
+    u = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
+    s = ((u[None] - 0.5) * geometry[:, None, :3]).sum(-1) - geometry[:, 3:4]
+    w = geometry[:, 4:5]
+    mean_h = torch.where(w > 0, torch.sigmoid(s / w.clamp_min(1e-30)), (s > 0).float()).mean(1)
+    return torch.minimum(mean_h, 1 - mean_h)
+
+
 @torch.no_grad()
 def _slot_map(N: int, ids, device) -> torch.Tensor:
     """(N,) int32 row of each leaf in statistics kept for `ids` only (all leaves, in order, when None); -1 elsewhere."""
@@ -487,6 +497,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     allowed = torch.zeros((N, 4), dtype=torch.bool, device=device)
     allowed[:, :3] = type_allowed[None, :] & (torch.arange(3, device=device)[None, :] != kind[:, None])
     allowed[:, 2] |= type_allowed[2] & (kind == 2)  # a step leaf may take the newly estimated geometry
+    allowed[:, 2] &= step_side_fraction(candidate) >= 0.02  # a step must split its leaf, not shave a corner
     allowed[:, 0] &= (kind == 0) | (value_span(model) < float(penalty_delta))  # downgrade to constant: flat leaves only
     if frozen is not None:
         allowed[:, :3] &= ~frozen[:, None]
@@ -554,6 +565,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     # 2. splits (function preserving)
     if split_cells.numel():
         model.split_leaves_batch(model.ids_of_cells(split_cells))
+        report["split_step_children"] = model.last_split_report  # the lossy part of the splits (step children turned constant)
     lap("edits")
     report["bytes_after"] = model_bytes(model)
     report["leaf_type_counts"] = dict(zip(TYPE_NAMES, torch.bincount(model.leaf_type(), minlength=3).tolist()))

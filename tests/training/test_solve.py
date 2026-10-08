@@ -74,7 +74,7 @@ class FixedTreeSolverTests(unittest.TestCase):
         # the estimate (subset losses right after their updates + beta R) is what stops the solve: it must track J
         split = _problem()
         model = _start()
-        penalty = EdgePenalty(model, 0.02, 1.0)
+        penalty = EdgePenalty(model, 0.02)
         _, hist, _ = solve(model, split, subsets=4, tol=-1e9, max_epochs=8, min_epochs=1, penalty=penalty, penalty_weight=50.0)
         exact = _data_term(model, split) + 50.0 * penalty.value_and_gradient(model.values.detach())[0]
         self.assertAlmostEqual(hist[-1]["objective_estimate"], exact, delta=0.1 * exact + 1e-3)

@@ -5,7 +5,7 @@ Per step leaf L, with D_ray = d(prediction of the ray)/d theta_L (5 numbers, CUD
   g_L = sum residual * D,   G_L = sum D D^T   (rays through several step leaves: their coupling is ignored),
   delta_L = -(G_L + 0.1 diag(G_L) + eps I)^-1 g_L, each part capped (|dn| <= 0.25, |dd| <= 0.1, w within [w/2, 2w]).
 Constraints after the step: n renormalised (d, w scaled with it, same function), w >= a quarter detector pixel,
-and the plane inside the leaf (a side the data hardly see is held by the ghost penalty, regularizer.py).
+the plane inside the leaf, and both sides >= 2% of the leaf (otherwise the leaf keeps its geometry).
 The whole step is accepted only if J decreases; otherwise it is halved, up to three tries.  The first try uses
 `alpha` (the loop passes the step accepted last time: later rounds accept 1/2 or 1/4, so starting at 1 wastes passes).
 """
@@ -21,6 +21,14 @@ from adaptive_ct.training.regularizer import EdgePenalty
 from adaptive_ct.training.solve import binned, ray_batches
 
 STATS = 20
+
+
+def _side_fraction(g: torch.Tensor, samples: int = 4) -> torch.Tensor:
+    q = (torch.arange(samples, device=g.device, dtype=torch.float32) + 0.5) / samples
+    u = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
+    s = ((u[None] - 0.5) * g[:, None, :3]).sum(-1) - g[:, 3:4]
+    h = torch.sigmoid(s / g[:, 4:5].clamp_min(1e-30)).mean(1)
+    return torch.minimum(h, 1 - h)
 
 
 def _reference_accumulate(model, batch, residual, accum):
@@ -69,8 +77,7 @@ def statistics(model, angles, projections, views) -> tuple[torch.Tensor, float]:
 
 
 @torch.no_grad()
-def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, penalty_delta: float, penalty_ghost: float, alpha: float = 1.0,
-                  tries: int = 3) -> dict:
+def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, penalty_delta: float, alpha: float = 1.0, tries: int = 3) -> dict:
     t0 = time.perf_counter()
     if model.n_step == 0:
         return {"step_leaves": 0}
@@ -78,7 +85,7 @@ def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, pen
     views = list(range(int(angles.numel())))
     beta = float(penalty_weight) / detector_bin**2
 
-    penalty = EdgePenalty(model, penalty_delta, penalty_ghost) if beta > 0 else None  # samples and ghost side weights fixed; basis weights follow the geometry
+    penalty = EdgePenalty(model, penalty_delta) if beta > 0 else None  # samples fixed; weights follow the geometry
     R = lambda: penalty.value_and_gradient(model.values.detach())[0] if penalty is not None else 0.0
     objective = lambda: data_term(model, angles, projections, views) + beta * R()
     accum, J_data = statistics(model, angles, projections, views)
@@ -106,7 +113,7 @@ def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, pen
         g[:, 4] = torch.maximum(g[:, 4], w_min)
         extent = 0.5 * g[:, :3].abs().sum(1)
         g[:, 3] = torch.maximum(torch.minimum(g[:, 3], 0.98 * extent), -0.98 * extent)
-        ok = old[:, 4] > 0
+        ok = (_side_fraction(g) >= 0.02) & (old[:, 4] > 0)
         model.step_geometry[:, :5] = torch.where(ok[:, None], g, old[:, :5])
         J = objective()
         if J < J0:

@@ -119,12 +119,12 @@ def run_training(config_path: str | Path) -> dict:
         geometry = []
         for _ in range(int(solver_cfg["geometry_steps"]) if model.n_step else 0):
             geometry.append(geometry_step(model, dataset.train, detector_bin=detector_bin, penalty_weight=weight,
-                                          penalty_delta=float(edge["delta"]), penalty_ghost=float(edge["ghost"]), alpha=alpha))
+                                          penalty_delta=float(edge["delta"]), alpha=alpha))
             alpha = geometry[-1]["accepted_step"] or alpha / 8  # next first try: the step accepted now
         if final:  # the state every solver comparison starts from (audit/benchmark_pipeline.py)
             save_state(model, out_dir / "states" / "pre_final_solve.pt", config, dataset, round=r, detector_bin=detector_bin)
         t0 = time.perf_counter()
-        penalty = EdgePenalty(model, float(edge["delta"]), float(edge["ghost"])).freeze() if weight > 0 else None  # tree, types, geometry fixed from here
+        penalty = EdgePenalty(model, float(edge["delta"])).freeze() if weight > 0 else None  # tree, types, geometry fixed from here
         # A tree is only changed once its objective has stopped falling (tolerance per epoch): otherwise the solve goes
         # on (same denominators and running gradient) until it has, or the run's time limit is reached.
         solve_state, hist, continuations, epochs_used = {}, [], 0, 0

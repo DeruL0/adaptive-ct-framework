@@ -79,11 +79,10 @@ class BernsteinOctreeTests(unittest.TestCase):
         steps = torch.nonzero(model.leaf_type() == 2).flatten()
         self.assertEqual(model.split_leaves_batch(steps), 3)
         counts = model.stats().leaf_type_counts
-        self.assertEqual(sum(counts), 5 + 24)
+        self.assertEqual(sum(counts), 5 + 24)  # children with < 2% of one side become constant
         self.assertEqual(counts[1], 0)
-        self.assertGreater(counts[0], 5)  # children the plane does not cross became constant
-        # function preserving: the constant children take the value of their side (no lossy rule)
-        self.assertLess(float((before - model.forward_mu(points).detach()).abs().max()), 1e-5)
+        # exact where the step is kept, within 2% of the step height where a child became constant
+        self.assertLess(float((before - model.forward_mu(points).detach()).abs().max()), 0.02)
 
     def test_exact_projector_integrates_constant_field(self):
         model = BernsteinOctree(levels=[2, 4], leaf_types=("constant",))

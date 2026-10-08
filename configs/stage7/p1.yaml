@@ -36,7 +36,6 @@ training:
     edge_penalty:           # neighbouring leaves: jumps <= delta penalised quadratically, larger ones linearly
       weight: 1150          # held-out views prefer it with the relaxed OS-LALM (share 0.5: 4600 / 2300 / 1150 -> 53.24 / 53.62 / 53.78 dB)
       delta: 0.02
-      ghost: 1.0            # ghost penalty: each side of a step leaf tied to the neighbours on its side with the leaf's face area (Burman 2010)
   refinement:
     action_share: 0.35      # each round's net added bytes stay within this share of the remaining budget (0.7 / 0.5 / 0.35: 37.33 / 37.39 / 37.41 dB)
     stop_below_remaining: 0.01  # stop refining when less than this share of the budget is left
