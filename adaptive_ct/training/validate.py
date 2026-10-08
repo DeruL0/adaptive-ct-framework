@@ -19,7 +19,7 @@ def validate_config(config: dict) -> None:
     if not float(train_cfg.get("max_seconds", 0)) > 0:
         errors.append("training.max_seconds (time limit of the whole run, seconds) is required")
     ref = train_cfg.get("refinement")
-    keys = ("byte_budget", "action_share", "stop_below_remaining", "decision_views", "min_footprint_px", "max_rounds", "error_share", "spend_all_below")
+    keys = ("byte_budget", "action_share", "stop_below_remaining", "decision_views", "min_footprint_px", "max_rounds", "continuation_share", "spend_all_below")
     if not isinstance(ref, dict) or any(k not in ref for k in keys):
         errors.append("training.refinement needs " + ", ".join(keys))
     if errors:

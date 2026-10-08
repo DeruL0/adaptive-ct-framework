@@ -1,4 +1,3 @@
-import math
 import unittest
 from pathlib import Path
 
@@ -9,7 +8,7 @@ from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
 from adaptive_ct.data.dataset import ProjectionSplit
 from adaptive_ct.refinement.decision import (candidate_step_geometry, child_minimum, decide_and_apply, decision_views, evaluate_options,
-                                             local_statistics, modified_error, penalty_statistics, resolvable_mask)
+                                             local_statistics, penalty_statistics, resolvable_mask)
 from adaptive_ct.representation.octree import BernsteinOctree
 from adaptive_ct.training.solve import solve
 
@@ -37,7 +36,7 @@ def _split_from(truth, views=16):
 
 
 def _decide(model, split, **kw):
-    kw = {"action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, "error_share": 0.2, **kw}
+    kw = {"action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, "continuation_share": 0.2, **kw}
     report, _, _ = decide_and_apply(model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, **kw)
     return report
 
@@ -148,9 +147,7 @@ class DecisionTests(unittest.TestCase):
             values = torch.zeros_like(model.values)
             values[0] = 0.3  # one wrong leaf; every other leaf already sits at the bound 0
             model.values.copy_(values)
-        # error_share 0: the residual of the wrong leaf lies on every ray through it, so error-driven splits would also take
-        # leaves those rays cross (the error is attributed along the rays); this test is about the gains
-        report = _decide(model, split, byte_budget=10**9, action_share=1.0, error_share=0.0)
+        report = _decide(model, split, byte_budget=10**9, action_share=1.0)
         # only the wrong leaf can improve; its zero-valued neighbours would need negative values
         self.assertLessEqual(sum(report["actions"].values()), 1)
 
@@ -166,14 +163,9 @@ class DecisionTests(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available() and has_bernstein_native(), "Bernstein CUDA extension unavailable")
 class DecisionCudaTests(unittest.TestCase):
-    def test_modified_error_follows_the_parent(self):
-        e = torch.tensor([4.0, 4.0, 0.0], dtype=torch.float64)
-        out = modified_error(e, torch.tensor([math.inf, 4.0, 4.0], dtype=torch.float64))
-        self.assertEqual(out.tolist(), [4.0, 2.0, 0.0])  # no parent: e; an error the split did not reduce: halved; none: 0
-
-    def test_slab_thinner_than_the_children_is_split_by_error(self):
-        # a slab one finest cell wide inside root leaves: a one-level split only half-resolves it, so its one-step gain
-        # may not pay; the error share splits the leaves the slab crosses (largest error left after one split) first
+    def test_slab_thinner_than_the_children_continues_below_a_gain_split(self):
+        # a slab one finest cell wide inside root leaves: their one-level split gain is positive but need not pay; with
+        # the parents split by gain the share goes to exactly those leaves (gain per byte), without them to none
         truth = _model(trilinear=False)
         truth.split_leaves_batch(torch.arange(truth.leaf_count))
         truth.split_leaves_batch(torch.arange(truth.leaf_count))
@@ -183,13 +175,19 @@ class DecisionCudaTests(unittest.TestCase):
         split = _split_from(truth)
         model = _model(types=("constant", "trilinear"))  # no step: a type change saving bytes would take every leaf first
         solve(model, split, subsets=4, tol=1e-3, max_epochs=200, min_epochs=3)
-        report, _, (split_cells, errors) = decide_and_apply(
-            model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=4 * 150,
-            action_share=1.0, min_footprint_px=1.0, penalty_weight=0.0, penalty_delta=0.02, error_share=1.0)
-        self.assertEqual(report["actions"]["split"], report["error_splits"])  # every byte went by error
-        self.assertGreater(report["error_splits"], 0)
+        state = {k: v.clone() for k, v in model.state_dict().items()}
+        kw = dict(detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=4 * 150, action_share=1.0, min_footprint_px=1.0,
+                  penalty_weight=0.0, penalty_delta=0.02, continuation_share=1.0)
+        report, _, productive = decide_and_apply(model, split, decision_views(split, 16, 0), **kw)
+        self.assertEqual(report["actions"]["split"], 0)  # no parent split by gain: the share stays unspent
+        model.load_state_dict(state)
+        report, _, productive = decide_and_apply(model, split, decision_views(split, 16, 0),
+                                                 productive_parent=torch.ones(model.leaf_count, dtype=torch.bool), **kw)
+        self.assertGreater(report["continuation_splits"], 0)
+        self.assertEqual(report["actions"]["split"], report["continuation_splits"])  # every byte went to continuations
+        self.assertEqual(productive.numel(), 0)  # continuation splits do not make their children eligible
+        split_cells = model.cells[model.leaf_levels == 1] // 2
         self.assertTrue(bool((split_cells[:, 1] == 0).all()), split_cells.tolist())  # the slab lies in root cells x = 0
-        self.assertTrue(bool((errors > 0).all()))
 
     def test_cuda_statistics_match_reference(self):
         from tests.representation.test_octree import make_step

@@ -161,11 +161,11 @@ def stage_decision(run_dir, repeats):
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
-        report, _, _ = decide_and_apply(  # parents' modified errors are not saved: every leaf ranked by its own error (timing only)
+        report, _, _ = decide_and_apply(  # which parents split by gain is not saved: no continuation splits (timing only)
 model, ds.train, decision_views(ds.train, int(ref["decision_views"]), int(state["round"])), detector_h=h,
                                      detector_w=w, byte_budget=int(ref["byte_budget"]), action_share=float(ref["action_share"]),
                                      min_footprint_px=float(ref["min_footprint_px"]), penalty_weight=float(edge["weight"]),
-                                     penalty_delta=float(edge["delta"]), error_share=float(ref["error_share"]))
+                                     penalty_delta=float(edge["delta"]), continuation_share=float(ref["continuation_share"]))
         torch.cuda.synchronize()
         results.append({"seconds": time.perf_counter() - t0, "parts": report["seconds"], "actions": report["actions"],
                         "candidates_with_positive_gain": report["candidates_with_positive_gain"], "bytes_after": report["bytes_after"],
