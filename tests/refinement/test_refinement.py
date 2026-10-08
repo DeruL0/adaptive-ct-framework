@@ -154,6 +154,21 @@ class DecisionTests(unittest.TestCase):
         # only the wrong leaf can improve; its zero-valued neighbours would need negative values
         self.assertLessEqual(sum(report["actions"].values()), 1)
 
+    def test_value_span_marks_flat_leaves(self):
+        from adaptive_ct.refinement.decision import value_span
+        model = _model(levels=(2,), trilinear=False)
+        model.to_trilinear([0, 1])
+        model.set_types(torch.tensor([2]), torch.tensor([2]), torch.tensor([0.3, 0.31]), torch.tensor([[1.0, 0, 0, 0, 0.05]]))
+        with torch.no_grad():
+            off = model.value_offsets()
+            model.values[off[0] : off[0] + 8] = 0.2
+            model.values[off[0] + 5] = 0.5  # one corner of leaf 0 differs
+        span = value_span(model)
+        kind = model.leaf_type()
+        self.assertAlmostEqual(float(span[(kind == 1).nonzero()[0]]), 0.3, places=6)
+        self.assertAlmostEqual(float(span[(kind == 2).nonzero()[0]]), 0.01, places=6)
+        self.assertEqual(float(span[kind == 0].abs().max()), 0.0)
+
     def test_frozen_leaves_cannot_change_type(self):
         truth = _model(levels=(1, 2, 4), trilinear=False)
         truth.set_types([0], [2], torch.tensor([0.1, 0.5]), torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]]))

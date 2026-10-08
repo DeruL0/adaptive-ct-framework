@@ -82,7 +82,7 @@ class GeometryStepTests(unittest.TestCase):
         model = _step_model([0.6, 0.8, 0.0, -0.05, 0.06])
         error = lambda: float((model.step_geometry[0, :4] - truth.step_geometry[0, :4]).norm())
         before = error()
-        reports = [geometry_step(model, split, detector_bin=1, penalty_weight=0.0, penalty_delta=0.02) for _ in range(8)]
+        reports = [geometry_step(model, split, detector_bin=1, penalty_weight=0.0, penalty_delta=0.02, penalty_ghost=1.0) for _ in range(8)]
         self.assertTrue(all(r["objective_after"] <= r["objective_before"] for r in reports))
         self.assertGreater(reports[0]["accepted_step"], 0.0)
         self.assertLess(error(), 0.3 * before)

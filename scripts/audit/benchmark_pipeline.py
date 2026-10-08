@@ -89,11 +89,11 @@ def stage_ops(run_dir, repeats):
 
     out["forward_plus_backward_s"] = spread(sync_time(forward_backward, repeats))
     model.values.requires_grad_(False)
-    penalty = EdgePenalty(model, float(edge["delta"]))
+    penalty = EdgePenalty(model, float(edge["delta"]), float(edge["ghost"]))
     c = model.values.detach()
     base_allocated = torch.cuda.memory_allocated()
     out["penalty_samples"] = penalty.samples
-    out["penalty_build_s"] = spread(sync_time(lambda: EdgePenalty(model, float(edge["delta"])), max(1, repeats // 2)))
+    out["penalty_build_s"] = spread(sync_time(lambda: EdgePenalty(model, float(edge["delta"]), float(edge["ghost"])), max(1, repeats // 2)))
     out["penalty_value_gradient_s"] = spread(sync_time(lambda: penalty.value_and_gradient(c), repeats))
     out["penalty_curvature_s"] = spread(sync_time(penalty.curvature, repeats))
     out["penalty_freeze_s"] = spread(sync_time(penalty.freeze, max(1, repeats // 2)))
@@ -106,7 +106,7 @@ def stage_ops(run_dir, repeats):
 
         def one_geometry_step():
             model.step_geometry.copy_(saved)
-            geometry_step(model, ds.train, detector_bin=1, penalty_weight=float(edge["weight"]), penalty_delta=float(edge["delta"]), alpha=0.5)
+            geometry_step(model, ds.train, detector_bin=1, penalty_weight=float(edge["weight"]), penalty_delta=float(edge["delta"]), penalty_ghost=float(edge["ghost"]), alpha=0.5)
 
         out["geometry_step_s"] = spread(sync_time(one_geometry_step, max(1, repeats // 2)))
     return out
@@ -123,7 +123,7 @@ def stage_solve(run_dir, repeats, max_seconds, freeze=True):
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()  # penalty set-up included, as in training/loop.py
-        penalty = EdgePenalty(model, float(edge["delta"]))
+        penalty = EdgePenalty(model, float(edge["delta"]), float(edge["ghost"]))
         if freeze:
             penalty.freeze()
         sstate, calls, epochs, converged = {}, 0, 0, False
@@ -169,7 +169,7 @@ model, ds.train, decision_views(ds.train, int(ref["decision_views"]), int(state[
         torch.cuda.synchronize()
         results.append({"seconds": time.perf_counter() - t0, "parts": report["seconds"], "actions": report["actions"],
                         "candidates_with_positive_gain": report["candidates_with_positive_gain"], "bytes_after": report["bytes_after"],
-                        "split_step_children": report.get("split_step_children"), "peak_gb": torch.cuda.max_memory_allocated() / 2**30,
+                        "peak_gb": torch.cuda.max_memory_allocated() / 2**30,
                         "leaves": int(state["model"]["cells"].shape[0])})
         del model
     return {"runs": results, "seconds": spread([r["seconds"] for r in results])}

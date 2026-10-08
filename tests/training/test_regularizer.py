@@ -20,7 +20,7 @@ class EdgePenaltyTests(unittest.TestCase):
         model = _tree()
         with torch.no_grad():
             model.values.fill_(0.4)
-        penalty = EdgePenalty(model, delta=0.05)
+        penalty = EdgePenalty(model, delta=0.05, ghost=1.0)
         value, grad = penalty.value_and_gradient(model.values.detach())
         self.assertAlmostEqual(value, 0.0, places=9)
         self.assertLess(float(grad.abs().max()), 1e-6)
@@ -31,7 +31,7 @@ class EdgePenaltyTests(unittest.TestCase):
     def test_gradient_and_curvature_bound(self):
         torch.manual_seed(0)
         model = _tree()
-        penalty = EdgePenalty(model, delta=0.05)
+        penalty = EdgePenalty(model, delta=0.05, ghost=1.0)
         c = 0.05 + 0.5 * torch.rand(model.values.numel(), dtype=torch.float32)
         value, grad = penalty.value_and_gradient(c)
         step = 1e-3 * torch.randn_like(c)
@@ -46,7 +46,7 @@ class EdgePenaltyTests(unittest.TestCase):
     def test_frozen_weights_give_the_same_value_gradient_and_curvature(self):
         torch.manual_seed(3)
         model = _tree()
-        penalty = EdgePenalty(model, delta=0.05)
+        penalty = EdgePenalty(model, delta=0.05, ghost=1.0)
         penalty.CHUNK = 7  # several chunks, the last one short
         c = 0.05 + 0.5 * torch.rand(model.values.numel())
         value, grad, curv = (*penalty.value_and_gradient(c), penalty.curvature())
@@ -95,7 +95,7 @@ class EdgePenaltyTests(unittest.TestCase):
         candidate = torch.tensor([[1.0, 0.0, 0.0, 0.1, 0.05]]).repeat(model.leaf_levels.numel(), 1)
         delta = 10.0  # every jump in the quadratic range: the surrogate is the penalty itself
         acc = penalty_statistics(model, delta, candidate).double()
-        R = EdgePenalty(model, delta).value_and_gradient(c)[0]
+        R = EdgePenalty(model, delta, 0.0).value_and_gradient(c)[0]  # the decision statistics model the edge term (no ghost)
         self.assertAlmostEqual(float(acc[:, 96].sum()), 4 * R, delta=1e-5 * max(1.0, R))  # each sample on both leaves, phi = t^2/2
         iu, ju = torch.triu_indices(8, 8)
         for leaf in torch.nonzero(model.leaf_type() == 1).flatten().tolist():  # refit option = current values: t unchanged
@@ -104,13 +104,30 @@ class EdgePenaltyTests(unittest.TestCase):
             G[ju, iu] = acc[leaf, 2:38]
             v = c[model.value_offsets()[leaf] + torch.arange(8)].double()
             self.assertAlmostEqual(float(v @ G @ v - 2 * acc[leaf, 38:46] @ v + acc[leaf, 95]), float(acc[leaf, 96]), places=5)
+    def test_ghost_penalty_holds_a_small_cut_side_at_its_neighbours(self):
+        # a step cutting off a small corner (u near (1, 1, 1)): no face sample lies on that side, so the edge penalty
+        # hardly sees its value c1; the ghost penalty ties c1 to the neighbours on that side with the leaf's face area
+        model = BernsteinOctree(levels=[2], leaf_types=("constant", "step"), cuda_integrator=False)
+        n = torch.ones(3) / 3 ** 0.5
+        model.set_types(torch.tensor([0]), torch.tensor([2]), torch.tensor([0.3, 0.9]), torch.cat([n, torch.tensor([0.8, 0.01])])[None])
+        with torch.no_grad():
+            model.values[2:] = 0.3  # the constant neighbours
+        c = model.values.detach().clone()
+        k = int(model.value_offsets()[0]) + 1  # c1, the small side
+        without = EdgePenalty(model, 0.05, 0.0).value_and_gradient(c)[1][k]
+        penalty = EdgePenalty(model, 0.05, 1.0)
+        grad = penalty.value_and_gradient(c)[1][k]
+        self.assertLess(abs(float(without)), 1e-4)
+        self.assertGreater(float(grad), 1e3 * abs(float(without)) + 1e-3)  # pulled down towards 0.3
+        self.assertAlmostEqual(float(grad), 0.05 * float(penalty.ghost_area[0]), places=5)  # A phi'(0.6) = A delta
+
     def test_large_jumps_cost_linearly(self):
         model = BernsteinOctree(levels=[2], leaf_types=("constant",), cuda_integrator=False)
         values = torch.full((8,), 0.1)
         values[model.find_leaf((0, 1, 0, 0))] = 0.1 + 1.0
         small = values.clone()
         small[model.find_leaf((0, 1, 0, 0))] = 0.1 + 0.01
-        penalty = EdgePenalty(model, delta=0.05)
+        penalty = EdgePenalty(model, delta=0.05, ghost=1.0)
         big, tiny = penalty.value_and_gradient(values)[0], penalty.value_and_gradient(small)[0]
         # jump 1.0 vs 0.01: quadratic would give 10^4 x, linear beyond delta gives far less
         self.assertLess(big / tiny, 1e3)

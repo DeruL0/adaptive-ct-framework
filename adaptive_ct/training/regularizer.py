@@ -12,6 +12,17 @@ Stored per sample: the two leaf indices (int32), both leaf-local points (fp16: d
 step geometry (so the same samples serve a geometry update).  freeze() evaluates them once instead and keeps them
 (two (n, 8) float32 sets and the first value index of each side, 72 bytes more per sample) for a solve, where tree,
 types and geometry do not change and the weights were 78 % of every value-and-gradient call.
+
+Ghost penalty (cut-cell stabilisation, Burman 2010): a step leaf's plane may cut off a small side whose value c_k few
+rays see; the data then hardly constrain it.  Each side k of each step leaf L is extended to the whole leaf (the
+"ghost" part) and tied to the neighbours' values on its side of the plane:
+  R_ghost = ghost * sum_L sum_k A_L phi(c_k - T_k),   T_k = sum_p beta_k(p) f_O(p)
+over L's face samples p (f_O the neighbour's function there), beta_k(p) proportional to area_p sigmoid(+-s(p) / TAU)
+(s = signed distance to the plane in leaf units, TAU = a quarter leaf: samples near side k count most) and summing
+to 1, A_L = L's sampled face area.  The weight of every side is A_L whatever the cut, so a value the data cannot see
+is held at its neighbours' (the same edge-preserving phi: a real edge at the leaf's face is penalised only
+linearly).  The side weights beta are evaluated from the step geometry when the penalty is built (and kept).
+Curvature bound: t_k = c_k - T_k has |coefficients| summing to 2 (beta and the basis weights each sum to 1).
 """
 
 from __future__ import annotations
@@ -68,12 +79,36 @@ def face_samples(model):
 
 class EdgePenalty:
     CHUNK = 1 << 21
+    TAU = 0.25  # width of the side weights of the ghost penalty, leaf units
 
-    def __init__(self, model, delta: float):
-        self.model, self.delta = model, float(delta)
+    def __init__(self, model, delta: float, ghost: float):
+        self.model, self.delta, self.ghost = model, float(delta), float(ghost)
         parts = [(i.int(), j.int(), ui.half(), uj.half(), a) for i, j, ui, uj, a in face_samples(model)]
         self.leaf_i, self.leaf_j, self.u_i, self.u_j, self.area = (torch.cat(x) for x in zip(*parts))
         self.w_i = self.w_j = self.first_i = self.first_j = None
+        self._ghost_weights()
+
+    def _ghost_weights(self):
+        """beta (samples, 2): weights of each sample for the sides 0 / 1 of leaf i and of leaf j (0 where that leaf is
+        not a step); the steps' sampled face areas (N,) and the value index of each side (N, 2)."""
+        model, N = self.model, self.model.leaf_count
+        kind, off = model.leaf_type(), model.value_offsets()
+        self.ghost_area = torch.zeros(N, device=self.area.device)
+        self.beta_i, self.beta_j = (torch.zeros((self.samples, 2), device=self.area.device) for _ in range(2))
+        self.ghost_index = (off[:, None] + torch.arange(2, device=off.device)[None]).clamp_max(int(model.values.numel()) - 1)
+        if self.ghost <= 0 or not bool((kind == 2).any()):
+            return
+        total = torch.zeros((N, 2), device=self.area.device)
+        for leaf, u, beta in ((self.leaf_i, self.u_i, self.beta_i), (self.leaf_j, self.u_j, self.beta_j)):
+            leaf = leaf.long()
+            step = torch.nonzero(kind[leaf] == 2).flatten()
+            g = model.geometry(leaf[step])
+            dist = ((u[step].float() - 0.5) * g[:, :3]).sum(1) - g[:, 3]
+            beta[step] = self.area[step, None] * torch.sigmoid(torch.stack([-dist, dist], 1) / self.TAU)
+            total.index_add_(0, leaf[step], beta[step])
+            self.ghost_area.index_add_(0, leaf[step], self.area[step])
+        for leaf, beta in ((self.leaf_i, self.beta_i), (self.leaf_j, self.beta_j)):
+            beta /= total[leaf.long()].clamp_min(1e-30)
 
     @property
     def samples(self) -> int:
@@ -111,23 +146,52 @@ class EdgePenalty:
     def differences(self, c: torch.Tensor) -> torch.Tensor:
         return torch.cat([(wi * c[ii]).sum(1) - (wj * c[jj]).sum(1) for _, wi, ii, wj, jj in self._chunks()])
 
+    def _phi(self, t):
+        d = self.delta
+        return torch.where(t.abs() <= d, 0.5 * t * t, d * (t.abs() - 0.5 * d))
+
     def value_and_gradient(self, c: torch.Tensor) -> tuple[float, torch.Tensor]:
         d = self.delta
         value = torch.zeros((), dtype=torch.float64, device=c.device)  # on the device: one sync at the end, not one per chunk
         g = torch.zeros_like(c)
+        ghost = self.ghost > 0 and bool((self.ghost_area > 0).any())
+        T = torch.zeros((self.model.leaf_count, 2), device=c.device)
         for sl, wi, ii, wj, jj in self._chunks():
-            t = (wi * c[ii]).sum(1) - (wj * c[jj]).sum(1)
+            fi, fj = (wi * c[ii]).sum(1), (wj * c[jj]).sum(1)
+            t = fi - fj
             area = self.area[sl]
-            value += (area * torch.where(t.abs() <= d, 0.5 * t * t, d * (t.abs() - 0.5 * d))).sum().double()
+            value += (area * self._phi(t)).sum().double()
             slope = (area * t.clamp(-d, d))[:, None]
             g.index_add_(0, ii.reshape(-1), (slope * wi).reshape(-1))
             g.index_add_(0, jj.reshape(-1), (-slope * wj).reshape(-1))
+            if ghost:  # targets: each side's neighbour values, weighted by beta
+                T.index_add_(0, self.leaf_i[sl].long(), self.beta_i[sl] * fj[:, None])
+                T.index_add_(0, self.leaf_j[sl].long(), self.beta_j[sl] * fi[:, None])
+        if ghost:
+            A = self.ghost * self.ghost_area[:, None]  # 0 for leaves that are not steps
+            t = c[self.ghost_index] - T
+            value += (A * self._phi(t)).sum().double()
+            s = A * t.clamp(-d, d)  # d/dc_k; the neighbours get -s beta_k(p) times their basis weights at p
+            g.index_add_(0, self.ghost_index.reshape(-1), s.reshape(-1))
+            for sl, wi, ii, wj, jj in self._chunks():
+                si = -(s[self.leaf_i[sl].long()] * self.beta_i[sl]).sum(1, keepdim=True)  # sides of leaf i: neighbour j
+                sj = -(s[self.leaf_j[sl].long()] * self.beta_j[sl]).sum(1, keepdim=True)
+                g.index_add_(0, jj.reshape(-1), (si * wj).reshape(-1))
+                g.index_add_(0, ii.reshape(-1), (sj * wi).reshape(-1))
         return float(value), g
 
     def curvature(self) -> torch.Tensor:
         d = torch.zeros(int(self.model.values.numel()), device=self.area.device)
+        A = 2.0 * self.ghost * self.ghost_area[:, None].expand(-1, 2)  # 2 x weight of each ghost term (|coefficients| sum to 2)
+        if self.ghost > 0:
+            d.index_add_(0, self.ghost_index.reshape(-1), A.reshape(-1))
         for sl, wi, ii, wj, jj in self._chunks():
             a = 2.0 * self.area[sl, None]
             d.index_add_(0, ii.reshape(-1), (a * wi).reshape(-1))
             d.index_add_(0, jj.reshape(-1), (a * wj).reshape(-1))
+            if self.ghost > 0:  # the neighbours' share of the ghost terms of leaf i's / leaf j's sides
+                gi = (A[self.leaf_i[sl].long()] * self.beta_i[sl]).sum(1, keepdim=True)
+                gj = (A[self.leaf_j[sl].long()] * self.beta_j[sl]).sum(1, keepdim=True)
+                d.index_add_(0, jj.reshape(-1), (gi * wj).reshape(-1))
+                d.index_add_(0, ii.reshape(-1), (gj * wi).reshape(-1))
         return d

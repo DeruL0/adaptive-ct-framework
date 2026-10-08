@@ -11,9 +11,12 @@ leaf is replaced by the quadratic that touches it at the current values and lies
 so the penalty part of a gain never exceeds the true one.
 Gain = objective(keep) - objective(option); every refit respects the constraint of the solve (attenuation >= 0),
 so gains that would need negative values are not counted.  A leaf whose type changed in the previous round may only be
-kept or split (no immediate change back).  Trilinear and step leaves are never downgraded to constant: the
-detail it drops is largely invisible in held-out projections but not in the volume (run fabed08: projections
-+0.7 dB, volume -0.6 dB with 472k downgrades).
+kept or split (no immediate change back).  Trilinear and step leaves are downgraded to constant only when they are
+flat: their values vary by less than the edge penalty's delta (a jump the penalty itself does not treat as an edge).
+Free downgrades drop detail largely invisible in held-out projections but not in the volume (run fabed08: projections
++0.7 dB, volume -0.6 dB with 472k downgrades); flat leaves hold none (offline, contnorm04: 180k steps with a jump
+< 0.005 as constants cost 0.006 dB and free 1.08 MB) - without the downgrade a flat trilinear leaf could only save
+bytes by becoming an 8.25-byte step.
 
 Choice: each leaf takes the option maximising  gain - lambda * extra_bytes ; lambda >= 0 is the smallest
 price of a byte that keeps this round's additions within (1 - continuation_share - error_share) of the round's allowance (`action_share` of
@@ -150,16 +153,6 @@ def _accumulate_reference(model, batch, residual, candidate, acc, slot):
     rows = _pack(feat[:, 0], feat[:, 1:9], feat[:, 9:11], feat[:, 11:19], feat[:, 19], residual[pair_ray], feat[:, 20:22])
     keep = slot[pair_leaf] >= 0
     acc.index_add_(0, slot[pair_leaf[keep]].long(), rows[keep])
-
-
-def step_side_fraction(geometry: torch.Tensor, samples: int = 4) -> torch.Tensor:
-    """Volume fraction of the smaller side of each step (mean of H or 1 - H over samples^3 points of the leaf)."""
-    q = (torch.arange(samples, device=geometry.device, dtype=torch.float32) + 0.5) / samples
-    u = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
-    s = ((u[None] - 0.5) * geometry[:, None, :3]).sum(-1) - geometry[:, 3:4]
-    w = geometry[:, 4:5]
-    mean_h = torch.where(w > 0, torch.sigmoid(s / w.clamp_min(1e-30)), (s > 0).float()).mean(1)
-    return torch.minimum(mean_h, 1 - mean_h)
 
 
 @torch.no_grad()
@@ -402,6 +395,17 @@ def modified_error(e: torch.Tensor, parent: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def value_span(model) -> torch.Tensor:
+    """(N,) how much each leaf's values vary: max - min of a trilinear leaf's 8 values, |c1 - c0| of a step, 0 of a
+    constant (the values bound the function: trilinear weights and H are convex combinations)."""
+    kind, off = model.leaf_type(), model.value_offsets()
+    count = torch.tensor([1, 8, 2], device=off.device)[kind]
+    k = torch.arange(8, device=off.device)[None]
+    v = model.values.detach()[(off[:, None] + torch.where(k < count[:, None], k, 0))]
+    return v.amax(1) - v.amin(1)
+
+
+@torch.no_grad()
 def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: torch.Tensor, samples: int = 4) -> torch.Tensor:
     """Values (concatenated in leaf order) of the new-type functions closest, in least squares over
     samples^3 points inside each leaf, to the current leaf functions; nonnegative."""
@@ -483,8 +487,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     allowed = torch.zeros((N, 4), dtype=torch.bool, device=device)
     allowed[:, :3] = type_allowed[None, :] & (torch.arange(3, device=device)[None, :] != kind[:, None])
     allowed[:, 2] |= type_allowed[2] & (kind == 2)  # a step leaf may take the newly estimated geometry
-    allowed[:, 2] &= step_side_fraction(candidate) >= 0.02  # a step must split its leaf, not shave a corner
-    allowed[:, 0] &= kind == 0  # no downgrade to constant: what it drops is largely invisible in projections but not in the volume
+    allowed[:, 0] &= (kind == 0) | (value_span(model) < float(penalty_delta))  # downgrade to constant: flat leaves only
     if frozen is not None:
         allowed[:, :3] &= ~frozen[:, None]
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
@@ -551,7 +554,6 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     # 2. splits (function preserving)
     if split_cells.numel():
         model.split_leaves_batch(model.ids_of_cells(split_cells))
-        report["split_step_children"] = model.last_split_report  # the lossy part of the splits (step children turned constant)
     lap("edits")
     report["bytes_after"] = model_bytes(model)
     report["leaf_type_counts"] = dict(zip(TYPE_NAMES, torch.bincount(model.leaf_type(), minlength=3).tolist()))

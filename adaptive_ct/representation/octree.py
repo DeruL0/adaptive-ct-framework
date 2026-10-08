@@ -112,7 +112,6 @@ class BernsteinOctree(nn.Module):
         self.l0_shape = self.level_shapes[0]
         self.cuda_integrator = bool(cuda_integrator)
         self.max_leaf_count = int(max_leaf_count) if max_leaf_count is not None else None
-        self.last_split_report: dict = {}  # what the last split_leaves_batch changed beyond the function (2 % rule)
         self._morton_bits = max(1, math.ceil(math.log2(max(self.level_shapes[-1]))))
         coords = _grid_coords(self.l0_shape)
         n = coords.shape[0]
@@ -398,7 +397,8 @@ class BernsteinOctree(nn.Module):
         """Split leaves into 8 children of the same type, function preserving:
         constant children copy the parent; trilinear children take the parent's values at their corners;
         step children keep both values with geometry n' = n, d' = 2d - n . (o - 1/2), w' = 2w (o = child offset),
-        except children where one side of the step fills < 2% of the volume: those become constant (mean value).
+        except children the plane does not cross (|d'| >= max |n . (u - 1/2)| + 6 w'): those become constant with the value of
+        their side.  A side the plane cuts small is kept (the ghost penalty holds it, training/regularizer.py).
         Returns the number of split leaves (capped by max_leaf_count)."""
         device = self.cells.device
         ids = torch.unique(torch.as_tensor(leaf_ids, dtype=torch.long, device=device))
@@ -428,22 +428,11 @@ class BernsteinOctree(nn.Module):
         g = self.step_geometry[ids[c] - self.n_tri][:, None, :]
         shift = (g[..., :3] * (offsets[None].float() - 0.5)).sum(-1)
         cg = torch.cat([g[..., :3].expand(-1, 8, -1), (2 * g[..., 3] - shift)[..., None], (2 * g[..., 4]).expand(-1, 8)[..., None]], -1)
-        # A child where one side of the step fills < 2% of its volume becomes a constant leaf (its mean value):
-        # the value on the small side would hardly affect any ray and drift unconstrained in the solve.
-        q = (torch.arange(4, device=device, dtype=torch.float32) + 0.5) / 4
-        u = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
-        sv = ((u[None, None] - 0.5) * cg[..., None, :3]).sum(-1) - cg[..., 3:4]
-        Hs = torch.where(cg[..., 4:5] > 0, torch.sigmoid(sv / cg[..., 4:5].clamp_min(1e-30)), (sv > 0).float())
-        mean_h = Hs.mean(-1)
-        flat = torch.minimum(mean_h, 1 - mean_h) < 0.02
-        # what this lossy rule changes: |c1 - c0| times the deviation of H from its mean, over the flattened children
-        jump = (pair[:, None, 1] - pair[:, None, 0]).abs()
-        deviation = (Hs - mean_h[..., None]).abs()
-        self.last_split_report = {
-            "step_children": int(flat.numel()), "children_to_constant": int(flat.sum()),
-            "max_abs_change": float((deviation.amax(-1) * jump)[flat].max()) if bool(flat.any()) else 0.0,
-            "rms_change": float(((deviation ** 2).mean(-1) * jump ** 2)[flat].mean().sqrt()) if bool(flat.any()) else 0.0}
-        vals[c, :, 0] = torch.where(flat, (1 - mean_h) * pair[:, None, 0] + mean_h * pair[:, None, 1], pair[:, None, 0].expand(-1, 8))
+        # a child the plane does not cross lies on one side: a constant leaf with that side's value
+        extent = 0.5 * cg[..., :3].abs().sum(-1)
+        flat = cg[..., 3].abs() >= extent + 6 * cg[..., 4]  # beyond the soft edge too: H within 0.25 % of 0 or 1
+        side = (cg[..., 3] < 0).long()  # d' < -extent: every point has s > 0, side 1
+        vals[c, :, 0] = torch.where(flat, pair.gather(1, side), pair[:, None, 0].expand(-1, 8))
         vals[c, :, 1] = pair[:, None, 1]
         geometry[c] = pad_geometry(cg.reshape(-1, 5)).reshape(-1, 8, GEOMETRY_WIDTH)
         kc = types.reshape(-1, 8)

@@ -339,19 +339,19 @@ def stage_edge_penalty(ds):
     from adaptive_ct.training.regularizer import EdgePenalty
     from adaptive_ct.training.solve import gradient, solve
     dh, dw = ds.detector_shape
-    delta = 0.02
+    delta, ghost = 0.02, 1.0  # mainline edge penalty (configs/stage7/p1.yaml)
     m0 = load_checkpoint(ROOT / "output" / RUN / "checkpoint.pt")
     m0.values.requires_grad_(True)
     c0 = m0.values.detach().clone()
     _, J = gradient(m0, c0, ds.train.angles, ds.train.projections, list(range(int(ds.train.angles.numel()))))
     J = float(J)
-    R, _ = EdgePenalty(m0, delta).value_and_gradient(c0)
+    R, _ = EdgePenalty(m0, delta, ghost).value_and_gradient(c0)
     print(f"start: data term {J:.4g}, penalty {R:.4g}", flush=True)
     out = {"delta": delta, "data_term_start": J, "penalty_start": R}
     for f in factors:
         m = load_checkpoint(ROOT / "output" / RUN / "checkpoint.pt")
         weight = f * J / max(R, 1e-30)
-        penalty = EdgePenalty(m, delta) if weight > 0 else None
+        penalty = EdgePenalty(m, delta, ghost) if weight > 0 else None
         t0 = time.time()
         _, hist, conv = solve(m, ds.train, subsets=12, tol=1e-4, max_epochs=60, min_epochs=3, penalty=penalty, penalty_weight=weight)
         with torch.no_grad():
