@@ -215,6 +215,15 @@ class DecisionCudaTests(unittest.TestCase):
         for column in range(cuda.shape[-1]):  # every statistic: the kernel (float32 per view) against the reference
             scale = float(reference[..., column].abs().max()) + 1e-12
             self.assertLess(float((cuda[..., column] - reference[..., column]).abs().max()) / scale, 2e-4, column)
+        # only the marked leaves get statistics, and theirs are unchanged (kernel and reference)
+        active = torch.zeros(model.leaf_count, dtype=torch.bool, device="cuda")
+        active[::3] = True
+        masked_ref = local_statistics(model, split, views, candidate, active=active)
+        model.cuda_integrator = True
+        masked = local_statistics(model, split, views, candidate, active=active)
+        for full, part in ((reference, masked_ref), (cuda, masked)):
+            self.assertTrue(torch.equal(part[:, ~active], torch.zeros_like(part[:, ~active])))
+            self.assertLess(float((part[:, active] - full[:, active]).abs().max()), 1e-9 + 1e-6 * float(full.abs().max()))
 
 
 if __name__ == "__main__":

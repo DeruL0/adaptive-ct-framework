@@ -274,7 +274,8 @@ constexpr int DECISION_STRIDE = 102;
 constexpr int DECISION_THREADS = 64;  // 64 rows of DECISION_STRIDE floats of shared memory per block
 
 __device__ void segment_decision(const Tree& T, const Segment& s, const float* candidate, float* accum, int64_t leaf_count,
-                                 float residual, float* shared_rows) {
+                                 float residual, float* shared_rows, const bool* active) {
+    if (!active[s.leaf]) return;  // statistics only for the marked leaves (group_add pairs the active threads only)
     const float length = s.t1 - s.t0;
     const float b = segment_value(T, s) - residual;
     float tri[8];
@@ -338,11 +339,11 @@ __device__ void segment_decision(const Tree& T, const Segment& s, const float* c
 }
 
 __global__ void decision_kernel(Tree T, Rays R, const float* candidate, const float* residual, float* accum,
-                                int64_t leaf_count) {
+                                int64_t leaf_count, const bool* active) {
     __shared__ float rows[DECISION_THREADS * DECISION_STRIDE];
     const int ray = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray >= R.count) return;
-    traverse(T, R, ray, [&](const Segment& s) { segment_decision(T, s, candidate, accum, leaf_count, residual[ray], rows); });
+    traverse(T, R, ray, [&](const Segment& s) { segment_decision(T, s, candidate, accum, leaf_count, residual[ray], rows, active); });
 }
 
 // Step geometry normal equations (training/geometry.py): for every segment in a step leaf the derivative of the
@@ -459,7 +460,7 @@ at::Tensor bernstein_octree_integrate_backward_cuda(TREE_ARGS, at::Tensor grad_o
 }
 
 at::Tensor bernstein_octree_decision_accumulate_cuda(TREE_ARGS, at::Tensor candidate, at::Tensor residual, at::Tensor accum,
-                                                     int64_t leaf_count) {
+                                                     int64_t leaf_count, at::Tensor active) {
     MAKE_TREE_RAYS
     check(candidate, at::kFloat, "candidate_geometry");
     check(residual, at::kFloat, "residual");
@@ -467,9 +468,11 @@ at::Tensor bernstein_octree_decision_accumulate_cuda(TREE_ARGS, at::Tensor candi
     TORCH_CHECK(candidate.dim() == 2 && candidate.size(0) == leaf_count && candidate.size(1) == 8, "candidate_geometry must be (N, 8).");
     TORCH_CHECK(residual.numel() == R.count, "residual must match the rays.");
     TORCH_CHECK(accum.numel() == leaf_count * DECISION_STRIDE, "accum must be (N, 102).");
+    check(active, at::kBool, "active");
+    TORCH_CHECK(active.numel() == leaf_count, "active must be (N,).");
     if (R.count)
         decision_kernel<<<(R.count + DECISION_THREADS - 1) / DECISION_THREADS, DECISION_THREADS, 0, stream>>>(T, R, candidate.data_ptr<float>(), residual.data_ptr<float>(),
-                                                        accum.data_ptr<float>(), leaf_count);
+                                                        accum.data_ptr<float>(), leaf_count, active.data_ptr<bool>());
     launched("octree decision kernel");
     return accum;
 }

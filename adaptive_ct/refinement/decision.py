@@ -108,8 +108,8 @@ def _pack(L, tri, step, child, contribution, residual, step_cur) -> torch.Tensor
                       step_cur * b[:, None]], 1)
 
 
-def _accumulate_reference(model, batch, residual, candidate, acc):
-    """PyTorch reference of the CUDA accumulation of one view into acc (N, STRIDE), used on CPU."""
+def _accumulate_reference(model, batch, residual, candidate, acc, active):
+    """PyTorch reference of the CUDA accumulation of one view into acc (N, STRIDE) for the leaves marked in active, used on CPU."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     kind = model.leaf_type()
@@ -143,8 +143,8 @@ def _accumulate_reference(model, batch, residual, candidate, acc):
     feat = torch.zeros((uniq.numel(), 22), device=device).index_add_(
         0, inv, torch.cat([L[:, None], tri, step_weights(candidate[leaf_ids]), child, cur[:, None], own_step], 1))
     pair_ray, pair_leaf = uniq // N, uniq % N
-    acc.index_add_(0, pair_leaf, _pack(feat[:, 0], feat[:, 1:9], feat[:, 9:11], feat[:, 11:19], feat[:, 19], residual[pair_ray],
-                                       feat[:, 20:22]))
+    rows = _pack(feat[:, 0], feat[:, 1:9], feat[:, 9:11], feat[:, 11:19], feat[:, 19], residual[pair_ray], feat[:, 20:22])
+    acc.index_add_(0, pair_leaf, rows * active[pair_leaf, None])
 
 
 def step_side_fraction(geometry: torch.Tensor, samples: int = 4) -> torch.Tensor:
@@ -205,18 +205,22 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor) -> torch.Te
 
 
 @torch.no_grad()
-def local_statistics(model, split, views: list[int], candidate: torch.Tensor, prior: torch.Tensor | None = None) -> torch.Tensor:
+def local_statistics(model, split, views: list[int], candidate: torch.Tensor, prior: torch.Tensor | None = None,
+                     active: torch.Tensor | None = None) -> torch.Tensor:
     """(2, N, STRIDE) float64 statistics per leaf and ray half f (alternate views): the normal equations of every
     option (G upper triangle and h, layout _SLOTS), sum b^2 with b = data minus the other leaves (the target of a
     type refit) and sum residual^2.  Each view is accumulated in float32 by the kernel and added up in double: the
     gains are differences of terms that are large against them (b^2 against the residual), which float32 sums
-    over the views lose.  `prior` (N, STRIDE), e.g. the weighted penalty_statistics, is added to both halves."""
+    over the views lose.  `prior` (N, STRIDE), e.g. the weighted penalty_statistics, is added to both halves.  `active` (N,) bool:
+    only these leaves get ray statistics (the others keep the prior); default all."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     acc = torch.zeros((2, N, STRIDE), dtype=torch.float64, device=device)
     if prior is not None:
         acc += prior[None]
     view_acc = torch.zeros((N, STRIDE), device=device)
+    if active is None:
+        active = torch.ones(N, dtype=torch.bool, device=device)
     h, w = split.projections.shape[1:]
     rows, cols = traversal_grid(h, w, device)
     for position, v in enumerate(views):
@@ -226,9 +230,9 @@ def local_statistics(model, split, views: list[int], candidate: torch.Tensor, pr
         view_acc.zero_()
         if model.uses_cuda():
             bernstein_octree_decision_accumulate(model.values, model.step_geometry, **model.tree_arguments(), rays=batch,
-                                                 candidate_geometry=candidate, residual=residual, accum=view_acc)
+                                                 candidate_geometry=candidate, residual=residual, accum=view_acc, active=active)
         else:
-            _accumulate_reference(model, batch, residual, candidate, view_acc)
+            _accumulate_reference(model, batch, residual, candidate, view_acc, active)
         acc[position % 2] += view_acc
     return acc
 
@@ -385,7 +389,9 @@ def lookahead(model, split, views, ids, *, penalty_weight, penalty_delta, detect
     # the kernel needs a candidate geometry for every leaf; the children's type options are not used here
     dummy = pad_geometry(torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.25]], device=device).expand(temp.leaf_count, -1))
     prior = 0.5 * float(penalty_weight) * penalty_statistics(temp, penalty_delta, dummy) if penalty_weight > 0 else None
-    acc = local_statistics(temp, split, views, dummy, prior)
+    active = torch.zeros(temp.leaf_count, dtype=torch.bool, device=device)
+    active[cid] = True
+    acc = local_statistics(temp, split, views, dummy, prior, active)  # ray statistics of the children only
     del prior
     kind = temp.leaf_type()[cid]
     gain = evaluate_options(acc[:, cid], -child_minimum(temp)[cid], kind)[:, 3]
