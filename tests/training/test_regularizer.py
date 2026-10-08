@@ -43,6 +43,29 @@ class EdgePenaltyTests(unittest.TestCase):
             bound = value + float((grad * s).sum()) + 0.5 * float((d * s * s).sum())
             self.assertLessEqual(penalty.value_and_gradient(c + s)[0], bound + 1e-6)
 
+    def test_frozen_weights_give_the_same_value_gradient_and_curvature(self):
+        torch.manual_seed(3)
+        model = _tree()
+        penalty = EdgePenalty(model, delta=0.05)
+        penalty.CHUNK = 7  # several chunks, the last one short
+        c = 0.05 + 0.5 * torch.rand(model.values.numel())
+        value, grad, curv = (*penalty.value_and_gradient(c), penalty.curvature())
+        penalty.freeze()
+        fvalue, fgrad = penalty.value_and_gradient(c)
+        self.assertAlmostEqual(fvalue, value, delta=1e-9 * max(1.0, abs(value)))
+        self.assertLess(float((fgrad - grad).abs().max()), 1e-6)
+        self.assertLess(float((penalty.curvature() - curv).abs().max()), 1e-6)
+        penalty.release()
+        self.assertEqual(penalty.value_and_gradient(c)[0], value)  # unfrozen again: computed from the model
+        # a frozen penalty is the weights at freezing time: after a geometry change only a new freeze() agrees
+        penalty.freeze()
+        with torch.no_grad():
+            model.step_geometry[:, 3] += 0.05
+        fresh = penalty.value_and_gradient(c)[0]
+        penalty.release()
+        self.assertNotAlmostEqual(penalty.value_and_gradient(c)[0], fresh, places=6)
+        self.assertAlmostEqual(penalty.freeze().value_and_gradient(c)[0], penalty.release() or penalty.value_and_gradient(c)[0], places=9)
+
     def test_decision_statistics_match_the_penalty(self):
         from adaptive_ct.refinement.decision import penalty_statistics
         torch.manual_seed(1)

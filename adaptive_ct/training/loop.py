@@ -124,7 +124,7 @@ def run_training(config_path: str | Path) -> dict:
         if final:  # the state every solver comparison starts from (audit/benchmark_pipeline.py)
             save_state(model, out_dir / "states" / "pre_final_solve.pt", config, dataset, round=r, detector_bin=detector_bin)
         t0 = time.perf_counter()
-        penalty = EdgePenalty(model, float(edge["delta"])) if weight > 0 else None
+        penalty = EdgePenalty(model, float(edge["delta"])).freeze() if weight > 0 else None  # tree, types, geometry fixed from here
         # A tree is only changed once its objective has stopped falling (tolerance per epoch): otherwise the solve goes
         # on (same denominators and running gradient) until it has, or the run's time limit is reached.
         solve_state, hist, continuations, epochs_used = {}, [], 0, 0

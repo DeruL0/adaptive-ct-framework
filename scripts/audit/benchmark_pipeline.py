@@ -91,10 +91,15 @@ def stage_ops(run_dir, repeats):
     model.values.requires_grad_(False)
     penalty = EdgePenalty(model, float(edge["delta"]))
     c = model.values.detach()
+    base_allocated = torch.cuda.memory_allocated()
     out["penalty_samples"] = penalty.samples
     out["penalty_build_s"] = spread(sync_time(lambda: EdgePenalty(model, float(edge["delta"])), max(1, repeats // 2)))
     out["penalty_value_gradient_s"] = spread(sync_time(lambda: penalty.value_and_gradient(c), repeats))
     out["penalty_curvature_s"] = spread(sync_time(penalty.curvature, repeats))
+    out["penalty_freeze_s"] = spread(sync_time(penalty.freeze, max(1, repeats // 2)))
+    out["penalty_value_gradient_frozen_s"] = spread(sync_time(lambda: penalty.value_and_gradient(c), repeats))
+    out["penalty_curvature_frozen_s"] = spread(sync_time(penalty.curvature, repeats))
+    out["penalty_frozen_extra_gb"] = (torch.cuda.memory_allocated() - base_allocated) / 2**30
     del penalty
     if model.n_step:
         saved = model.step_geometry.clone()
@@ -107,7 +112,7 @@ def stage_ops(run_dir, repeats):
     return out
 
 
-def stage_solve(run_dir, repeats, max_seconds):
+def stage_solve(run_dir, repeats, max_seconds, freeze=True):
     state, config = load(run_dir, "pre_final_solve.pt")
     ds = dataset(config, state)
     cfg, edge = config["training"]["solver"], config["training"]["solver"]["edge_penalty"]
@@ -115,10 +120,12 @@ def stage_solve(run_dir, repeats, max_seconds):
     results = []
     for _ in range(repeats):
         model = build(state, config)
-        penalty = EdgePenalty(model, float(edge["delta"]))
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
-        t0 = time.perf_counter()
+        t0 = time.perf_counter()  # penalty set-up included, as in training/loop.py
+        penalty = EdgePenalty(model, float(edge["delta"]))
+        if freeze:
+            penalty.freeze()
         sstate, calls, epochs, converged = {}, 0, 0, False
         while not converged and time.perf_counter() - t0 < max_seconds:
             _, more, converged = solve(model, ds.train, subsets=int(cfg["subsets"]), tol=float(cfg["final_tol"]), max_epochs=int(cfg["final_epochs"]),
@@ -173,6 +180,7 @@ def main():
     ap.add_argument("--stages", default="ops,solve,decision")
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--max-seconds", type=float, default=1800.0)
+    ap.add_argument("--no-freeze", action="store_true", help="solve stage: penalty weights recomputed at every call (comparison)")
     args = ap.parse_args()
     run_dir = ROOT / "output" / args.run
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
@@ -180,12 +188,12 @@ def main():
     result = {"run": args.run, "commit": commit + ("+uncommitted" if dirty else ""), "device": torch.cuda.get_device_name(0),
               "torch": torch.__version__, "repeats": args.repeats, "date": time.strftime("%Y-%m-%d %H:%M:%S")}
     for stage in args.stages.split(","):
-        result[stage] = {"ops": lambda: stage_ops(run_dir, args.repeats), "solve": lambda: stage_solve(run_dir, args.repeats, args.max_seconds),
+        result[stage] = {"ops": lambda: stage_ops(run_dir, args.repeats), "solve": lambda: stage_solve(run_dir, args.repeats, args.max_seconds, not args.no_freeze),
                          "decision": lambda: stage_decision(run_dir, args.repeats)}[stage]()
         print(stage, json.dumps(result[stage], default=float)[:1500], flush=True)
     out = ROOT / "output" / "_bench"
     out.mkdir(parents=True, exist_ok=True)
-    path = out / f"{args.run}_{commit}.json"
+    path = out / f"{args.run}_{commit}{'_nofreeze' if args.no_freeze else ''}.json"
     path.write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
     print(path)
 
