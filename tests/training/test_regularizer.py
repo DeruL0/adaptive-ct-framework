@@ -66,6 +66,25 @@ class EdgePenaltyTests(unittest.TestCase):
         self.assertNotAlmostEqual(penalty.value_and_gradient(c)[0], fresh, places=6)
         self.assertAlmostEqual(penalty.freeze().value_and_gradient(c)[0], penalty.release() or penalty.value_and_gradient(c)[0], places=9)
 
+    def test_decision_penalty_statistics_in_blocks_scaled_into_a_given_array(self):
+        import adaptive_ct.refinement.decision as D
+        torch.manual_seed(4)
+        model = _tree()
+        with torch.no_grad():
+            model.values.copy_(0.05 + 0.5 * torch.rand(model.values.numel()))
+        candidate = torch.tensor([[1.0, 0.0, 0.0, 0.1, 0.05]]).repeat(model.leaf_levels.numel(), 1)
+        whole = D.penalty_statistics(model, 0.05, candidate)
+        chunk, D.PENALTY_CHUNK = D.PENALTY_CHUNK, 5  # several blocks per face direction, the last one short
+        try:
+            out = torch.full_like(whole, 1.0)
+            D.penalty_statistics(model, 0.05, candidate, scale=3.0, out=out)
+            ids = torch.tensor([7, 2, 11])
+            part = D.penalty_statistics(model, 0.05, candidate, ids=ids)
+        finally:
+            D.PENALTY_CHUNK = chunk
+        self.assertLess(float((out - (1.0 + 3.0 * whole)).abs().max()), 1e-9 * (1 + float(whole.abs().max())))
+        self.assertLess(float((part - whole[ids]).abs().max()), 1e-9 * (1 + float(whole.abs().max())))
+
     def test_decision_statistics_match_the_penalty(self):
         from adaptive_ct.refinement.decision import penalty_statistics
         torch.manual_seed(1)
