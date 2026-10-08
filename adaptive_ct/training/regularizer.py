@@ -72,6 +72,25 @@ def face_samples(model):
                            0.5 * (size[i_ids, axis] + size[j_ids, axis]))
 
 
+@torch.no_grad()
+def face_jump_energy(model, delta: float, chunk: int = 1 << 21) -> torch.Tensor:
+    """(N,) float64 edge-penalty energy on each leaf's faces, sum of area h phi(t / h) over its face samples (each sample
+    counted for both leaves): a face-jump error indicator (the jump terms of residual a posteriori estimators)."""
+    N = int(model.leaf_levels.numel())
+    kind, off, c = model.leaf_type(), model.value_offsets(), model.values.detach()
+    out = torch.zeros(N, dtype=torch.float64, device=c.device)
+    for i_ids, j_ids, ui, uj, area, h in face_samples(model):
+        for a in range(0, int(area.numel()), chunk):
+            sl = slice(a, a + chunk)
+            wi, ii = basis_rows(model, i_ids[sl], ui[sl], kind, off)
+            wj, jj = basis_rows(model, j_ids[sl], uj[sl], kind, off)
+            x = ((wi * c[ii]).sum(1) - (wj * c[jj]).sum(1)) / h[sl]
+            e = (area[sl] * h[sl] * torch.where(x.abs() <= delta, 0.5 * x * x, delta * (x.abs() - 0.5 * delta))).double()
+            out.index_add_(0, i_ids[sl], e)
+            out.index_add_(0, j_ids[sl], e)
+    return out
+
+
 class EdgePenalty:
     CHUNK = 1 << 21
 

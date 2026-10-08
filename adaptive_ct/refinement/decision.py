@@ -28,11 +28,12 @@ round's price: the structure is there) whose own split gain is positive but was 
 Error-driven splits (`error_share` of the allowance, after the continuation splits): a split into children of the leaf's size can earn
 little where the structure is thinner than the children (a 3-5 voxel crack through 10-voxel leaves), although
 splitting those children would capture it.  So, as in near-best adaptive tree approximation (Binev & DeVore 2004),
-part of the bytes goes by error rather than by one-step gain: e = residual energy left after the leaf's best one-level
-split per ray through the leaf (divided by its projected area: unnormalised, the large leaves rank first - run err02),
-modified along the ancestors  e~ = 1 / (1 / e + 1 / e~_parent)  (e~ = e at the coarsest level): an error that
+part of the bytes goes by error rather than by one-step gain: e = the edge penalty's energy on the leaf's faces
+(face_jump_energy: where neighbouring leaves disagree, e.g. planes that do not meet; the residual of the rays, used
+before, spreads along the rays and ranked leaves by size), modified along the ancestors  e~ = 1 / (1 / e + 1 / e~_parent)  (e~ = e at the coarsest level): an error that
 appeared where the parent had a large one stays nearly whole, an error that splitting does not reduce halves per level.
-Leaves not taken by gain are split in decreasing e~ until that share is spent.
+Leaves not taken by gain whose one-level split gain is positive are split in decreasing e~ until that share is spent
+(face jumps that are real - an edge on a leaf face - do not pass: their split does not predict better).
 All chosen actions are executed; the budget fills geometrically over the rounds, and the tree is re-solved
 before the next decision.
 """
@@ -48,7 +49,7 @@ from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import parallel_rays, traversal_grid
 from adaptive_ct.core.projector import bernstein_octree_decision_accumulate
 from adaptive_ct.representation.octree import TYPE_NAMES, pad_geometry, step_H, step_integral, trilinear_weights
-from adaptive_ct.training.regularizer import basis_rows, face_samples
+from adaptive_ct.training.regularizer import basis_rows, face_jump_energy, face_samples
 
 OPTIONS = ("constant", "trilinear", "step", "split")  # column order of gains / extra bytes
 _DIMS = {"constant": 1, "trilinear": 8, "step": 2, "split": 8, "cur_step": 2}
@@ -482,12 +483,6 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     local_statistics(model, split, views, candidate, out=acc)
     lap("ray_statistics")
     gains = evaluate_options(acc, -child_minimum(model), kind)
-    r2 = acc[:, :, 96].sum(0)
-    left = r2 - gains[:, 3]  # residual energy left after the best one-level split
-    left = torch.where(left > 1.0e-6 * (r2 + r2.mean()), left, torch.zeros_like(left))  # below the statistics' accuracy: 0
-    # per ray: the rays through a leaf scale with its projected area (width in the rotation plane x height along the axis)
-    shape = torch.tensor(model.level_shapes, dtype=torch.float64, device=device)[model.leaf_levels]
-    left = left.double() * shape[:, 0] * shape[:, 2]
     del acc  # free the statistics before the edits
     lap("fits")
     per_leaf = leaf_bytes().to(device)
@@ -518,8 +513,10 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     gain_split[ids[option == 3]] = True
     ids, option = torch.cat([ids, cont]), torch.cat([option, torch.full_like(cont, 3)])
     # error-driven splits: leaves not taken by gain, in decreasing modified error, within error_share of the allowance
-    err = modified_error(left.double(), torch.full_like(left, math.inf, dtype=torch.float64) if parent_error is None else parent_error.double())
-    free = allowed[:, 3] & (err > 0)
+    e = face_jump_energy(model, float(penalty_delta))  # before any edit: the solved state
+    err = modified_error(e, torch.full_like(e, math.inf) if parent_error is None else parent_error.double())
+    free = allowed[:, 3] & (err > 0) & (gains[:, 3] > 0)  # the error ranks; the held-out gain must still be positive (a jump
+    # the true volume has at a leaf face is not an error: splitting it predicts no better)
     free[ids] = False
     cand = torch.nonzero(free).flatten()
     cand = cand[torch.argsort(err[cand], descending=True)]

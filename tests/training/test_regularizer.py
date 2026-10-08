@@ -130,6 +130,18 @@ class EdgePenaltyTests(unittest.TestCase):
         G[:, ju, iu] = stats[:, 5:]
         self.assertGreaterEqual(float(torch.linalg.eigvalsh(G).min()), -1e-6)  # positive semidefinite
 
+    def test_face_jump_energy_sits_on_the_leaves_of_the_jump(self):
+        from adaptive_ct.training.regularizer import face_jump_energy
+        model = BernsteinOctree(levels=[2], leaf_types=("constant",), cuda_integrator=False)
+        with torch.no_grad():
+            model.values.fill_(0.1)
+            model.values[model.find_leaf((0, 1, 0, 0))] = 0.15  # one leaf differs by 0.05
+        e = face_jump_energy(model, delta=10.0)  # quadratic range: area t^2 / (2 h) per face, unit faces, h = 1
+        k = model.find_leaf((0, 1, 0, 0))
+        self.assertAlmostEqual(float(e[k]), 3 * 0.05 ** 2 / 2, places=7)  # its three interior faces
+        self.assertAlmostEqual(float(e.sum()), 2 * 3 * 0.05 ** 2 / 2, places=7)  # each face on both leaves
+        self.assertEqual(int((e > 0).sum()), 4)  # the leaf and its three neighbours
+
     def test_large_jumps_cost_linearly(self):
         model = BernsteinOctree(levels=[2], leaf_types=("constant",), cuda_integrator=False)
         values = torch.full((8,), 0.1)
