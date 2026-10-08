@@ -28,6 +28,7 @@ class RefinementController:
         self.stopped = False
         self.stop_reasons: list[str] = []
         self.changed_cells: torch.Tensor | None = None  # cells whose type changed in the previous round
+        self.productive_keys: torch.Tensor | None = None  # keys of every cell split by gain so far
         self.split_keys = self.split_errors = None  # sorted keys of every cell split so far and its modified error then
 
     def _stop(self, event, reason):
@@ -52,6 +53,9 @@ class RefinementController:
             at = torch.searchsorted(self.split_keys, keys).clamp_max(self.split_keys.numel() - 1)
             hit = (self.split_keys[at] == keys) & (model.leaf_levels > 0)
             parent_error[hit] = self.split_errors[at[hit]]
+        productive = None
+        if self.productive_keys is not None:  # parent cell among the cells split by gain
+            productive = torch.isin(_cell_keys(model.leaf_levels - 1, model.leaf_coords // 2), self.productive_keys) & (model.leaf_levels > 0)
         views = decision_views(self.estimator_split, int(self.spec["decision_views"]), self.round_index)
         self.state_dir.mkdir(parents=True, exist_ok=True)  # the last decision's input (audit/benchmark_pipeline.py)
         torch.save({"model": model.state_dict(), "round": self.round_index}, self.state_dir / "pre_decision_last.pt")
@@ -60,13 +64,17 @@ class RefinementController:
         # share of the rest per round, which adds rounds of a few percent of the bytes each)
         share = 1.0 if remaining < float(self.spec["spend_all_below"]) else float(self.spec["action_share"])
         event["action_share"] = share
-        report, self.changed_cells, (cells, errors) = decide_and_apply(
+        report, self.changed_cells, (cells, errors, by_gain) = decide_and_apply(
             model, self.estimator_split, views, detector_h=self.detector_h, detector_w=self.detector_w,
             byte_budget=self.byte_budget, frozen=frozen,
             action_share=share, min_footprint_px=float(self.spec["min_footprint_px"]),
-            error_share=float(self.spec["error_share"]), parent_error=parent_error,
+            continuation_share=float(self.spec["continuation_share"]), error_share=float(self.spec["error_share"]),
+            productive_parent=productive, parent_error=parent_error,
             penalty_weight=float(self.edge_penalty["weight"]), penalty_delta=float(self.edge_penalty["delta"]))
         event.update(report)
+        if by_gain.any():
+            keys = _cell_keys(cells[by_gain, 0], cells[by_gain, 1:])
+            self.productive_keys = keys if self.productive_keys is None else torch.cat([self.productive_keys, keys])
         if cells.numel():
             keys = torch.cat([_cell_keys(cells[:, 0], cells[:, 1:])] + ([self.split_keys] if self.split_keys is not None else []))
             errors = torch.cat([errors] + ([self.split_errors] if self.split_errors is not None else []))

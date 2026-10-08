@@ -37,7 +37,7 @@ def _split_from(truth, views=16):
 
 
 def _decide(model, split, **kw):
-    kw = {"action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, "error_share": 0.2, **kw}
+    kw = {"action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, "continuation_share": 0.2, "error_share": 0.2, **kw}
     report, _, _ = decide_and_apply(model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, **kw)
     return report
 
@@ -183,13 +183,39 @@ class DecisionCudaTests(unittest.TestCase):
         split = _split_from(truth)
         model = _model(types=("constant", "trilinear"))  # no step: a type change saving bytes would take every leaf first
         solve(model, split, subsets=4, tol=1e-3, max_epochs=200, min_epochs=3)
-        report, _, (split_cells, errors) = decide_and_apply(
+        report, _, (split_cells, errors, _) = decide_and_apply(
             model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=4 * 150,
-            action_share=1.0, min_footprint_px=1.0, penalty_weight=0.0, penalty_delta=0.02, error_share=1.0)
+            action_share=1.0, min_footprint_px=1.0, penalty_weight=0.0, penalty_delta=0.02, continuation_share=0.0, error_share=1.0)
         self.assertEqual(report["actions"]["split"], report["error_splits"])  # every byte went by error
         self.assertGreater(report["error_splits"], 0)
         self.assertTrue(bool((split_cells[:, 1] == 0).all()), split_cells.tolist())  # the slab lies in root cells x = 0
         self.assertTrue(bool((errors > 0).all()))
+
+    def test_slab_thinner_than_the_children_continues_below_a_gain_split(self):
+        # the same slab: the root leaves' one-level split gain is positive but need not pay; with the parents split by
+        # gain the continuation share goes to exactly those leaves (gain per byte), without them to none
+        truth = _model(trilinear=False)
+        truth.split_leaves_batch(torch.arange(truth.leaf_count))
+        truth.split_leaves_batch(torch.arange(truth.leaf_count))
+        with torch.no_grad():
+            truth.values.fill_(0.2)
+            truth.values[truth.leaf_coords[:, 0] == 1] = 0.6
+        split = _split_from(truth)
+        model = _model(types=("constant", "trilinear"))
+        solve(model, split, subsets=4, tol=1e-3, max_epochs=200, min_epochs=3)
+        state = {k: v.clone() for k, v in model.state_dict().items()}
+        kw = dict(detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=4 * 150, action_share=1.0, min_footprint_px=1.0,
+                  penalty_weight=0.0, penalty_delta=0.02, continuation_share=1.0, error_share=0.0)
+        report, _, _ = decide_and_apply(model, split, decision_views(split, 16, 0), **kw)
+        self.assertEqual(report["actions"]["split"], 0)  # no parent split by gain: the share stays unspent
+        model.load_state_dict(state)
+        report, _, (_, _, by_gain) = decide_and_apply(model, split, decision_views(split, 16, 0),
+                                                      productive_parent=torch.ones(model.leaf_count, dtype=torch.bool), **kw)
+        self.assertGreater(report["continuation_splits"], 0)
+        self.assertEqual(report["actions"]["split"], report["continuation_splits"])
+        self.assertFalse(bool(by_gain.any()))  # continuation splits do not make their children eligible
+        split_cells = model.cells[model.leaf_levels == 1] // 2
+        self.assertTrue(bool((split_cells[:, 1] == 0).all()), split_cells.tolist())
 
     def test_cuda_statistics_match_reference(self):
         from tests.representation.test_octree import make_step
