@@ -154,6 +154,19 @@ class DecisionTests(unittest.TestCase):
         # only the wrong leaf can improve; its zero-valued neighbours would need negative values
         self.assertLessEqual(sum(report["actions"].values()), 1)
 
+    def test_candidate_plane_continues_the_neighbouring_step(self):
+        # leaf (0,0,0) is a step with the plane x = 0.2 of its own frame; its neighbour along y, (0,1,0), is flat: its
+        # candidate is that plane continued into its frame (same x origin and size: n = (1,0,0), d = 0.2)
+        model = _model(levels=(2, 4), types=ALL, trilinear=False)
+        with torch.no_grad():
+            model.values.fill_(0.3)
+        s = model.find_leaf((0, 0, 0, 0))
+        model.set_types(torch.tensor([s]), torch.tensor([2]), torch.tensor([0.3, 0.3]), torch.tensor([[1.0, 0.0, 0.0, 0.2, 0.05]]))
+        cand = candidate_step_geometry(model, detector_w=DETECTOR)
+        L = model.find_leaf((0, 0, 1, 0))
+        self.assertAlmostEqual(abs(float(cand[L, 0])), 1.0, places=4)
+        self.assertAlmostEqual(float(cand[L, 3] * torch.sign(cand[L, 0])), 0.2, places=4)
+
     def test_value_span_marks_flat_leaves(self):
         from adaptive_ct.refinement.decision import value_span
         model = _model(levels=(2,), trilinear=False)

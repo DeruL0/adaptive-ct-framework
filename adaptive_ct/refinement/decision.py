@@ -71,30 +71,68 @@ def resolvable_mask(model, *, detector_h: int, detector_w: int, min_footprint_px
 
 
 @torch.no_grad()
+def _step_neighbours(model):
+    """(L, S, area): pairs of a leaf L and a neighbouring step leaf S with their shared sampled face area."""
+    N = int(model.leaf_levels.numel())
+    kind = model.leaf_type()
+    parts = []
+    for i, j, _, _, area, _ in face_samples(model):
+        for L, S in ((i, j), (j, i)):
+            m = kind[S] == 2
+            parts.append((L[m] * N + S[m], area[m]))
+    key, area = (torch.cat(x) for x in zip(*parts))
+    key, inv = torch.unique(key, return_inverse=True)
+    return key // N, key % N, torch.zeros(key.numel(), device=area.device).index_add_(0, inv, area)
+
+
 def candidate_step_geometry(model, *, detector_w: int, grid: int = 5, chunk: int = 20000) -> torch.Tensor:
-    """(N, GEOMETRY_WIDTH) step geometry (n, d, w) per leaf from the current reconstruction: n = main direction of the
-    gradient second-moment matrix over the leaf and a quarter-leaf margin, d = gradient-weighted centre along
-    n, w = half a detector pixel (in leaf units)."""
+    """(N, GEOMETRY_WIDTH) step geometry (n, d, w) per leaf from the current reconstruction and the neighbouring
+    steps' planes (planes that meet across the faces, as the per-cell plane data of dual contouring):
+      n = main direction of  M_grad / trace(M_grad) + sum_S a_S n_S n_S^T / sum_S a_S  (M_grad the gradient second-moment
+          matrix over the leaf and a quarter-leaf margin; S the neighbouring step leaves, a_S the shared face area);
+      d = mean of the gradient-weighted centre along n and the area-weighted offset of the neighbours' planes in this
+          leaf's frame (planes within 30 degrees of n that cross the leaf; the neighbours' alone in a flat leaf);
+      w = half a detector pixel (in leaf units).
+    Without neighbouring steps this is the reconstruction's own estimate."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=device)[model.leaf_levels]
+    size_all = 2.0 / shapes[:, 0]  # cubic leaves: one size per leaf
+    centre = -1.0 + (model.leaf_coords.float() + 0.5) * size_all[:, None]
+    L, S, area = _step_neighbours(model)
+    gS = model.geometry(S)
+    nS = gS[:, :3] / gS[:, :3].norm(dim=1, keepdim=True).clamp_min(1e-12)
+    dSL = ((nS * centre[S]).sum(1) + gS[:, 3] * size_all[S] - (nS * centre[L]).sum(1)) / size_all[L]  # S's plane in L's frame
+    Mn = torch.zeros((N, 3, 3), device=device).index_add_(0, L, area[:, None, None] * nS[:, :, None] * nS[:, None, :])
+    Mn = Mn / torch.zeros(N, device=device).index_add_(0, L, area).clamp_min(1e-30)[:, None, None]
     lin = torch.linspace(-0.25, 1.25, grid, device=device)
     uu = torch.stack(torch.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
-    out = torch.zeros((N, 5), device=device)
+    n_all, d_all = torch.zeros((N, 3), device=device), torch.zeros(N, device=device)
+    own = torch.zeros(N, dtype=torch.bool, device=device)  # the reconstruction varies over the leaf
     for a in range(0, N, chunk):
         b = min(N, a + chunk)
         size = 2.0 / shapes[a:b]
         pts = (-1.0 + model.leaf_coords[a:b].float() * size)[:, None, :] + uu[None] * size[:, None, :]
         f = model.forward_mu(pts.clamp(-1.0, 1.0).reshape(-1, 3)).reshape(b - a, grid, grid, grid)
         g = torch.stack(torch.gradient(f, spacing=float(lin[1] - lin[0]), dim=(1, 2, 3)), -1).reshape(b - a, -1, 3)
-        n = torch.linalg.eigh(torch.einsum("npi,npj->nij", g, g).double())[1][:, :, -1].float()
+        M = torch.einsum("npi,npj->nij", g, g)
+        tr = M.diagonal(dim1=1, dim2=2).sum(1)
+        own[a:b] = tr > 1e-12
+        M = M / tr.clamp_min(1e-30)[:, None, None] + Mn[a:b]
+        n = torch.linalg.eigh(M.double())[1][:, :, -1].float()
         s = ((uu[None] - 0.5) * n[:, None, :]).sum(-1)
         weight = (g * n[:, None, :]).sum(-1).abs()
-        extent = 0.5 * n.abs().sum(1)  # max |n . (u - 1/2)| over the cell: the plane stays well inside the leaf
-        d = (weight * s).sum(1) / weight.sum(1).clamp_min(1e-12)
-        d = torch.maximum(torch.minimum(d, 0.8 * extent), -0.8 * extent)
-        out[a:b] = torch.cat([n, d[:, None], (0.5 * shapes[a:b, 0] / detector_w)[:, None]], 1)
-    return pad_geometry(out)
+        n_all[a:b], d_all[a:b] = n, (weight * s).sum(1) / weight.sum(1).clamp_min(1e-12)
+    extent = 0.5 * n_all.abs().sum(1)  # max |n . (u - 1/2)| over the cell
+    cos = (nS * n_all[L]).sum(1)
+    ok = (cos.abs() > 0.866) & (dSL.abs() < extent[L])
+    w = area * ok
+    Wn = torch.zeros(N, device=device).index_add_(0, L, w)
+    Dn = torch.zeros(N, device=device).index_add_(0, L, w * torch.sign(cos) * dSL)
+    dn = Dn / Wn.clamp_min(1e-30)
+    d = torch.where(Wn > 0, torch.where(own, 0.5 * (d_all + dn), dn), d_all)
+    d = torch.maximum(torch.minimum(d, 0.8 * extent), -0.8 * extent)  # the plane stays well inside the leaf
+    return pad_geometry(torch.cat([n_all, d[:, None], (0.5 * shapes[:, 0] / detector_w)[:, None]], 1))
 
 
 def decision_views(split, count: int, offset: int) -> list[int]:
