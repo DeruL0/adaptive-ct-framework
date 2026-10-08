@@ -60,7 +60,7 @@ def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
             "solver": {"subsets": 3, "round_tol": 1e-2, "round_epochs": 6, "final_tol": 1e-3, "final_epochs": 8, "min_epochs": 2,
                        "min_leaf_px": 2.5, "edge_penalty": {"weight": 2300, "delta": 0.02}, "geometry_steps": 1},
             "refinement": {"action_share": 0.5, "stop_below_remaining": 0.01, "decision_views": 6, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3,
-                           "lookahead_leaves": 64},
+                           "lookahead_leaves": 64, "spend_all_below": 0.0},
         },
         "metrics": {"compute_projection_metrics": True, "compute_volume_metrics": False, "compute_boundary_metrics": False},
         "output": {"dir": str(output_root)},
@@ -94,6 +94,14 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(report["status"], "complete")
         self.assertTrue(all(r["values_converged"] for r in report["rounds"]))  # no structure change on unconverged values
         self.assertTrue(all(isinstance(a, bool) for r in report["rounds"] for a in r["geometry_accepted"]))
+
+    def test_tail_spends_the_rest_of_the_budget_in_one_decision(self):
+        def patch(config):
+            config["training"]["refinement"].update(spend_all_below=0.9, max_rounds=6)
+        report, _ = self._run(types=["constant", "trilinear", "step"], patch=patch)
+        shares = [event["action_share"] for event in report["growth_events"] if "action_share" in event]
+        self.assertIn(1.0, shares)  # remaining fell below 90 %: the next decision may spend all of it
+        self.assertTrue(all(s in (0.5, 1.0) for s in shares))
 
     def test_unconverged_values_stop_the_run_without_a_structure_change(self):
         def patch(config):

@@ -48,10 +48,14 @@ class RefinementController:
         self.state_dir.mkdir(parents=True, exist_ok=True)  # the last decision's input (audit/benchmark_pipeline.py)
         torch.save({"model": model.state_dict(), "round": self.round_index}, self.state_dir / "pre_decision_last.pt")
         t0 = time.perf_counter()
+        # the tail: once less than spend_all_below of the budget is left, one decision spends all of it (instead of a
+        # share of the rest per round, which adds rounds of a few percent of the bytes each)
+        share = 1.0 if remaining < float(self.spec["spend_all_below"]) else float(self.spec["action_share"])
+        event["action_share"] = share
         report, self.changed_cells = decide_and_apply(
             model, self.estimator_split, views, detector_h=self.detector_h, detector_w=self.detector_w,
             byte_budget=self.byte_budget, frozen=frozen,
-            action_share=float(self.spec["action_share"]), min_footprint_px=float(self.spec["min_footprint_px"]),
+            action_share=share, min_footprint_px=float(self.spec["min_footprint_px"]),
             lookahead_leaves=int(self.spec["lookahead_leaves"]),
             penalty_weight=float(self.edge_penalty["weight"]), penalty_delta=float(self.edge_penalty["delta"]))
         event.update(report)
