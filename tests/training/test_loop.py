@@ -60,7 +60,7 @@ def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
             "solver": {"subsets": 3, "round_tol": 1e-2, "round_epochs": 6, "final_tol": 1e-3, "final_epochs": 8, "min_epochs": 2,
                        "min_leaf_px": 2.5, "edge_penalty": {"weight": 2300, "delta": 0.02}, "geometry_steps": 1},
             "refinement": {"action_share": 0.5, "stop_below_remaining": 0.01, "decision_views": 6, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3,
-                           "lookahead_leaves": 64, "spend_all_below": 0.0},
+                           "error_share": 0.2, "spend_all_below": 0.0},
         },
         "metrics": {"compute_projection_metrics": True, "compute_volume_metrics": False, "compute_boundary_metrics": False},
         "output": {"dir": str(output_root)},

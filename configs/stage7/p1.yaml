@@ -41,7 +41,7 @@ training:
     stop_below_remaining: 0.01  # stop refining when less than this share of the budget is left
     decision_views: 240     # all pixels of all training views; alternate views (by angle) = the two halves
     min_footprint_px: 1.0   # children must span >= 1 detector pixel
-    lookahead_leaves: 0     # two-level split evaluated for this many leaves (most residual left after a one-level split); 0: off
+    error_share: 0.2        # share of each round's allowance split by modified residual error (Binev-DeVore) instead of one-step gain: reaches structure thinner than the children
     spend_all_below: 0.10   # once less than this share of the budget is left, one decision spends all of it (0: off)
     byte_budget: 8388608    # bytes of the stored file (codec/budget.py): leaf 2.25 / 16.25 / 8.25 B, split 1 B + 7 leaves
     max_rounds: 32
