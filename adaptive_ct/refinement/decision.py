@@ -185,11 +185,11 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor, ids: torch.
     The face samples are processed in blocks of PENALTY_CHUNK: a block of all samples of a face direction held
     (samples, 102) doubles several times over (3.7 GB and more at 2.3 M leaves) and fragmented the allocator.
     Each shared-face sample p of leaf L (other side g = neighbour value, fixed) enters with weight
-    alpha = area * min(1, delta / |t0|), t0 = f_L(p) - g: the quadratic that touches the penalty's
-    phi(t) at the current t0 and lies above it everywhere (phi <= alpha t^2 / 2 + const).  Summed:
+    alpha = area * min(1 / h, delta / |t0|), t0 = f_L(p) - g: the quadratic that touches the penalty's
+    h phi(t / h) at the current t0 and lies above it everywhere (<= alpha t^2 / 2 + const).  Summed:
       option values c (basis a at p):  sum alpha (a.c - g)^2   -> G, h, b2 slots (target b = g)
       split corrections e (child of p): sum alpha (e - (g - f_L))^2  -> split G, h, r2 slots (residual = t0)
-    plus the faces between the 8 children (current jump 0, alpha = area)."""
+    plus the faces between the 8 children (current jump 0, alpha = area / h, h = the children's size)."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     coeff = model.values.detach()
@@ -202,17 +202,17 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor, ids: torch.
         return (w.double() * coeff[idx].double()).sum(1)
 
     def blocks():
-        for i_ids, j_ids, ui, uj, area in face_samples(model):
+        for i_ids, j_ids, ui, uj, area, h in face_samples(model):
             if ids is not None:  # samples touching a kept leaf
                 k = (slot[i_ids] >= 0) | (slot[j_ids] >= 0)
-                i_ids, j_ids, ui, uj, area = i_ids[k], j_ids[k], ui[k], uj[k], area[k]
+                i_ids, j_ids, ui, uj, area, h = i_ids[k], j_ids[k], ui[k], uj[k], area[k], h[k]
             for a in range(0, int(area.numel()), PENALTY_CHUNK):
                 b = a + PENALTY_CHUNK
-                yield i_ids[a:b], j_ids[a:b], ui[a:b], uj[a:b], area[a:b]
+                yield i_ids[a:b], j_ids[a:b], ui[a:b], uj[a:b], area[a:b], h[a:b]
 
-    for i_ids, j_ids, ui, uj, area in blocks():
+    for i_ids, j_ids, ui, uj, area, h in blocks():
         fi, fj = value(i_ids, ui).double(), value(j_ids, uj).double()
-        s = (scale * area.double() * (float(delta) / (fi - fj).abs().clamp_min(1e-30)).clamp(max=1.0)).sqrt()
+        s = (scale * area.double() * torch.minimum(1.0 / h.double(), float(delta) / (fi - fj).abs().clamp_min(1e-30))).sqrt()
         for leaf, u, f, g in ((i_ids, ui, fi, fj), (j_ids, uj, fj, fi)):
             u = u.double()
             tri = trilinear_weights(u)
@@ -238,7 +238,7 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor, ids: torch.
                 e[a], e[a | bit] = 1.0, -1.0
                 M += torch.outer(e, e)
         t1, t2 = [b for b in range(3) if b != axis]
-        acc[:, 51:87] += (scale * size[:, t1] * size[:, t2] / 4.0)[:, None] * M[iu, ju][None]
+        acc[:, 51:87] += (scale * size[:, t1] * size[:, t2] / 4.0 / (size[:, axis] / 2.0))[:, None] * M[iu, ju][None]
     return acc
 
 

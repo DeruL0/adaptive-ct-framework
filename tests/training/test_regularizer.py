@@ -26,7 +26,7 @@ class EdgePenaltyTests(unittest.TestCase):
         self.assertLess(float(grad.abs().max()), 1e-6)
         # 2x2 samples per shared face patch, from the finer side: sampled area = interior face area
         # (2x2x2 grid of unit cells: 12; each split unit cell adds 3 internal unit faces)
-        self.assertAlmostEqual(float(penalty.area.sum()), 12 + 2 * 3, places=5)
+        self.assertAlmostEqual(float((penalty.weight * penalty.h).sum()), 12 + 2 * 3, places=5)
 
     def test_gradient_and_curvature_bound(self):
         torch.manual_seed(0)
@@ -96,7 +96,7 @@ class EdgePenaltyTests(unittest.TestCase):
         delta = 10.0  # every jump in the quadratic range: the surrogate is the penalty itself
         acc = penalty_statistics(model, delta, candidate).double()
         R = EdgePenalty(model, delta).value_and_gradient(c)[0]
-        self.assertAlmostEqual(float(acc[:, 96].sum()), 4 * R, delta=1e-5 * max(1.0, R))  # each sample on both leaves, phi = t^2/2
+        self.assertAlmostEqual(float(acc[:, 96].sum()), 4 * R, delta=1e-5 * max(1.0, 4 * R))  # each sample on both leaves, phi = t^2/2
         iu, ju = torch.triu_indices(8, 8)
         for leaf in torch.nonzero(model.leaf_type() == 1).flatten().tolist():  # refit option = current values: t unchanged
             G = torch.zeros(8, 8, dtype=torch.float64)

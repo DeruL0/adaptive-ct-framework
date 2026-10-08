@@ -339,7 +339,7 @@ def stage_edge_penalty(ds):
     from adaptive_ct.training.regularizer import EdgePenalty
     from adaptive_ct.training.solve import gradient, solve
     dh, dw = ds.detector_shape
-    delta = 0.02
+    delta = 2.0  # gradient units (configs/stage7/p1.yaml)
     m0 = load_checkpoint(ROOT / "output" / RUN / "checkpoint.pt")
     m0.values.requires_grad_(True)
     c0 = m0.values.detach().clone()
