@@ -108,8 +108,8 @@ def _pack(L, tri, step, child, contribution, residual, step_cur) -> torch.Tensor
                       step_cur * b[:, None]], 1)
 
 
-def _accumulate_reference(model, batch, residual, candidate, acc, active):
-    """PyTorch reference of the CUDA accumulation of one view into acc (N, STRIDE) for the leaves marked in active, used on CPU."""
+def _accumulate_reference(model, batch, residual, candidate, acc, slot):
+    """PyTorch reference of the CUDA accumulation of one view into acc (rows, STRIDE), leaf i into row slot[i] (< 0: skipped), used on CPU."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     kind = model.leaf_type()
@@ -144,7 +144,8 @@ def _accumulate_reference(model, batch, residual, candidate, acc, active):
         0, inv, torch.cat([L[:, None], tri, step_weights(candidate[leaf_ids]), child, cur[:, None], own_step], 1))
     pair_ray, pair_leaf = uniq // N, uniq % N
     rows = _pack(feat[:, 0], feat[:, 1:9], feat[:, 9:11], feat[:, 11:19], feat[:, 19], residual[pair_ray], feat[:, 20:22])
-    acc.index_add_(0, pair_leaf, rows * active[pair_leaf, None])
+    keep = slot[pair_leaf] >= 0
+    acc.index_add_(0, slot[pair_leaf[keep]].long(), rows[keep])
 
 
 def step_side_fraction(geometry: torch.Tensor, samples: int = 4) -> torch.Tensor:
@@ -158,8 +159,18 @@ def step_side_fraction(geometry: torch.Tensor, samples: int = 4) -> torch.Tensor
 
 
 @torch.no_grad()
-def penalty_statistics(model, delta: float, candidate: torch.Tensor) -> torch.Tensor:
-    """(N, STRIDE) edge-penalty terms of every option, in the layout of the ray statistics.
+def _slot_map(N: int, ids, device) -> torch.Tensor:
+    """(N,) int32 row of each leaf in statistics kept for `ids` only (all leaves, in order, when None); -1 elsewhere."""
+    if ids is None:
+        return torch.arange(N, dtype=torch.int32, device=device)
+    slot = torch.full((N,), -1, dtype=torch.int32, device=device)
+    slot[ids] = torch.arange(ids.numel(), dtype=torch.int32, device=device)
+    return slot
+
+
+def penalty_statistics(model, delta: float, candidate: torch.Tensor, ids: torch.Tensor | None = None) -> torch.Tensor:
+    """(N, STRIDE) edge-penalty terms of every option, in the layout of the ray statistics (rows of `ids` only, in that
+    order, when given).
     Each shared-face sample p of leaf L (other side g = neighbour value, fixed) enters with weight
     alpha = area * min(1, delta / |t0|), t0 = f_L(p) - g: the quadratic that touches the penalty's
     phi(t) at the current t0 and lies above it everywhere (phi <= alpha t^2 / 2 + const).  Summed:
@@ -170,27 +181,32 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor) -> torch.Te
     N = int(model.leaf_levels.shape[0])
     coeff = model.values.detach()
     kind = model.leaf_type()
-    acc = torch.zeros((N, STRIDE), dtype=torch.float64, device=device)  # double: see local_statistics
+    slot = _slot_map(N, ids, device)
+    acc = torch.zeros((N if ids is None else ids.numel(), STRIDE), dtype=torch.float64, device=device)  # double: see local_statistics
 
     def value(ids, u):
         w, idx = basis_rows(model, ids, u)
         return (w.double() * coeff[idx].double()).sum(1)
 
     for i_ids, j_ids, ui, uj, area in face_samples(model):
+        if ids is not None:  # samples touching a kept leaf
+            k = (slot[i_ids] >= 0) | (slot[j_ids] >= 0)
+            i_ids, j_ids, ui, uj, area = i_ids[k], j_ids[k], ui[k], uj[k], area[k]
         fi, fj = value(i_ids, ui).double(), value(j_ids, uj).double()
         s = (area.double() * (float(delta) / (fi - fj).abs().clamp_min(1e-30)).clamp(max=1.0)).sqrt()
-        for ids, u, f, g in ((i_ids, ui, fi, fj), (j_ids, uj, fj, fi)):
+        for leaf, u, f, g in ((i_ids, ui, fi, fj), (j_ids, uj, fj, fi)):
             u = u.double()
             tri = trilinear_weights(u)
-            cg = candidate[ids]
+            cg = candidate[leaf]
             H = torch.sigmoid((((u - 0.5) * cg[:, :3]).sum(1) - cg[:, 3]) / cg[:, 4].clamp_min(1e-30))
             child = torch.nn.functional.one_hot((u[:, 0] > 0.5).long() * 4 + (u[:, 1] > 0.5).long() * 2 + (u[:, 2] > 0.5).long(), 8).float()
-            Hc = step_H(model.geometry(ids), u)  # the leaf's own step (rows of leaves that are not steps are zeroed)
-            own = torch.stack([1 - Hc, Hc], 1) * (kind[ids] == 2)[:, None]
-            acc.index_add_(0, ids, _pack(s, s[:, None] * tri, s[:, None] * torch.stack([1 - H, H], 1), s[:, None] * child, s * f, s * (f - g),
-                                         s[:, None] * own))
+            Hc = step_H(model.geometry(leaf), u)  # the leaf's own step (rows of leaves that are not steps are zeroed)
+            own = torch.stack([1 - Hc, Hc], 1) * (kind[leaf] == 2)[:, None]
+            rows = _pack(s, s[:, None] * tri, s[:, None] * torch.stack([1 - H, H], 1), s[:, None] * child, s * f, s * (f - g), s[:, None] * own)
+            keep = slot[leaf] >= 0
+            acc.index_add_(0, slot[leaf[keep]].long(), rows[keep])
     iu, ju = torch.triu_indices(8, 8, device=device)
-    size = 2.0 / torch.tensor(model.level_shapes, dtype=torch.float64, device=device)[model.leaf_levels]
+    size = 2.0 / torch.tensor(model.level_shapes, dtype=torch.float64, device=device)[model.leaf_levels if ids is None else model.leaf_levels[ids]]
     for axis in range(3):
         bit = 4 >> axis  # child index = 4 x + 2 y + z
         M = torch.zeros((8, 8), dtype=torch.float64, device=device)
@@ -206,21 +222,21 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor) -> torch.Te
 
 @torch.no_grad()
 def local_statistics(model, split, views: list[int], candidate: torch.Tensor, prior: torch.Tensor | None = None,
-                     active: torch.Tensor | None = None) -> torch.Tensor:
+                     ids: torch.Tensor | None = None) -> torch.Tensor:
     """(2, N, STRIDE) float64 statistics per leaf and ray half f (alternate views): the normal equations of every
     option (G upper triangle and h, layout _SLOTS), sum b^2 with b = data minus the other leaves (the target of a
     type refit) and sum residual^2.  Each view is accumulated in float32 by the kernel and added up in double: the
     gains are differences of terms that are large against them (b^2 against the residual), which float32 sums
-    over the views lose.  `prior` (N, STRIDE), e.g. the weighted penalty_statistics, is added to both halves.  `active` (N,) bool:
-    only these leaves get ray statistics (the others keep the prior); default all."""
+    over the views lose.  `prior` (N, STRIDE), e.g. the weighted penalty_statistics, is added to both halves.  `ids`: statistics of
+    these leaves only (rows in that order; prior given for them); default all leaves."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
-    acc = torch.zeros((2, N, STRIDE), dtype=torch.float64, device=device)
+    slot = _slot_map(N, ids, device)
+    n = N if ids is None else ids.numel()
+    acc = torch.zeros((2, n, STRIDE), dtype=torch.float64, device=device)
     if prior is not None:
         acc += prior[None]
-    view_acc = torch.zeros((N, STRIDE), device=device)
-    if active is None:
-        active = torch.ones(N, dtype=torch.bool, device=device)
+    view_acc = torch.zeros((n, STRIDE), device=device)
     h, w = split.projections.shape[1:]
     rows, cols = traversal_grid(h, w, device)
     for position, v in enumerate(views):
@@ -230,9 +246,9 @@ def local_statistics(model, split, views: list[int], candidate: torch.Tensor, pr
         view_acc.zero_()
         if model.uses_cuda():
             bernstein_octree_decision_accumulate(model.values, model.step_geometry, **model.tree_arguments(), rays=batch,
-                                                 candidate_geometry=candidate, residual=residual, accum=view_acc, active=active)
+                                                 candidate_geometry=candidate, residual=residual, accum=view_acc, slot=slot)
         else:
-            _accumulate_reference(model, batch, residual, candidate, view_acc, active)
+            _accumulate_reference(model, batch, residual, candidate, view_acc, slot)
         acc[position % 2] += view_acc
     return acc
 
@@ -259,10 +275,17 @@ def _fit(G: torch.Tensor, h: torch.Tensor, lower: torch.Tensor, iterations: int 
     A = G.reshape(-1, m, m).double()
     A = A + 1e-6 * A.diagonal(dim1=1, dim2=2).mean(1).clamp_min(1e-12)[:, None, None] * torch.eye(m, dtype=A.dtype, device=A.device)
     hd, lo = h.double(), lower.double()
-    step = 1.0 / torch.linalg.eigvalsh(A).amax(1).clamp_min(1e-30)
-    c = torch.maximum(torch.linalg.solve(A, hd), lo)
-    for _ in range(iterations):
-        c = torch.maximum(c - step[:, None] * (torch.bmm(A, c[:, :, None])[:, :, 0] - hd), lo)
+    c = torch.linalg.solve(A, hd)
+    # A convex problem: where the unconstrained solution meets the bounds it is the solution (88-95 % of the leaves);
+    # projected gradient only for the others.
+    bad = torch.nonzero((c < lo).any(1)).flatten()
+    if bad.numel():
+        Ab, hb, lb = A[bad], hd[bad], lo[bad]
+        step = 1.0 / torch.linalg.eigvalsh(Ab).amax(1).clamp_min(1e-30)
+        cb = torch.maximum(c[bad], lb)
+        for _ in range(iterations):
+            cb = torch.maximum(cb - step[:, None] * (torch.bmm(Ab, cb[:, :, None])[:, :, 0] - hb), lb)
+        c[bad] = cb
     return c  # float64: the objective subtracts large terms
 
 
@@ -388,13 +411,14 @@ def lookahead(model, split, views, ids, *, penalty_weight, penalty_delta, detect
     cid = temp.ids_of_cells(child_cells)
     # the kernel needs a candidate geometry for every leaf; the children's type options are not used here
     dummy = pad_geometry(torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.25]], device=device).expand(temp.leaf_count, -1))
-    prior = 0.5 * float(penalty_weight) * penalty_statistics(temp, penalty_delta, dummy) if penalty_weight > 0 else None
-    active = torch.zeros(temp.leaf_count, dtype=torch.bool, device=device)
-    active[cid] = True
-    acc = local_statistics(temp, split, views, dummy, prior, active)  # ray statistics of the children only
+    if device.type == "cuda":
+        torch.cuda.empty_cache()  # the decision's freed statistics: without this the cache and the new arrays overflow 12 GB
+    # statistics of the children only (rows in cid order): a third of the copy's leaves
+    prior = penalty_statistics(temp, penalty_delta, dummy, cid).mul_(0.5 * float(penalty_weight)) if penalty_weight > 0 else None
+    acc = local_statistics(temp, split, views, dummy, prior, cid)
     del prior
     kind = temp.leaf_type()[cid]
-    gain = evaluate_options(acc[:, cid], -child_minimum(temp)[cid], kind)[:, 3]
+    gain = evaluate_options(acc, -child_minimum(temp)[cid], kind)[:, 3]
     del acc
     ok = resolvable_mask(temp, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)[cid]
     return gain.reshape(-1, 8), split_bytes(kind).reshape(-1, 8), ok.reshape(-1, 8)

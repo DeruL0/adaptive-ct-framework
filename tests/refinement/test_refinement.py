@@ -8,7 +8,7 @@ from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
 from adaptive_ct.data.dataset import ProjectionSplit
 from adaptive_ct.refinement.decision import (candidate_step_geometry, child_minimum, choose, decide_and_apply, decision_views,
-                                             evaluate_options, local_statistics, resolvable_mask)
+                                             evaluate_options, local_statistics, penalty_statistics, resolvable_mask)
 from adaptive_ct.representation.octree import BernsteinOctree
 from adaptive_ct.training.solve import solve
 
@@ -215,16 +215,15 @@ class DecisionCudaTests(unittest.TestCase):
         for column in range(cuda.shape[-1]):  # every statistic: the kernel (float32 per view) against the reference
             scale = float(reference[..., column].abs().max()) + 1e-12
             self.assertLess(float((cuda[..., column] - reference[..., column]).abs().max()) / scale, 2e-4, column)
-        # only the marked leaves get statistics, and theirs are unchanged (kernel and reference)
-        active = torch.zeros(model.leaf_count, dtype=torch.bool, device="cuda")
-        active[::3] = True
-        masked_ref = local_statistics(model, split, views, candidate, active=active)
+        # statistics of chosen leaves only: the same rows as the full statistics (kernel and reference), penalty too
+        ids = torch.arange(0, model.leaf_count, 3, device="cuda").flip(0)
+        part_ref = local_statistics(model, split, views, candidate, ids=ids)
         model.cuda_integrator = True
-        masked = local_statistics(model, split, views, candidate, active=active)
-        for full, part in ((reference, masked_ref), (cuda, masked)):
-            self.assertTrue(torch.equal(part[:, ~active], torch.zeros_like(part[:, ~active])))
-            self.assertLess(float((part[:, active] - full[:, active]).abs().max()), 1e-9 + 1e-6 * float(full.abs().max()))
-
+        part = local_statistics(model, split, views, candidate, ids=ids)
+        for full, sub in ((reference, part_ref), (cuda, part)):
+            self.assertLess(float((sub - full[:, ids]).abs().max()), 1e-9 + 1e-6 * float(full.abs().max()))
+        pen = penalty_statistics(model, 0.02, candidate)
+        self.assertLess(float((penalty_statistics(model, 0.02, candidate, ids) - pen[ids]).abs().max()), 1e-9 * (1 + float(pen.abs().max())))
 
 if __name__ == "__main__":
     unittest.main()
