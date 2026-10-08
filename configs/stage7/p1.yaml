@@ -34,14 +34,14 @@ training:
     min_leaf_px: 2.5        # bin the detector 2x2 / 4x4 while the finest leaf spans >= this many binned pixels
     geometry_steps: 1       # Gauss-Newton steps on the step geometry (n, d, w) per round, before the value solve
     edge_penalty:           # neighbouring leaves: jumps <= delta penalised quadratically, larger ones linearly
-      weight: 2300          # chosen on the held-out views (f474847 tree: 0 / 23 / 231 / 2311 / 7704 -> 2311 best)
+      weight: 1150          # held-out views prefer it with the relaxed OS-LALM (share 0.5: 4600 / 2300 / 1150 -> 53.24 / 53.62 / 53.78 dB)
       delta: 0.02
   refinement:
-    action_share: 0.7       # each round's net added bytes stay within this share of the remaining budget
+    action_share: 0.35      # each round's net added bytes stay within this share of the remaining budget (0.7 / 0.5 / 0.35: 37.33 / 37.39 / 37.41 dB)
     stop_below_remaining: 0.01  # stop refining when less than this share of the budget is left
     decision_views: 240     # all pixels of all training views; alternate views (by angle) = the two halves
     min_footprint_px: 1.0   # children must span >= 1 detector pixel
-    lookahead_leaves: 65536 # two-level split evaluated for the leaves with the most residual left after a one-level split
+    lookahead_leaves: 0     # two-level split evaluated for this many leaves (most residual left after a one-level split); 0: off
     spend_all_below: 0.10   # once less than this share of the budget is left, one decision spends all of it (0: off)
     byte_budget: 8388608    # bytes of the stored file (codec/budget.py): leaf 2.25 / 16.25 / 8.25 B, split 1 B + 7 leaves
     max_rounds: 32
