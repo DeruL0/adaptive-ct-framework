@@ -104,6 +104,32 @@ class EdgePenaltyTests(unittest.TestCase):
             G[ju, iu] = acc[leaf, 2:38]
             v = c[model.value_offsets()[leaf] + torch.arange(8)].double()
             self.assertAlmostEqual(float(v @ G @ v - 2 * acc[leaf, 38:46] @ v + acc[leaf, 95]), float(acc[leaf, 96]), places=5)
+    def test_geometry_gradient_matches_finite_differences(self):
+        torch.manual_seed(5)
+        model = _tree()
+        c = 0.05 + 0.5 * torch.rand(model.values.numel())
+        with torch.no_grad():
+            model.values.copy_(c)
+        penalty = EdgePenalty(model, delta=0.05)
+        stats = penalty.geometry_statistics(c)
+        self.assertEqual(tuple(stats.shape), (model.n_step, 20))
+        direction = torch.randn(model.n_step, 5)
+        g0 = model.step_geometry.clone()
+        values = []
+        for e in (1e-3, -1e-3):
+            with torch.no_grad():
+                model.step_geometry[:, :5] = g0[:, :5] + e * direction
+            values.append(penalty.value_and_gradient(c)[0])
+        with torch.no_grad():
+            model.step_geometry.copy_(g0)
+        numeric = (values[0] - values[1]) / 2e-3
+        self.assertAlmostEqual(numeric, float((stats[:, :5] * direction).sum()), delta=1e-3 * max(1.0, abs(numeric)))
+        iu, ju = torch.triu_indices(5, 5)
+        G = torch.zeros(model.n_step, 5, 5)
+        G[:, iu, ju] = stats[:, 5:]
+        G[:, ju, iu] = stats[:, 5:]
+        self.assertGreaterEqual(float(torch.linalg.eigvalsh(G).min()), -1e-6)  # positive semidefinite
+
     def test_large_jumps_cost_linearly(self):
         model = BernsteinOctree(levels=[2], leaf_types=("constant",), cuda_integrator=False)
         values = torch.full((8,), 0.1)

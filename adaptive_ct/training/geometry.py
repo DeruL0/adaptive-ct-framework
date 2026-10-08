@@ -3,6 +3,8 @@
 Objective as in the solve:  J(theta) = 1/2 ||A(theta) c - y||^2 + beta R(theta)  (theta = n, d, w of every step leaf).
 Per step leaf L, with D_ray = d(prediction of the ray)/d theta_L (5 numbers, CUDA segment_geometry):
   g_L = sum residual * D,   G_L = sum D D^T   (rays through several step leaves: their coupling is ignored),
+plus beta times the edge penalty's statistics (EdgePenalty.geometry_statistics: its gradient and the curvature of the
+quadratic that touches it, the neighbours fixed), so planes also move to meet their neighbours' transitions;
   delta_L = -(G_L + 0.1 diag(G_L) + eps I)^-1 g_L, each part capped (|dn| <= 0.25, |dd| <= 0.1, w within [w/2, 2w]).
 Constraints after the step: n renormalised (d, w scaled with it, same function), w >= a quarter detector pixel,
 the plane inside the leaf, and both sides >= 2% of the leaf (otherwise the leaf keeps its geometry).
@@ -89,6 +91,8 @@ def geometry_step(model, split, *, detector_bin: int, penalty_weight: float, pen
     R = lambda: penalty.value_and_gradient(model.values.detach())[0] if penalty is not None else 0.0
     objective = lambda: data_term(model, angles, projections, views) + beta * R()
     accum, J_data = statistics(model, angles, projections, views)
+    if penalty is not None:  # the penalty's own pull on the planes (alignment with the neighbours), not only its veto
+        accum += beta * penalty.geometry_statistics(model.values.detach())
     J0 = J_data + beta * R()
     iu, ju = torch.triu_indices(5, 5, device=accum.device)
     G = torch.zeros((model.n_step, 5, 5), dtype=torch.float64, device=accum.device)

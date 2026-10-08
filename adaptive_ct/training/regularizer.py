@@ -124,6 +124,37 @@ class EdgePenalty:
             g.index_add_(0, jj.reshape(-1), (-slope * wj).reshape(-1))
         return float(value), g
 
+    def geometry_statistics(self, c: torch.Tensor) -> torch.Tensor:
+        """(n_step, 20) Gauss-Newton statistics of R with respect to each step leaf's geometry theta = (n, d, w), in the
+        layout of training/geometry.py: gradient (5), then the upper triangle of the 5 x 5 matrix.  Per sample
+        t = f_i - f_j; a step side contributes  +-area phi'(t) df/dtheta  to the gradient and
+        area alpha df/dtheta df/dtheta^T  to the matrix, alpha = min(1, delta / |t|): the quadratic that touches phi
+        at t and lies above it (as in the decision's penalty statistics).  The other leaf is held fixed (Jacobi).
+        df/dtheta = (c1 - c0) H' (s / w)' with s = n . (u - 1/2) - d, H = sigmoid(s / w):  ((u - 1/2) / w, -1 / w, -s / w^2)."""
+        model, d = self.model, self.delta
+        n_step = int(model.n_step)
+        out = torch.zeros((n_step, 20), device=c.device)
+        if n_step == 0:
+            return out
+        kind, off = model.leaf_type(), model.value_offsets()
+        iu, ju = torch.triu_indices(5, 5, device=c.device)
+        for sl, wi, ii, wj, jj in self._chunks():
+            t = (wi * c[ii]).sum(1) - (wj * c[jj]).sum(1)
+            area = self.area[sl]
+            slope, alpha = area * t.clamp(-d, d), area * (d / t.abs().clamp_min(1e-30)).clamp(max=1.0)
+            for leaf, u, sign in ((self.leaf_i[sl].long(), self.u_i[sl].float(), 1.0), (self.leaf_j[sl].long(), self.u_j[sl].float(), -1.0)):
+                m = torch.nonzero(kind[leaf] == 2).flatten()
+                g = model.geometry(leaf[m])
+                w = g[:, 4]
+                m, g, w, um = m[w > 0], g[w > 0], w[w > 0], u[m][w > 0] - 0.5  # hard steps have no derivative
+                s = (um * g[:, :3]).sum(1) - g[:, 3]
+                H = torch.sigmoid(s / w)
+                k = (c[off[leaf[m]] + 1] - c[off[leaf[m]]]) * H * (1 - H) / w
+                D = torch.cat([k[:, None] * um, -k[:, None], (-k * s / w)[:, None]], 1)
+                rows = torch.cat([sign * slope[m, None] * D, alpha[m, None] * D[:, iu] * D[:, ju]], 1)
+                out.index_add_(0, leaf[m] - model.n_tri, rows)
+        return out
+
     def curvature(self) -> torch.Tensor:
         d = torch.zeros(int(self.model.values.numel()), device=self.area.device)
         for sl, wi, ii, wj, jj in self._chunks():
