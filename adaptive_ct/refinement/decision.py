@@ -16,15 +16,17 @@ detail it drops is largely invisible in held-out projections but not in the volu
 +0.7 dB, volume -0.6 dB with 472k downgrades).
 
 Choice: each leaf takes the option maximising  gain - lambda * extra_bytes ; lambda >= 0 is the smallest
-price of a byte that keeps this round's additions within (1 - continuation_share) of the round's allowance
-(`action_share` of the remaining budget; byte-saving options are taken when the lost gain is below the bytes they free,
-and pay for this round's additions).
-Continuation splits (the other `continuation_share` of the allowance): a split into children of the leaf's size can
-earn little where the structure is thinner than the children (a 3-5 voxel crack through 10-voxel leaves), although
-splitting those children would capture it; the one-level gain is then positive but below the round's price.  Children
-of a split taken by gain (it paid at the round's price: the structure is there) whose own split gain is positive but
-was not taken are split in decreasing gain per byte until that share is spent: growth continues one level below where
-it paid (a continuation split does not make its children eligible).
+price of a byte that keeps this round's additions within (1 - error_share) of the round's allowance (`action_share` of
+the remaining budget; byte-saving options are taken when the lost gain is below the bytes they free, and pay for this
+round's additions).
+Error-driven splits (the other `error_share` of the allowance): a split into children of the leaf's size can earn
+little where the structure is thinner than the children (a 3-5 voxel crack through 10-voxel leaves), although
+splitting those children would capture it.  So, as in near-best adaptive tree approximation (Binev & DeVore 2004),
+part of the bytes goes by error rather than by one-step gain: e = residual energy left after the leaf's best one-level
+split per ray through the leaf (divided by its projected area: unnormalised, the large leaves rank first - run err02),
+modified along the ancestors  e~ = 1 / (1 / e + 1 / e~_parent)  (e~ = e at the coarsest level): an error that
+appeared where the parent had a large one stays nearly whole, an error that splitting does not reduce halves per level.
+Leaves not taken by gain are split in decreasing e~ until that share is spent.
 All chosen actions are executed; the budget fills geometrically over the rounds, and the tree is re-solved
 before the next decision.
 """
@@ -378,6 +380,11 @@ def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, allo
     return chosen, idx[chosen], lam
 
 
+def modified_error(e: torch.Tensor, parent: torch.Tensor) -> torch.Tensor:
+    """Binev-DeVore modified error  1 / (1 / e + 1 / parent)  (parent = inf: e; e = 0: 0)."""
+    return torch.where(torch.isinf(parent), e, e * parent / (e + parent).clamp_min(1e-300))
+
+
 @torch.no_grad()
 def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: torch.Tensor, samples: int = 4) -> torch.Tensor:
     """Values (concatenated in leaf order) of the new-type functions closest, in least squares over
@@ -416,10 +423,11 @@ def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: 
 
 @torch.no_grad()
 def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, action_share, min_footprint_px,
-                     penalty_weight, penalty_delta, continuation_share, productive_parent=None, frozen=None):
+                     penalty_weight, penalty_delta, error_share, parent_error=None, frozen=None):
     """One structure / type decision on a solved model; applies the chosen batch.  `frozen` (N,) marks leaves
-    that may not change type; `productive_parent` (N,) the leaves whose parent was split by gain.
-    Returns a report, the cells (level, x, y, z) whose type changed and the cells split now by gain."""
+    that may not change type; `parent_error` (N,) the modified error of each leaf's parent when it was split (inf: none
+    recorded, e.g. the coarsest level).  Returns a report, the cells (level, x, y, z) whose type changed and
+    (cells, modified errors) of the leaves split now (the parents of the next decisions)."""
     device = model.leaf_levels.device
     N = int(model.leaf_levels.shape[0])
     kind = model.leaf_type()
@@ -439,6 +447,12 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     del prior
     lap("ray_statistics")
     gains = evaluate_options(acc, -child_minimum(model), kind)
+    r2 = acc[:, :, 96].sum(0)
+    left = r2 - gains[:, 3]  # residual energy left after the best one-level split
+    left = torch.where(left > 1.0e-6 * (r2 + r2.mean()), left, torch.zeros_like(left))  # below the statistics' accuracy: 0
+    # per ray: the rays through a leaf scale with its projected area (width in the rotation plane x height along the axis)
+    shape = torch.tensor(model.level_shapes, dtype=torch.float64, device=device)[model.leaf_levels]
+    left = left.double() * shape[:, 0] * shape[:, 2]
     del acc  # free the statistics before the edits
     lap("fits")
     per_leaf = leaf_bytes().to(device)
@@ -455,16 +469,16 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
     bytes_now = model_bytes(model)
     allowance = action_share * max(float(byte_budget - bytes_now), 0.0)
-    ids, option, lam = choose(gains, extra, allowed, (1.0 - float(continuation_share)) * allowance)
-    # continuation splits: children of productive splits, positive own split gain not taken, in decreasing gain per byte
-    more = allowed[:, 3] & (gains[:, 3] > 0)
-    more &= productive_parent if productive_parent is not None else torch.zeros_like(more)
-    more[ids] = False
-    cand = torch.nonzero(more).flatten()
-    cand = cand[torch.argsort(gains[cand, 3] / extra[cand, 3], descending=True)]
-    cand = cand[torch.cumsum(extra[cand, 3], 0) <= float(continuation_share) * allowance]
-    continued = torch.zeros(N, dtype=torch.bool, device=device)
-    continued[cand] = True
+    ids, option, lam = choose(gains, extra, allowed, (1.0 - float(error_share)) * allowance)
+    # error-driven splits: leaves not taken by gain, in decreasing modified error, within error_share of the allowance
+    err = modified_error(left.double(), torch.full_like(left, math.inf, dtype=torch.float64) if parent_error is None else parent_error.double())
+    free = allowed[:, 3] & (err > 0)
+    free[ids] = False
+    cand = torch.nonzero(free).flatten()
+    cand = cand[torch.argsort(err[cand], descending=True)]
+    cand = cand[torch.cumsum(extra[cand, 3], 0) <= float(error_share) * allowance]
+    by_error = torch.zeros(N, dtype=torch.bool, device=device)
+    by_error[cand] = True
     ids, option = torch.cat([ids, cand]), torch.cat([option, torch.full_like(cand, 3)])
     lap("choice")
     if model.max_leaf_count is not None:  # leaf-count cap: drop splits beyond it
@@ -478,16 +492,16 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
         "bytes_before": bytes_now,
         "candidates_with_positive_gain": {o: int(((gains[:, i] > 0) & allowed[:, i]).sum()) for i, o in enumerate(OPTIONS)},
         "actions": {o: int((option == i).sum()) for i, o in enumerate(OPTIONS)},
-        "continuation_splits": int(continued[split_ids].sum()),
-        "continuation_split_bytes": float(extra[split_ids[continued[split_ids]], 3].sum()),
-        "continuation_split_gain": float(gains[split_ids[continued[split_ids]], 3].sum()),
+        "error_splits": int(by_error[split_ids].sum()),
+        "error_split_bytes": float(extra[split_ids[by_error[split_ids]], 3].sum()),
+        "error_split_gain": float(gains[split_ids[by_error[split_ids]], 3].sum()),  # their one-step held-out gain
         "held_out_gain_of_batch": float(gains[ids, option].sum()) if ids.numel() else 0.0,
         "seconds": seconds,
     }
-    productive = model.cells[split_ids[~continued[split_ids]]].long()  # splits that paid at the price: parents of continuations
+    split_record = (model.cells[split_ids].long(), err[split_ids].float())
     if ids.numel() == 0:
         report["bytes_after"] = bytes_now
-        return report, torch.zeros((0, 4), dtype=torch.long, device=device), productive
+        return report, torch.zeros((0, 4), dtype=torch.long, device=device), split_record
     # 1. type changes, initialised with the closest function of the new type to the current leaf function
     #    (refits of many leaves made in isolation do not fit together; the next solve starts near the solved state)
     change = option < 3
@@ -505,4 +519,4 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     lap("edits")
     report["bytes_after"] = model_bytes(model)
     report["leaf_type_counts"] = dict(zip(TYPE_NAMES, torch.bincount(model.leaf_type(), minlength=3).tolist()))
-    return report, changed_cells, productive
+    return report, changed_cells, split_record
