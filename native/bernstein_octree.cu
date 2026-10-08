@@ -271,7 +271,11 @@ __global__ void backward_kernel(Tree T, Rays R, const float* grad_out, float* gr
 //   49..50 step*b | 51..86 split G (upper), 87..94 split*(-residual) | 95 b*b | 96 residual^2 |
 //   97..99 current-geometry step G (00, 01, 11), 100..101 current step*b (zero for leaves that are not steps)
 constexpr int DECISION_STRIDE = 102;
-constexpr int DECISION_THREADS = 64;  // 64 rows of DECISION_STRIDE floats of shared memory per block
+constexpr int DECISION_THREADS = 64;
+// The 102 columns go through shared memory 35 at a time (odd row stride: no bank conflicts), so a block needs 9 KB
+// instead of 26 KB: 3 x more blocks per SM (63 -> 96 registers, no spill).  Measured on a 1.0 M-leaf state: decision
+// kernel 133-160 -> 66 ms per view, same statistics.
+constexpr int DECISION_WINDOW = 35;
 
 __device__ void segment_decision(const Tree& T, const Segment& s, const float* candidate, float* accum, int64_t leaf_count,
                                  float residual, float* shared_rows, const int* slot) {
@@ -307,41 +311,48 @@ __device__ void segment_decision(const Tree& T, const Segment& s, const float* c
         const float tm = 0.5f * (cuts[c] + cuts[c + 1]);
         child[(s.ux(tm) > 0.5f ? 4 : 0) + (s.uy(tm) > 0.5f ? 2 : 0) + cz] += cuts[c + 1] - cuts[c];
     }
-    float* row = shared_rows + threadIdx.x * DECISION_STRIDE;  // this thread's statistics, then summed per leaf
-    int k = 0;
-    row[k++] = length * length;
-    row[k++] = length * b;
-    for (int i = 0; i < 8; ++i)
-        for (int j = i; j < 8; ++j) row[k++] = tri[i] * tri[j];
-    for (int i = 0; i < 8; ++i) row[k++] = tri[i] * b;
-    row[k++] = st[0] * st[0];
-    row[k++] = st[0] * st[1];
-    row[k++] = st[1] * st[1];
-    row[k++] = st[0] * b;
-    row[k++] = st[1] * b;
-    for (int i = 0; i < 8; ++i)
-        for (int j = i; j < 8; ++j) row[k++] = child[i] * child[j];
-    for (int i = 0; i < 8; ++i) row[k++] = -child[i] * residual;
-    row[k++] = b * b;
-    row[k++] = residual * residual;
     float cur[2] = {0.0f, 0.0f};  // the leaf's own step with its current geometry: the baseline of a step leaf's options
     if (leaf_kind(T, s.leaf) == 2) {
         const float Ic = step_integral(T.geometry + 8 * (s.leaf - T.n_tri), s);
         cur[0] = length - Ic;
         cur[1] = Ic;
     }
-    row[k++] = cur[0] * cur[0];
-    row[k++] = cur[0] * cur[1];
-    row[k++] = cur[1] * cur[1];
-    row[k++] = cur[0] * b;
-    row[k++] = cur[1] * b;
-    group_add(shared_rows, DECISION_STRIDE, DECISION_STRIDE, static_cast<unsigned long long>(s.leaf),
-              accum + static_cast<int64_t>(out) * DECISION_STRIDE);
+    float* row = shared_rows + threadIdx.x * DECISION_WINDOW;  // this thread's columns lo..hi, then summed per leaf
+    for (int lo = 0; lo < DECISION_STRIDE; lo += DECISION_WINDOW) {
+        const int hi = min(lo + DECISION_WINDOW, DECISION_STRIDE);
+        int k = 0;
+        auto put = [&](float v) {  // the k-th column, written only when it falls in this window
+            if (k >= lo && k < hi) row[k - lo] = v;
+            ++k;
+        };
+        put(length * length);
+        put(length * b);
+        for (int i = 0; i < 8; ++i)
+            for (int j = i; j < 8; ++j) put(tri[i] * tri[j]);
+        for (int i = 0; i < 8; ++i) put(tri[i] * b);
+        put(st[0] * st[0]);
+        put(st[0] * st[1]);
+        put(st[1] * st[1]);
+        put(st[0] * b);
+        put(st[1] * b);
+        for (int i = 0; i < 8; ++i)
+            for (int j = i; j < 8; ++j) put(child[i] * child[j]);
+        for (int i = 0; i < 8; ++i) put(-child[i] * residual);
+        put(b * b);
+        put(residual * residual);
+        put(cur[0] * cur[0]);
+        put(cur[0] * cur[1]);
+        put(cur[1] * cur[1]);
+        put(cur[0] * b);
+        put(cur[1] * b);
+        group_add(shared_rows, hi - lo, DECISION_WINDOW, static_cast<unsigned long long>(s.leaf),
+                  accum + static_cast<int64_t>(out) * DECISION_STRIDE + lo);
+    }
 }
 
 __global__ void decision_kernel(Tree T, Rays R, const float* candidate, const float* residual, float* accum,
                                 int64_t leaf_count, const int* slot) {
-    __shared__ float rows[DECISION_THREADS * DECISION_STRIDE];
+    __shared__ float rows[DECISION_THREADS * DECISION_WINDOW];
     const int ray = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray >= R.count) return;
     traverse(T, R, ray, [&](const Segment& s) { segment_decision(T, s, candidate, accum, leaf_count, residual[ray], rows, slot); });
