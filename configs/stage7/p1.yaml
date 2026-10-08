@@ -34,15 +34,15 @@ training:
     min_leaf_px: 2.5        # bin the detector 2x2 / 4x4 while the finest leaf spans >= this many binned pixels
     geometry_steps: 1       # Gauss-Newton steps on the step geometry (n, d, w) per round, before the value solve
     edge_penalty:           # sum over faces of area h phi(jump / h), h = distance of the leaf centres, phi Huber: gradients <= delta quadratic, steeper linear
-      weight: 13            # = 1150 / 87: the old penalty's size at the flat04 solution (sweep pending)
-      delta: 2.0            # gradient (value per box unit): 1.4 % of the face area beyond it, as 1.6 % beyond the old jump threshold 0.02
+      weight: 9             # smooth part (beta): 7-9 keep cracks visible; 13-18 best volume PSNR but blur them (sweep at d10f82e)
+      delta: 1.5            # gradient (value per box unit); edge pull beta * delta 13.5: 6.5 leaves bright specks, 26+ fades cracks (visual choice sc_d15_b9)
   refinement:
     action_share: 0.35      # each round's net added bytes stay within this share of the remaining budget (0.7 / 0.5 / 0.35: 37.33 / 37.39 / 37.41 dB)
     stop_below_remaining: 0.01  # stop refining when less than this share of the budget is left
     decision_views: 240     # all pixels of all training views; alternate views (by angle) = the two halves
     min_footprint_px: 1.0   # children must span >= 1 detector pixel
-    continuation_share: 0.2 # share of each round's allowance for children of gain splits whose own positive split gain did not pay (structure thinner than the children)
-    error_share: 0.2        # share of each round's allowance split by modified residual error (Binev-DeVore) instead of one-step gain: reaches structure thinner than the children
+    continuation_share: 0.4 # share of each round's allowance for children of gain splits whose own positive split gain did not pay (structure thinner than the children)
+    error_share: 0.4        # share of each round's allowance split by modified residual error (Binev-DeVore) instead of one-step gain: reaches structure thinner than the children
     spend_all_below: 0.10   # once less than this share of the budget is left, one decision spends all of it (0: off)
     byte_budget: 8388608    # bytes of the stored file (codec/budget.py): leaf 2.25 / 16.25 / 8.25 B, split 1 B + 7 leaves
     max_rounds: 32
