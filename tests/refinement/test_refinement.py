@@ -116,7 +116,7 @@ class DecisionTests(unittest.TestCase):
         truth.set_types([0], [2], torch.tensor([0.1, 0.5]), torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]]))  # hard step at x = 0
         split = _split_from(truth)
         model = _model(levels=(1, 2, 4))
-        solve(model, split, passes=60, tol=1e-6)  # trilinear fit: a ramp along x
+        solve(model, split, subsets=4, tol=1e-3, max_epochs=200, min_epochs=3)  # trilinear fit: a ramp along x
         report = _decide(model, split, byte_budget=10**9, action_share=1.0)
         self.assertEqual(report["actions"]["step"], 1)
         self.assertEqual(model.leaf_type().tolist(), [2])
@@ -130,7 +130,7 @@ class DecisionTests(unittest.TestCase):
         _random_values(truth, 5)
         split = _split_from(truth)
         model = _model(levels=(2, 4, 8))
-        solve(model, split, passes=30, tol=1e-4)
+        solve(model, split, subsets=4, tol=1e-3, max_epochs=100, min_epochs=3)
         budget = model_bytes(model) + 400
         report = _decide(model, split, byte_budget=budget, action_share=1.0)
         self.assertGreater(sum(report["actions"].values()), 0)
@@ -156,7 +156,7 @@ class DecisionTests(unittest.TestCase):
         truth.set_types([0], [2], torch.tensor([0.1, 0.5]), torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]]))
         split = _split_from(truth)
         model = _model(levels=(1, 2, 4))
-        solve(model, split, passes=60, tol=1e-6)
+        solve(model, split, subsets=4, tol=1e-3, max_epochs=200, min_epochs=3)
         report = _decide(model, split, byte_budget=10**9, action_share=1.0, frozen=torch.tensor([True]))
         self.assertEqual(report["actions"]["constant"] + report["actions"]["trilinear"] + report["actions"]["step"], 0)
 

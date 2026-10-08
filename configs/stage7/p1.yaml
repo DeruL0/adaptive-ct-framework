@@ -25,15 +25,13 @@ training:
   max_seconds: 7200         # time limit of the whole run: the model is kept, its status says "time_limit_not_converged"
   eval_ray_chunk: 1048576
   solver:
-    groups: 24              # views split into 24 angle-interleaved groups
-    first_group_passes: 4   # grouped passes on the first round (cold start)
-    group_passes: 2         # grouped passes on later rounds (warm start)
-    round_tol: 1.0e-3       # stop a round's solve at this optimality residual ...
-    round_passes: 30        # ... or after this many full-data-equivalent passes (flagged "not converged")
-    final_tol: 1.0e-4       # strict solve on the final tree
-    final_passes: 150
+    subsets: 12             # relaxed OS-LALM: views in 12 angle-interleaved subsets (10-12 in the paper; 24 ripples)
+    round_tol: 5.0e-3       # a round's solve has converged when its objective fell by <= this (relative) in the last epoch ...
+    round_epochs: 12        # ... at most this many epochs per call (the solve is continued until it has converged)
+    final_tol: 1.0e-3       # the final tree: stricter
+    final_epochs: 40
+    min_epochs: 3           # no convergence is declared before this many epochs on a tree
     min_leaf_px: 2.5        # bin the detector 2x2 / 4x4 while the finest leaf spans >= this many binned pixels
-    extrapolate: true
     geometry_steps: 1       # Gauss-Newton steps on the step geometry (n, d, w) per round, before the value solve
     edge_penalty:           # neighbouring leaves: jumps <= delta penalised quadratically, larger ones linearly
       weight: 2300          # chosen on the held-out views (f474847 tree: 0 / 23 / 231 / 2311 / 7704 -> 2311 best)

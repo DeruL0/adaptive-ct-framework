@@ -119,12 +119,11 @@ def stage_solve(run_dir, repeats, max_seconds):
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
-        sstate, calls, passes, converged = {}, 0, 0, False
+        sstate, calls, epochs, converged = {}, 0, 0, False
         while not converged and time.perf_counter() - t0 < max_seconds:
-            _, more, converged = solve(model, ds.train, passes=int(cfg["final_passes"]), tol=float(cfg["final_tol"]), groups=int(cfg["groups"]),
-                                       group_passes=int(cfg["group_passes"]), extrapolate=bool(cfg["extrapolate"]), detector_bin=1,
-                                       penalty=penalty, penalty_weight=weight, state=sstate)
-            passes += int(more[-1]["pass"])  # full-data-equivalent passes of the call, curvature and checks included
+            _, more, converged = solve(model, ds.train, subsets=int(cfg["subsets"]), tol=float(cfg["final_tol"]), max_epochs=int(cfg["final_epochs"]),
+                                       min_epochs=int(cfg["min_epochs"]), detector_bin=1, penalty=penalty, penalty_weight=weight, state=sstate)
+            epochs += len(more)
             calls += 1
         torch.cuda.synchronize()
         seconds = time.perf_counter() - t0
@@ -135,9 +134,9 @@ def stage_solve(run_dir, repeats, max_seconds):
         g, J = gradient(model, c, ds.train.angles, ds.train.projections, views)
         J = float(J)
         R, gR = penalty.value_and_gradient(c)
-        d_ref = sstate["d"]
+        d_ref = sstate["d_l"] + sstate["d_r"]
         rho = float((c - (c - (g + weight * gR) / d_ref).clamp_min(0)).norm() / c.norm())
-        results.append({"seconds": seconds, "passes": passes, "solve_calls": calls, "converged": converged, "objective": J + weight * R, "data_term": J, "penalty": R,
+        results.append({"seconds": seconds, "epochs": epochs, "solve_calls": calls, "converged": converged, "objective": J + weight * R, "data_term": J, "penalty": R,
                         "reference_residual": rho, "peak_gb": torch.cuda.max_memory_allocated() / 2**30})
         del penalty, model
     return {"runs": results, "seconds": spread([r["seconds"] for r in results])}

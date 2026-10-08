@@ -57,8 +57,8 @@ def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
             "seed": 3,
             "max_seconds": 600,
             "eval_ray_chunk": 4096,
-            "solver": {"groups": 3, "first_group_passes": 2, "group_passes": 1, "round_tol": 1e-3, "round_passes": 6, "final_tol": 1e-4, "final_passes": 8,
-                       "min_leaf_px": 2.5, "extrapolate": True, "edge_penalty": {"weight": 2300, "delta": 0.02}, "geometry_steps": 1},
+            "solver": {"subsets": 3, "round_tol": 1e-2, "round_epochs": 6, "final_tol": 1e-3, "final_epochs": 8, "min_epochs": 2,
+                       "min_leaf_px": 2.5, "edge_penalty": {"weight": 2300, "delta": 0.02}, "geometry_steps": 1},
             "refinement": {"action_share": 0.5, "stop_below_remaining": 0.01, "decision_views": 6, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3},
         },
         "metrics": {"compute_projection_metrics": True, "compute_volume_metrics": False, "compute_boundary_metrics": False},
@@ -97,7 +97,7 @@ class PipelineTests(unittest.TestCase):
     def test_unconverged_values_stop_the_run_without_a_structure_change(self):
         def patch(config):
             config["training"]["max_seconds"] = 1e-6
-            config["training"]["solver"].update(round_passes=3, final_passes=3, round_tol=1e-12)
+            config["training"]["solver"].update(round_epochs=2, final_epochs=2, round_tol=-1.0, final_tol=-1.0, min_epochs=1)
 
         report, _ = self._run(types=["constant", "trilinear", "step"], patch=patch)
         self.assertEqual(report["status"], "time_limit_not_converged")
@@ -107,7 +107,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_unconverged_values_are_solved_on_before_the_structure_changes(self):
         def patch(config):
-            config["training"]["solver"].update(round_passes=3, round_tol=1e-4)
+            config["training"]["solver"].update(round_epochs=1, round_tol=0.5, min_epochs=2)
 
         report, _ = self._run(types=["constant", "trilinear", "step"], patch=patch)
         self.assertEqual(report["status"], "complete")

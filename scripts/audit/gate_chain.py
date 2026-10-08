@@ -2,7 +2,6 @@
 
   ls_eval     the tree of output/<run> + per-leaf GT least-squares values        (how good is the chosen tree)
   oracle      best tree under the byte budget (Lagrangian DP, L0..L2) + GT LS values (capacity of the representation)
-  speed       solver from a cold start on the oracle tree, to the stopping tolerance
   profile     capacity of the adjustable-width step leaf vs constant / trilinear leaves (GT fits)
   main_eval   volume metrics and median slice of output/<run>
   edge_penalty strength of the edge-preserving penalty on the run's tree (held-out views decide)
@@ -354,37 +353,14 @@ def stage_edge_penalty(ds):
         weight = f * J / max(R, 1e-30)
         penalty = EdgePenalty(m, delta) if weight > 0 else None
         t0 = time.time()
-        _, hist, conv = solve(m, ds.train, passes=120, tol=1e-4, groups=24, group_passes=0, penalty=penalty, penalty_weight=weight)
+        _, hist, conv = solve(m, ds.train, subsets=12, tol=1e-4, max_epochs=60, min_epochs=3, penalty=penalty, penalty_weight=weight)
         with torch.no_grad():
             held = projection_metrics(render_split(m, ds.validation, detector_h=dh, detector_w=dw), ds.validation.projections)
-        res = {**evaluate_volume(m), "weight": weight, "factor": f, "held_out_projection_psnr": held["psnr"], "passes": hist[-1]["pass"],
-               "converged": conv, "seconds": time.time() - t0, "penalty_end": hist[-1]["penalty"]}
+        res = {**evaluate_volume(m), "weight": weight, "factor": f, "held_out_projection_psnr": held["psnr"], "epochs": len(hist),
+               "converged": conv, "seconds": time.time() - t0}
         report(f"edge_penalty_f{f:g}", m, res)
-        out[f"f{f:g}"] = {k: res[k] for k in ("weight", "held_out_projection_psnr", "volume_psnr_db", "band_rmse", "far_rmse", "passes", "converged")}
+        out[f"f{f:g}"] = {k: res[k] for k in ("weight", "held_out_projection_psnr", "volume_psnr_db", "band_rmse", "far_rmse", "epochs", "converged")}
     save("edge_penalty_selection_" + "_".join(f"{f:g}" for f in factors), out)
-
-
-def stage_speed(ds):
-    """Accelerated solver on the oracle tree, cold start: tolerance stop, with / without a 2x2-binned warm-up.
-    Reference: 80 fixed passes, 57 min, 36.58 dB (solve_C_groups24_then_extrapolated_80)."""
-    from adaptive_ct.training.solve import solve
-    dh, dw = ds.detector_shape
-    n_rays = int(ds.train.angles.numel()) * dh * dw
-    for name, steps in {
-        "speed_full_tol1e-4": [dict(passes=150, tol=1e-4, groups=24, group_passes=4)],
-        "speed_bin2_then_full_tol1e-4": [dict(passes=30, tol=1e-3, groups=24, group_passes=4, detector_bin=2), dict(passes=150, tol=1e-4, groups=24)],
-    }.items():
-        m = oracle_tree_for(ds)
-        t0, hist, out = time.time(), [], {}
-        for i, kw in enumerate(steps):
-            _, h, conv = solve(m, ds.train, **kw)
-            hist += [{**x, "step": i} for x in h]
-            out[f"step{i}"] = {"passes": h[-1]["pass"], "converged": conv, "seconds": time.time() - t0, **{k: kw[k] for k in ("tol", "detector_bin") if k in kw}}
-        last = hist[-1]
-        with torch.no_grad():
-            pm = projection_metrics(render_split(m, ds.test, detector_h=dh, detector_w=dw), ds.test.projections)
-        report(name, m, {**evaluate_volume(m), **out, "seconds": time.time() - t0, "train_mse": 2 * last["objective_at_eval_point"] / n_rays,
-                         "optimality_residual": last["optimality_residual"], "test_projection_psnr": pm["psnr"], "history": hist})
 
 
 @torch.no_grad()
@@ -588,4 +564,4 @@ def stage_profile(ds):
 if __name__ == "__main__":
     ds = get_dataset()
     for st in STAGES:
-        {"ls_eval": stage_ls_eval, "oracle": stage_oracle, "speed": stage_speed, "profile": stage_profile, "main_eval": stage_main_eval, "edge_penalty": stage_edge_penalty}[st](ds)
+        {"ls_eval": stage_ls_eval, "oracle": stage_oracle, "profile": stage_profile, "main_eval": stage_main_eval, "edge_penalty": stage_edge_penalty}[st](ds)

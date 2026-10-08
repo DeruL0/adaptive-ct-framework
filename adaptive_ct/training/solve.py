@@ -1,17 +1,19 @@
-"""Fixed-tree solver for  min_{c >= 0}  J(c) = 1/2 * || A c - y ||^2  over the physical leaf coefficients c.
+"""Fixed-tree solver for  min_{c >= 0}  J(c) = 1/2 |A c - y|^2 + beta R(c)  over the leaf values c (model.values):
+relaxed ordered-subsets linearized augmented Lagrangian method (Nien & Fessler 2016, arXiv:1512.04564, Algorithm 1, W = I).
 
-A is the exact projector of the current octree (linear in c = model.values, nonnegative entries).
-  gradient     g = A^T (A c - y)                       (back-projection of the residual)
-  step scale   d = A^T A 1                             (bounds the curvature per coefficient, so
-                                                        c - g/d never increases J)
-  update       c <- max(0, c - g / d)                  (truncation = the legal projection onto c >= 0)
-Speed-ups that keep the same solution:
-  groups       views split into G angle-interleaved groups; each update uses one group (gradient x G; the
-               penalty gradient is evaluated once per grouped pass)
-  extrapolate  evaluate the gradient at  z = max(0, c + beta (c - c_prev))  with beta from the standard
-               (t-1)/t_next sequence; drop the extrapolation when the step turns against the last move
-Convergence is measured by the optimality residual ||z - max(0, z - g/d)|| / ||c|| at the feasible point z;
-the solve stops when it is <= tol, or after `passes` passes (then `converged` is False).
+A is the exact projector of the current octree (nonnegative entries), R the edge-preserving penalty between neighbouring
+leaves (training/regularizer.py).  D_L = diag(A^T A 1) and D_R = beta * (the penalty's separable curvature bound) majorize
+the curvature of the two terms.  The views are split into M angle-interleaved subsets L_m; one epoch visits them all,
+spaced apart in angle.  Per subset (x the values, g and h the running gradient estimate and its offset):
+    s = rho (D_L x - h) + (1 - rho) g
+    x+ = max(0, x - (rho D_L + D_R)^-1 (s + beta grad R(x)))                 (grad R at the current x, every subset)
+    zeta = M grad L_m(x+)
+    g+ = rho/(rho + 1) (alpha zeta + (1 - alpha) g) + g/(rho + 1) ;   h+ = alpha (D_L x+ - zeta) + (1 - alpha) h
+rho decays per subset: rho_0 = 1, rho_k = pi / (alpha (k + 1)) sqrt(1 - (pi / (2 alpha (k + 1)))^2), alpha = 1.999.
+Measured against the previous solver on the same trees: 6 epochs instead of 62 passes to the same residual, a lower objective.
+The subset count must stay small (10-12; 24 ripples) and grad R must be recomputed every subset (once per epoch diverges).
+Convergence: the objective estimate of an epoch (the subsets' losses taken right after their updates, plus beta R) is free;
+the solve has converged when it changed by no more than `tol` (relative) in the last epoch, after at least `min_epochs`.
 detector_bin b > 1 solves against b x b averaged detector pixels (one ray through each block centre):
 16x fewer rays for b = 4, an approximation that is only used while the leaves span several blocks.
 """
@@ -27,6 +29,7 @@ import torch.nn.functional as F
 from adaptive_ct.core.geometry import parallel_rays, traversal_grid
 
 CHUNK = 1 << 20  # rays per kernel call (one 1024x1024 view, or several binned views)
+ALPHA = 1.999  # relaxation of the augmented Lagrangian (the paper's choice)
 
 
 def _set(model, c):
@@ -79,89 +82,88 @@ def gradient(model, c, angles, projections, views):
     return model.values.grad.clone(), J
 
 
-def solve(model, split, *, passes, tol=0.0, groups=1, group_passes=0, extrapolate=True, detector_bin=1, on_pass=None,
-          penalty=None, penalty_weight=0.0, state=None):
-    """Run `group_passes` passes of grouped updates, then full-data (optionally extrapolated) updates until the
-    optimality residual of the returned coefficients is <= tol or `passes` full-data-equivalent passes are spent.
-    With `penalty` (training.regularizer.EdgePenalty) the objective is  J + penalty_weight / bin^2 * R  (the data
-    term has bin^2 fewer rays when binned); its gradient joins g and its curvature bound joins d.
-    Convergence is checked at the coefficients that are returned: when the step from the extrapolated point z is
-    small, one more gradient is taken at the new iterate c and  |c - max(0, c - g(c) / d)| / |c| <= tol  decides;
-    if it fails, the iteration goes on from c with that gradient and the momentum restarted.
-    `state` (a dict): filled at the end of the call; a later call with the same tree, geometry, binning and penalty
-    and the same dict continues from it (no curvature pass, no grouped passes, `passes` counts from zero).
-    Returns (coefficients, history, converged)."""
+def _rho(k: int) -> float:
+    """Penalty parameter of subset step k (counted over all epochs of a tree)."""
+    return 1.0 if k == 0 else (math.pi / (ALPHA * (k + 1))) * math.sqrt(1 - (math.pi / (2 * ALPHA * (k + 1))) ** 2)
+
+
+DIVERGED = 2.0  # objective estimate above this multiple of the best one so far: the run is diverging
+
+
+def _subsets(angles, subsets):
+    """Angle-interleaved view subsets, and a visiting order that puts consecutive subsets far apart in angle."""
+    order = sorted(range(int(angles.numel())), key=lambda v: float(angles[v]))
+    groups = [order[g::subsets] for g in range(subsets)]
+    stride = next(s for s in range(max(1, subsets // 3), subsets + 1) if math.gcd(s, subsets) == 1)
+    return groups, [(i * stride) % subsets for i in range(subsets)]
+
+
+def solve(model, split, *, subsets, tol, max_epochs, min_epochs, detector_bin=1, penalty=None, penalty_weight=0.0, state=None):
+    """Epochs of the relaxed OS-LALM until the objective estimate changed by <= tol (relative, either sign) in the last
+    epoch (and at least `min_epochs` ran, counted over the whole tree) or `max_epochs` of this call are spent.  The
+    objective is J + penalty_weight / bin^2 * R (the data term has bin^2 fewer rays when binned).
+    The method has no guarantee for many small subsets (seen: 12 views per subset diverge on a toy problem, 10 views ripple
+    on the real data): when the estimate exceeds DIVERGED times the best one, the values go back to the best ones and the
+    subset count is halved (down to 1 = the full batch, which is monotone), restarting rho and the running gradient.
+    `state` (a dict): filled at the end of the call; a later call with the same tree, geometry, binning and penalty and the
+    same dict continues from it (same denominators and running gradient, rho keeps decaying).
+    Returns (values, history, converged)."""
     angles, projections = split.angles, binned(split, detector_bin)
-    views = list(range(int(angles.numel())))
-    order = sorted(views, key=lambda v: float(angles[v]))
-    view_groups = [order[g::groups] for g in range(groups)]
-    model.values.requires_grad_(True)
     beta = float(penalty_weight) / detector_bin**2 if penalty is not None else 0.0
+    model.values.requires_grad_(True)
 
-    def penalised(g, J, at):
-        if beta == 0:
-            return g, J, 0.0
-        R, gR = penalty.value_and_gradient(at)
-        return g + beta * gR, J + beta * R, R
+    def begin(x, subsets):  # running gradient estimate at x for the given subset count
+        groups, visit = _subsets(angles, subsets)
+        zeta = float(subsets) * gradient(model, x, angles, projections, groups[visit[-1]])[0]
+        return groups, visit, zeta.clone(), d_l * x - zeta
 
-    history, t0, converged = [], time.time(), False
     if state:
-        d, c, z, t_k, pending, spent = state["d"], state["c"], state["z"], state["t_k"], state["pending"], 0.0
+        d_l, d_r, x, g, h, k, J_prev, epochs, subsets, best_J, best_x = (state[n] for n in (
+            "d_l", "d_r", "x", "g", "h", "k", "J_prev", "epochs", "subsets", "best_J", "best_x"))
+        groups, visit = _subsets(angles, subsets)
     else:
-        d = curvature(model, angles, projections, views)
-        if beta > 0:
-            d = d + beta * penalty.curvature()
-        c = model.values.detach().clone()
-        spent = 1.0  # the curvature pass counts as one pass
-        while spent < 1 + group_passes:
-            gR = penalty.value_and_gradient(c)[1] if beta > 0 else 0.0  # once per pass, shared by the groups (24 evaluations cost ~2.5 s)
-            for grp in view_groups:
-                g, _ = gradient(model, c, angles, projections, grp)
-                c = (c - (groups * g + beta * gR) / d).clamp_min(0)
-            spent += 1
-            if on_pass:
-                history.append({"pass": spent, "phase": "grouped", "seconds": time.time() - t0, **on_pass(c)})
-        t_k, z, pending = 1.0, c.clone(), None
-
-    while spent < passes:
-        if pending is None:
-            g, J = gradient(model, z, angles, projections, views)
-            g, J, R = penalised(g, float(J), z)
-            spent += 1
-        else:  # the gradient at z was taken by the last convergence check
-            (g, J, R), pending = pending, None
-        c_new = (z - g / d).clamp_min(0)
-        resid = float((z - c_new).norm() / c_new.norm().clamp_min(1e-30))
-        if extrapolate:
-            if float(((z - c_new) * (c_new - c)).sum()) > 0:  # the step turned against the last move
-                t_k = 1.0
-            t_next = (1 + math.sqrt(1 + 4 * t_k * t_k)) / 2
-            z_next = (c_new + ((t_k - 1) / t_next) * (c_new - c)).clamp_min(0)
-            t_k = t_next
-        else:
-            z_next = c_new
-        c, z = c_new, z_next
-        row = {"pass": spent, "phase": "full", "objective_at_eval_point": J, "optimality_residual": resid,
-               "seconds": time.time() - t0, "detector_bin": detector_bin, "penalty": R}
-        if resid <= tol:
-            gv, Jv = gradient(model, c, angles, projections, views)
-            gv, Jv, Rv = penalised(gv, float(Jv), c)
-            spent += 1
-            row["pass"] = spent  # the check took a pass of its own
-            rho = float((c - (c - gv / d).clamp_min(0)).norm() / c.norm().clamp_min(1e-30))
-            row["optimality_residual_at_returned"] = rho
-            if rho <= tol:
-                converged = True
-            else:
-                z, t_k, pending = c.clone(), 1.0, (gv, Jv, Rv)
-        if on_pass:
-            row.update(on_pass(c))
-        history.append(row)
-        print(row, flush=True)
-        if converged:
+        d_l = curvature(model, angles, projections, list(range(int(angles.numel()))))
+        d_r = beta * penalty.curvature() if beta > 0 else torch.zeros_like(d_l)
+        x = model.values.detach().clone()
+        groups, visit, g, h = begin(x, subsets)
+        k, J_prev, epochs, best_J, best_x = 0, None, 0, math.inf, x.clone()
+    history, converged, t0 = [], False, time.time()
+    for _ in range(max_epochs):
+        M, J_data, R, rho = float(subsets), 0.0, 0.0, 1.0
+        for m in visit:
+            rho, k = _rho(k), k + 1
+            gR = 0.0
+            if beta > 0:
+                R, gR = penalty.value_and_gradient(x)
+                gR = beta * gR
+            s = rho * (d_l * x - h) + (1 - rho) * g
+            x = (x - (s + gR) / (rho * d_l + d_r)).clamp_min(0)
+            gm, Jm = gradient(model, x, angles, projections, groups[m])
+            zeta, J_data = M * gm, J_data + Jm  # the loss stays on the device until the epoch is over
+            g = (rho / (rho + 1)) * (ALPHA * zeta + (1 - ALPHA) * g) + g / (rho + 1)
+            h = ALPHA * (d_l * x - zeta) + (1 - ALPHA) * h
+        epochs += 1
+        J = float(J_data) + beta * R
+        row = {"epoch": epochs, "objective_estimate": J, "rho": rho, "subsets": subsets, "seconds": time.time() - t0, "detector_bin": detector_bin}
+        if not math.isfinite(J) or (J > DIVERGED * best_J and subsets > 1):
+            subsets = max(1, subsets // 2)
+            x = best_x.clone()
+            groups, visit, g, h = begin(x, subsets)
+            k, J_prev = 0, None
+            history.append({**row, "relative_decrease": None, "restart_with_subsets": subsets})
+            print(history[-1], flush=True)
+            continue
+        if J < best_J:
+            best_J, best_x = J, x.clone()
+        decrease = None if J_prev is None else (J_prev - J) / J
+        J_prev = J
+        history.append({**row, "relative_decrease": decrease})
+        print(history[-1], flush=True)
+        if decrease is not None and epochs >= min_epochs and abs(decrease) <= tol:
+            converged = True
             break
-    _set(model, c)
+    _set(model, x)
     model.values.requires_grad_(False)
     if state is not None:
-        state.update(d=d, c=c, z=z, t_k=t_k, pending=pending)
-    return c, history, converged
+        state.update(d_l=d_l, d_r=d_r, x=x, g=g, h=h, k=k, J_prev=J_prev, epochs=epochs, subsets=subsets, best_J=best_J, best_x=best_x)
+    return x, history, converged

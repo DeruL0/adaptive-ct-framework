@@ -107,9 +107,8 @@ def run_training(config_path: str | Path) -> dict:
     alpha = 1.0  # first step size of the next geometry step
     for r in range(max_rounds + 1):
         final = controller.stopped or r == max_rounds
-        passes = int(solver_cfg["final_passes"] if final else solver_cfg["round_passes"])
+        epochs = int(solver_cfg["final_epochs"] if final else solver_cfg["round_epochs"])
         tol = float(solver_cfg["final_tol"] if final else solver_cfg["round_tol"])
-        group_passes = int(solver_cfg["first_group_passes"] if r == 0 else solver_cfg["group_passes"])
         # Detector binning while the finest leaf still spans >= min_leaf_px binned pixels; the final solve is unbinned.
         finest = model.level_shapes[int(model.leaf_levels.max())]
         leaf_px = min(detector_h / finest[2], detector_w / finest[0])
@@ -126,15 +125,15 @@ def run_training(config_path: str | Path) -> dict:
             save_state(model, out_dir / "states" / "pre_final_solve.pt", config, dataset, round=r, detector_bin=detector_bin)
         t0 = time.perf_counter()
         penalty = EdgePenalty(model, float(edge["delta"])) if weight > 0 else None
-        # A tree is only changed once its values satisfy the optimality tolerance: otherwise the solve goes on
-        # (same curvature, momentum and penalty) until it does, or the run's time limit is reached.
-        solve_state, hist, continuations, passes_used = {}, [], 0, 0
+        # A tree is only changed once its objective has stopped falling (tolerance per epoch): otherwise the solve goes
+        # on (same denominators and running gradient) until it has, or the run's time limit is reached.
+        solve_state, hist, continuations, epochs_used = {}, [], 0, 0
         while True:
-            _, more, converged = solve(model, dataset.train, passes=passes, tol=tol, groups=int(solver_cfg["groups"]),
-                                       group_passes=group_passes, extrapolate=bool(solver_cfg["extrapolate"]),
-                                       detector_bin=detector_bin, penalty=penalty, penalty_weight=weight, state=solve_state)
+            _, more, converged = solve(model, dataset.train, subsets=int(solver_cfg["subsets"]), tol=tol, max_epochs=epochs,
+                                       min_epochs=int(solver_cfg["min_epochs"]), detector_bin=detector_bin, penalty=penalty,
+                                       penalty_weight=weight, state=solve_state)
             hist += more
-            passes_used += int(more[-1]["pass"]) if more else 0
+            epochs_used += len(more)
             if converged or time.perf_counter() - run_start_time > time_limit:
                 break
             continuations += 1
@@ -143,15 +142,15 @@ def run_training(config_path: str | Path) -> dict:
         entry = {
             "round": r,
             "final": final,
-            "passes": passes_used,  # full-data-equivalent passes, curvature and convergence checks included
+            "epochs": epochs_used,  # one epoch = one pass over all views (plus the penalty gradients) + the first pass for the denominators
             "values_converged": converged,
             "continuation_solves": continuations,
             "geometry_accepted": [g["accepted_step"] > 0 for g in geometry],
             "detector_bin": detector_bin,
             "solve_seconds": time.perf_counter() - t0,
             "geometry": geometry,
-            "objective": last.get("objective_at_eval_point"),
-            "optimality_residual": last.get("optimality_residual_at_returned", last.get("optimality_residual")),
+            "objective_estimate": last.get("objective_estimate"),
+            "relative_decrease": last.get("relative_decrease"),
             "leaves": model.leaf_count,
             "bytes": model_bytes(model),
             "leaf_type_counts": list(model.stats().leaf_type_counts),
@@ -235,7 +234,7 @@ def run_training(config_path: str | Path) -> dict:
         "boundary_sharpness": boundary_sharpness,
         "model": stats.__dict__,
         "training_objective": {
-            "form": "min_{c>=0} 1/2 ||A(theta) c - y||^2 + beta R per fixed tree (values c by the solve, step geometry theta by Gauss-Newton steps); tree and leaf types chosen by held-out refits of the same objective under the byte budget",
+            "form": "min_{c>=0} 1/2 ||A(theta) c - y||^2 + beta R per fixed tree (values c by the relaxed OS-LALM, step geometry theta by Gauss-Newton steps); tree and leaf types chosen by held-out refits of the same objective under the byte budget",
             "byte_budget": int(ref_cfg["byte_budget"]),
             "solver": solver_cfg,
             "dense_volume_loaded_during_training": False,
