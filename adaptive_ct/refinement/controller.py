@@ -52,6 +52,7 @@ class RefinementController:
             model, self.estimator_split, views, detector_h=self.detector_h, detector_w=self.detector_w,
             byte_budget=self.byte_budget, frozen=frozen,
             action_share=float(self.spec["action_share"]), min_footprint_px=float(self.spec["min_footprint_px"]),
+            lookahead_leaves=int(self.spec["lookahead_leaves"]),
             penalty_weight=float(self.edge_penalty["weight"]), penalty_delta=float(self.edge_penalty["delta"]))
         event.update(report)
         event["decision_seconds"] = time.perf_counter() - t0

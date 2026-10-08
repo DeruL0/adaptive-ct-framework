@@ -15,6 +15,12 @@ kept or split (no immediate change back).  Trilinear and step leaves are never d
 detail it drops is largely invisible in held-out projections but not in the volume (run fabed08: projections
 +0.7 dB, volume -0.6 dB with 472k downgrades).
 
+Two-level lookahead: a split into children of the leaf's size can earn little where the structure is thinner than
+the children (a 3-5 voxel crack through 10-voxel leaves), although splitting those children would capture it.  For
+`lookahead_leaves` leaves (those with the most residual energy left after their best one-level split) the leaf is split
+once in a copy of the model and each child's own split option is evaluated there, siblings fixed like every other
+neighbour.  The option "split2" splits the leaf and then every child whose split pays for its bytes at the round's price.
+
 Choice: each leaf takes the option maximising  gain - lambda * extra_bytes ; lambda >= 0 is the smallest
 price of a byte that keeps this round's additions within `action_share` of the remaining budget (byte-saving
 options are taken when the lost gain is below the bytes they free, and pay for this round's additions).
@@ -24,6 +30,7 @@ before the next decision.
 
 from __future__ import annotations
 
+import copy
 import math
 import time
 
@@ -36,6 +43,7 @@ from adaptive_ct.representation.octree import TYPE_NAMES, pad_geometry, step_H, 
 from adaptive_ct.training.regularizer import basis_rows, face_samples
 
 OPTIONS = ("constant", "trilinear", "step", "split")  # column order of gains / extra bytes
+CHOICES = OPTIONS + ("split2",)  # with the two-level split (its gain depends on the byte price, see choose)
 _DIMS = {"constant": 1, "trilinear": 8, "step": 2, "split": 8, "cur_step": 2}
 # Accumulated statistics per leaf and ray half (same layout as segment_decision in native/bernstein_octree.cu):
 # G upper triangle (row major) and h per option, then sum b^2 and sum residual^2.
@@ -319,21 +327,35 @@ def evaluate_options(acc: torch.Tensor, split_lower: torch.Tensor, kind: torch.T
     return gains
 
 
-def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, allowance: float):
-    """Leaves and options (index into OPTIONS) taking the best net benefit under the smallest byte price lambda
-    whose total extra bytes stay within `allowance`."""
-    net_at = lambda lam: torch.where(allowed, gains - lam * extra, torch.full_like(gains, -math.inf))
+def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, allowance: float, children=None):
+    """Leaves and options (index into CHOICES) taking the best net benefit under the smallest byte price lambda
+    whose total extra bytes stay within `allowance`.  gains / extra / allowed have a column per choice; the split2
+    column of `gains` is unused: with children = (gain, bytes, may_split) of the 8 children's own splits (N, 8), its
+    net benefit at price lambda is  sum_k max(0, gain_k - lambda bytes_k) - lambda extra  (extra = the first split),
+    i.e. only children whose split pays for its bytes are split.  Returns also the (N, 8) children to split."""
+    def child_net(lam):
+        g, b, ok = children
+        return torch.where(ok, g - lam * b, torch.zeros_like(g)).clamp_min(0)
+
+    def net_at(lam):
+        net = torch.where(allowed, gains - lam * extra, torch.full_like(gains, -math.inf))
+        if children is not None:
+            net[:, 4] = torch.where(allowed[:, 4], child_net(lam).sum(1) - lam * extra[:, 4], -math.inf)
+        return net
 
     def pick(lam):
         best, idx = net_at(lam).max(1)
         idx = torch.where(best > 0, idx, -1)
-        spent = float(extra.gather(1, idx.clamp_min(0)[:, None])[:, 0][idx >= 0].sum())
-        return idx, best, spent
+        cost = extra.gather(1, idx.clamp_min(0)[:, None])[:, 0]
+        if children is not None:
+            cost = cost + torch.where(idx == 4, ((child_net(lam) > 0) * children[1]).sum(1), torch.zeros_like(cost))
+        return idx, best, float(cost[idx >= 0].sum())
 
     lam = 0.0
     idx, best, spent = pick(0.0)
     if spent > allowance:
-        lo, hi = 0.0, float(gains.clamp_min(0).max()) + 1.0
+        top = gains.clamp_min(0).max() if children is None else torch.maximum(gains.clamp_min(0).max(), children[0].clamp_min(0).sum(1).max())
+        lo, hi = 0.0, float(top) + 1.0
         for _ in range(60):
             mid = 0.5 * (lo + hi)
             if pick(mid)[2] > allowance:
@@ -343,7 +365,33 @@ def choose(gains: torch.Tensor, extra: torch.Tensor, allowed: torch.Tensor, allo
         lam = hi
         idx, best, spent = pick(lam)
     chosen = torch.nonzero(idx >= 0).flatten()
-    return chosen, idx[chosen], lam
+    second = (child_net(lam) > 0) & (idx == 4)[:, None] if children is not None else None
+    return chosen, idx[chosen], lam, second
+
+
+@torch.no_grad()
+def lookahead(model, split, views, ids, *, penalty_weight, penalty_delta, detector_h, detector_w, min_footprint_px):
+    """Own split gains of the children of the leaves `ids`: the leaves are split once in a copy of the model (function
+    preserving) and the children's split options are evaluated there exactly as in evaluate_options (same rays, halves,
+    penalty and bounds; the other leaves, siblings included, fixed).  Returns (n, 8) gains, bytes and may-split, child
+    k = slot 4 x + 2 y + z."""
+    device = model.leaf_levels.device
+    temp = copy.deepcopy(model)
+    cells = model.cells[ids].long()
+    temp.split_leaves_batch(ids)
+    o = torch.tensor([[x, y, z] for x in (0, 1) for y in (0, 1) for z in (0, 1)], device=device)
+    child_cells = torch.cat([(cells[:, None, 0] + 1)[..., None].expand(-1, 8, 1), 2 * cells[:, None, 1:] + o[None]], -1).reshape(-1, 4)
+    cid = temp.ids_of_cells(child_cells)
+    # the kernel needs a candidate geometry for every leaf; the children's type options are not used here
+    dummy = pad_geometry(torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.25]], device=device).expand(temp.leaf_count, -1))
+    prior = 0.5 * float(penalty_weight) * penalty_statistics(temp, penalty_delta, dummy) if penalty_weight > 0 else None
+    acc = local_statistics(temp, split, views, dummy, prior)
+    del prior
+    kind = temp.leaf_type()[cid]
+    gain = evaluate_options(acc[:, cid], -child_minimum(temp)[cid], kind)[:, 3]
+    del acc
+    ok = resolvable_mask(temp, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)[cid]
+    return gain.reshape(-1, 8), split_bytes(kind).reshape(-1, 8), ok.reshape(-1, 8)
 
 
 @torch.no_grad()
@@ -384,7 +432,7 @@ def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: 
 
 @torch.no_grad()
 def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, action_share, min_footprint_px,
-                     penalty_weight, penalty_delta, frozen=None) -> tuple[dict, torch.Tensor]:
+                     penalty_weight, penalty_delta, lookahead_leaves, frozen=None) -> tuple[dict, torch.Tensor]:
     """One structure / type decision on a solved model; applies the chosen batch.  `frozen` (N,) marks leaves
     that may not change type.  Returns a report and the cells (level, x, y, z) whose type changed."""
     device = model.leaf_levels.device
@@ -406,6 +454,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     del prior
     lap("ray_statistics")
     gains = evaluate_options(acc, -child_minimum(model), kind)
+    left = acc[:, :, 96].sum(0) - gains[:, 3]  # residual energy left after the best one-level split
     del acc  # free the statistics before the edits
     lap("fits")
     per_leaf = leaf_bytes().to(device)
@@ -420,20 +469,39 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     if frozen is not None:
         allowed[:, :3] &= ~frozen[:, None]
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
+    # two-level lookahead for the leaves with the most residual left after a one-level split
+    # ponytail: ranked by left-over residual energy alone; a ridge / valley detector on the reconstruction if it misses thin structures
+    deep = allowed[:, 3] & (model.leaf_levels + 2 < len(model.level_shapes))
+    look = torch.nonzero(deep).flatten()
+    look = look[torch.argsort(left[look], descending=True)[: int(lookahead_leaves)]]
+    children = None
+    if look.numel():
+        g8, b8, ok8 = lookahead(model, split, views, look, penalty_weight=penalty_weight, penalty_delta=penalty_delta,
+                                detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
+        children = tuple(torch.zeros((N, 8), dtype=t.dtype, device=device).index_copy_(0, look, t) for t in (g8, b8, ok8))
+    lap("lookahead")
+    gains = torch.cat([gains, torch.zeros_like(gains[:, :1])], 1)
+    extra = torch.cat([extra, extra[:, 3:]], 1)
+    allowed = torch.cat([allowed, torch.zeros_like(allowed[:, :1])], 1)
+    allowed[look, 4] = allowed[look, 3]
     bytes_now = model_bytes(model)
     remaining = float(byte_budget - bytes_now)
-    ids, option, lam = choose(gains, extra, allowed, action_share * max(remaining, 0.0))
+    ids, option, lam, second = choose(gains, extra, allowed, action_share * max(remaining, 0.0), children)
+    if second is not None:
+        gains[:, 4] = (second * children[0]).sum(1)
     lap("choice")
     if model.max_leaf_count is not None:  # leaf-count cap: drop splits beyond it
         room = (int(model.max_leaf_count) - N) // 7
-        is_split = option == 3
-        drop = is_split & (torch.cumsum(is_split.long(), 0) > room)
+        count = (option >= 3).long() + (torch.where(option == 4, second[ids].sum(1), 0) if second is not None else 0)
+        drop = (count > 0) & (torch.cumsum(count, 0) > room)
         ids, option = ids[~drop], option[~drop]
     report = {
         "byte_price": lam,
         "bytes_before": bytes_now,
         "candidates_with_positive_gain": {o: int(((gains[:, i] > 0) & allowed[:, i]).sum()) for i, o in enumerate(OPTIONS)},
-        "actions": {o: int((option == i).sum()) for i, o in enumerate(OPTIONS)},
+        "actions": {o: int((option == i).sum()) for i, o in enumerate(CHOICES)},
+        "lookahead_leaves": int(look.numel()),
+        "second_level_splits": int(second[ids[option == 4]].sum()) if second is not None else 0,
         "held_out_gain_of_batch": float(gains[ids, option].sum()) if ids.numel() else 0.0,
         "seconds": seconds,
     }
@@ -446,6 +514,12 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     t_ids, t_new = ids[change], option[change]
     changed_cells = torch.cat([model.leaf_levels[t_ids, None], model.leaf_coords[t_ids]], 1)
     split_cells = model.cells[ids[~change]].long()  # leaf indices change with every edit; cells do not
+    two = ids[option == 4]
+    if two.numel():  # children of two-level splits that are split again: (level + 1, 2 x + o) for the chosen slots
+        o = torch.tensor([[x, y, z] for x in (0, 1) for y in (0, 1) for z in (0, 1)], device=device)
+        c = model.cells[two].long()
+        kids = torch.cat([(c[:, None, 0] + 1)[..., None].expand(-1, 8, 1), 2 * c[:, None, 1:] + o[None]], -1)
+        second_cells = kids[second[two]]
     if t_ids.numel():
         geometry = torch.where((t_new == 2)[:, None], candidate[t_ids], torch.zeros_like(candidate[t_ids]))
         vals = project_onto_types(model, t_ids, t_new, geometry)
@@ -454,6 +528,8 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     if split_cells.numel():
         model.split_leaves_batch(model.ids_of_cells(split_cells))
         report["split_step_children"] = model.last_split_report  # the lossy part of the splits (step children turned constant)
+    if two.numel() and second_cells.numel():
+        model.split_leaves_batch(model.ids_of_cells(second_cells))
     lap("edits")
     report["bytes_after"] = model_bytes(model)
     report["leaf_type_counts"] = dict(zip(TYPE_NAMES, torch.bincount(model.leaf_type(), minlength=3).tolist()))
