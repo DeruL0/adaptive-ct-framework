@@ -167,6 +167,21 @@ class DecisionTests(unittest.TestCase):
         self.assertAlmostEqual(abs(float(cand[L, 0])), 1.0, places=4)
         self.assertAlmostEqual(float(cand[L, 3] * torch.sign(cand[L, 0])), 0.2, places=4)
 
+    def test_gains_in_groups_equal_gains_at_once(self):
+        from adaptive_ct.refinement.decision import option_gains
+        truth = _model(levels=(2, 4, 8))
+        _random_values(truth, 11)
+        split = _split_from(truth)
+        model = _model(levels=(2, 4, 8))
+        model.split_leaves_batch([0, 3])
+        solve(model, split, subsets=4, tol=1e-3, max_epochs=50, min_epochs=3)
+        candidate = candidate_step_geometry(model, detector_w=DETECTOR)
+        kw = dict(penalty_weight=5.0, penalty_delta=1.0)
+        views = decision_views(split, 16, 0)
+        whole = option_gains(model, split, views, candidate, group=model.leaf_count, **kw)
+        parts = option_gains(model, split, views, candidate, group=5, **kw)
+        self.assertLess(float((whole - parts).abs().max()), 1e-9 * (1 + float(whole.abs().max())))
+
     def test_value_span_marks_flat_leaves(self):
         from adaptive_ct.refinement.decision import value_span
         model = _model(levels=(2,), trilinear=False)

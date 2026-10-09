@@ -21,7 +21,10 @@ def export_center_slice_png(
     *,
     axis: int = 2,
     chunk: int = 524288,
+    deblock_delta: float | None = None,
 ) -> dict:
+    """Median slice along `axis`, display range the 1 / 99 percentiles.  deblock_delta: decoded with the decoder-side
+    deblocking (evaluation/deblock.py, the edge penalty's delta) over the slice and its two neighbours."""
     shape = tuple(int(value) for value in volume_shape)
     axis = int(axis)
     index = shape[axis] // 2
@@ -36,12 +39,21 @@ def export_center_slice_png(
     coords = torch.zeros((grids[0].numel(), 3), dtype=torch.float32, device=device)
     coords[:, dims[0]] = grids[0].reshape(-1)
     coords[:, dims[1]] = grids[1].reshape(-1)
-    coords[:, axis] = float(index)
-    points = -1.0 + (coords + 0.5) * 2.0 / scale
-    values = []
-    for start in range(0, points.shape[0], int(chunk)):
-        values.append(model.forward_mu(points[start : start + int(chunk)]).detach().float().cpu())
-    image = torch.cat(values, dim=0).reshape(shape[dims[0]], shape[dims[1]]).numpy().T
+    offsets = (-1, 0, 1) if deblock_delta is not None else (0,)
+    values, ids = [], []
+    for offset in offsets:
+        coords[:, axis] = float(min(max(index + offset, 0), shape[axis] - 1))
+        points = -1.0 + (coords + 0.5) * 2.0 / scale
+        for start in range(0, points.shape[0], int(chunk)):
+            v, i = model.forward_mu_with_leaf_ids(points[start : start + int(chunk)])
+            values.append(v.detach().float())
+            ids.append(i)
+    block = torch.cat(values).reshape(len(offsets), shape[dims[0]], shape[dims[1]])
+    if deblock_delta is not None:
+        from adaptive_ct.evaluation.deblock import deblock
+        leaf_size = 2.0 / torch.tensor([sh[0] for sh in model.level_shapes], dtype=torch.float32, device=device)[model.leaf_levels]
+        block = deblock(block, torch.cat(ids).reshape(block.shape), leaf_size, model.leaf_type() == 2, float(deblock_delta))
+    image = block[len(offsets) // 2].cpu().numpy().T
     lo, hi = np.percentile(image, [1.0, 99.0])
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         lo, hi = float(np.nanmin(image)), float(np.nanmax(image))

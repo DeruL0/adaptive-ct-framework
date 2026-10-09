@@ -212,6 +212,8 @@ def run_training(config_path: str | Path) -> dict:
     export_summary["stored_file"] = export_octree_artifact(model, out_dir / "model.npz").__dict__  # what the budget counts
     export_summary["visual_slice"] = export_center_slice_png(model, out_dir / "center_slice.png", dataset.volume_shape)
     export_summary["visual_slice_fullres"] = export_center_slice_png(model, out_dir / "center_slice_fullres.png", finest_model_shape(model))
+    export_summary["visual_slice_deblocked"] = export_center_slice_png(model, out_dir / "center_slice_deblocked.png", dataset.volume_shape,
+                                                                       deblock_delta=float(train_cfg["solver"]["edge_penalty"]["delta"]))
 
     report = {
         "config": str(Path(config_path).resolve()),

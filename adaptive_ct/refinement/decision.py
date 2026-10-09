@@ -491,6 +491,29 @@ def project_onto_types(model, ids: torch.Tensor, types: torch.Tensor, geometry: 
 
 
 @torch.no_grad()
+def option_gains(model, split, views, candidate, *, penalty_weight, penalty_delta, group: int, lap=lambda name: None) -> torch.Tensor:
+    """(N, 4) held-out gains of OPTIONS for every leaf.  The (2, n, STRIDE) double statistics are held for `group` leaves
+    at a time (each group passes over the rays again): at 16 MiB (4-5 M leaves) all at once exceed 12 GB."""
+    N = int(model.leaf_levels.shape[0])
+    kind, lower = model.leaf_type(), -child_minimum(model)
+    gains = torch.empty((N, 4), dtype=torch.float64, device=model.leaf_levels.device)
+    for a in range(0, N, group):
+        b = min(N, a + group)
+        ids = None if (a, b) == (0, N) else torch.arange(a, b, device=model.leaf_levels.device)
+        acc = torch.zeros((2, b - a, STRIDE), dtype=torch.float64, device=model.leaf_levels.device)
+        if penalty_weight > 0:  # written into the first half, the same in the second: no separate (n, STRIDE) arrays
+            penalty_statistics(model, penalty_delta, candidate, ids=ids, scale=0.5 * float(penalty_weight), out=acc[0])
+            acc[1].copy_(acc[0])
+        lap("penalty_statistics")
+        local_statistics(model, split, views, candidate, ids=ids, out=acc)
+        lap("ray_statistics")
+        gains[a:b] = evaluate_options(acc, lower[a:b], kind[a:b])
+        del acc
+        lap("fits")
+    return gains
+
+
+@torch.no_grad()
 def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, action_share, min_footprint_px,
                      penalty_weight, penalty_delta, continuation_share, error_share, productive_parent=None,
                      parent_error=None, frozen=None):
@@ -507,22 +530,15 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
         if device.type == "cuda":
             torch.cuda.synchronize()
         now = time.perf_counter()
-        seconds[name], clock[0] = now - clock[0], now
+        seconds[name], clock[0] = seconds.get(name, 0.0) + now - clock[0], now  # summed over the statistics groups
 
     candidate = candidate_step_geometry(model, detector_w=detector_w)
     lap("candidates")
     if device.type == "cuda":
         torch.cuda.empty_cache()  # what the solve and the geometry step left in the allocator's cache
-    acc = torch.zeros((2, N, STRIDE), dtype=torch.float64, device=device)
-    if penalty_weight > 0:  # written into the first half, the same in the second: no separate (N, STRIDE) arrays
-        penalty_statistics(model, penalty_delta, candidate, scale=0.5 * float(penalty_weight), out=acc[0])
-        acc[1].copy_(acc[0])
-    lap("penalty_statistics")
-    local_statistics(model, split, views, candidate, out=acc)
-    lap("ray_statistics")
-    gains = evaluate_options(acc, -child_minimum(model), kind)
-    del acc  # free the statistics before the edits
-    lap("fits")
+    group = N if device.type != "cuda" else max(1, int(0.6 * torch.cuda.mem_get_info()[0] // (2 * STRIDE * 8 + STRIDE * 4)))
+    gains = option_gains(model, split, views, candidate, penalty_weight=penalty_weight, penalty_delta=penalty_delta,
+                         group=group, lap=lap)
     per_leaf = leaf_bytes().to(device)
     extra = torch.stack([per_leaf[0] - per_leaf[kind], per_leaf[1] - per_leaf[kind], per_leaf[2] - per_leaf[kind],
                          split_bytes(kind)], 1)
@@ -582,6 +598,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
         "error_split_gain": float(gains[split_ids[by_error[split_ids]], 3].sum()),  # their one-step held-out gain
         "held_out_gain_of_batch": float(gains[ids, option].sum()) if ids.numel() else 0.0,
         "seconds": seconds,
+        "statistics_groups": -(-N // group),
     }
     split_record = (model.cells[split_ids].long(), err[split_ids].float(), gain_split[split_ids])  # + which were split by gain
     if ids.numel() == 0:
