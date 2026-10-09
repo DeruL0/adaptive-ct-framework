@@ -142,6 +142,23 @@ class EdgePenaltyTests(unittest.TestCase):
         self.assertAlmostEqual(float(e.sum()), 2 * 3 * 0.05 ** 2 / 2, places=7)  # each face on both leaves
         self.assertEqual(int((e > 0).sum()), 4)  # the leaf and its three neighbours
 
+    def test_merged_constant_pairs_give_the_same_penalty(self):
+        from adaptive_ct.training.regularizer import basis_rows, face_samples
+        torch.manual_seed(7)
+        model = _tree()  # constant, trilinear and step leaves
+        c = 0.05 + 0.5 * torch.rand(model.values.numel())
+        with torch.no_grad():
+            model.values.copy_(c)
+        d, R = 0.05, 0.0
+        for i, j, ui, uj, a, h in face_samples(model, merge_constant_pairs=False):  # every Gauss point
+            wi, ii = basis_rows(model, i, ui); wj, jj = basis_rows(model, j, uj)
+            x = ((wi * c[ii]).sum(1) - (wj * c[jj]).sum(1)) / h
+            R += float((a * h * torch.where(x.abs() <= d, 0.5 * x * x, d * (x.abs() - 0.5 * d))).sum())
+        penalty = EdgePenalty(model, d)
+        self.assertLess(penalty.samples, sum(int(i.numel()) for i, *_ in face_samples(model, merge_constant_pairs=False)))
+        self.assertAlmostEqual(penalty.value_and_gradient(c)[0], R, delta=1e-4 * max(1.0, R))  # its points are stored in fp16
+        self.assertAlmostEqual(penalty.freeze().value_and_gradient(c)[0], R, delta=1e-4 * max(1.0, R))
+
     def test_large_jumps_cost_linearly(self):
         model = BernsteinOctree(levels=[2], leaf_types=("constant",), cuda_integrator=False)
         values = torch.full((8,), 0.1)

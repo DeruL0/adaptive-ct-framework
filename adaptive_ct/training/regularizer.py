@@ -43,10 +43,13 @@ def basis_rows(model, leaf_ids: torch.Tensor, u: torch.Tensor, kind_all=None, of
     return w, idx
 
 
-def face_samples(model):
+def face_samples(model, merge_constant_pairs: bool):
     """Shared-face sample points, in 24 chunks: (finer leaf i, other leaf j, u_i, u_j leaf-local, area, h = distance of
-    the two leaves' centres along the face normal)."""
+    the two leaves' centres along the face normal).  merge_constant_pairs: a patch between two constant leaves has the
+    same jump at its 4 points: one point with the patch's area (73 % of the points of a 4.6 M-leaf tree; exact for the
+    penalty, not for statistics that need the points' positions, e.g. the decision's child corrections)."""
     device = model.leaf_levels.device
+    kind = model.leaf_type()
     N = int(model.leaf_levels.numel())
     shapes = torch.tensor(model.level_shapes, dtype=torch.float32, device=device)
     size = 2.0 / shapes[model.leaf_levels]  # (N, 3) box units
@@ -56,8 +59,8 @@ def face_samples(model):
     for axis in range(3):
         t1, t2 = [a for a in range(3) if a != axis]
         for side in (0.0, 1.0):
-            for a in q:
-                for b in q:
+            for ia, a in enumerate(q):
+                for ib, b in enumerate(q):
                     u = torch.zeros((N, 3), device=device)
                     u[:, axis], u[:, t1], u[:, t2] = side, a, b
                     p = origin + u * size
@@ -67,8 +70,15 @@ def face_samples(model):
                     keep = j >= 0
                     lj = torch.where(keep, model.leaf_levels[j.clamp_min(0)], 0)
                     keep &= (lj < model.leaf_levels) | ((lj == model.leaf_levels) & (side == 1.0))
+                    area = torch.full((N,), 0.25, device=device)
+                    if merge_constant_pairs:
+                        both = (kind == 0) & (kind[j.clamp_min(0)] == 0)
+                        if ia == 0 and ib == 0:
+                            area = torch.where(both, 1.0, area)
+                        else:
+                            keep &= ~both
                     i_ids, j_ids = torch.nonzero(keep).flatten(), j[keep]
-                    yield (i_ids, j_ids, u[keep], (p[keep] - origin[j_ids]) / size[j_ids], size[i_ids, t1] * size[i_ids, t2] / 4.0,
+                    yield (i_ids, j_ids, u[keep], (p[keep] - origin[j_ids]) / size[j_ids], size[i_ids, t1] * size[i_ids, t2] * area[keep],
                            0.5 * (size[i_ids, axis] + size[j_ids, axis]))
 
 
@@ -79,7 +89,7 @@ def face_jump_energy(model, delta: float, chunk: int = 1 << 21) -> torch.Tensor:
     N = int(model.leaf_levels.numel())
     kind, off, c = model.leaf_type(), model.value_offsets(), model.values.detach()
     out = torch.zeros(N, dtype=torch.float64, device=c.device)
-    for i_ids, j_ids, ui, uj, area, h in face_samples(model):
+    for i_ids, j_ids, ui, uj, area, h in face_samples(model, merge_constant_pairs=True):
         for a in range(0, int(area.numel()), chunk):
             sl = slice(a, a + chunk)
             wi, ii = basis_rows(model, i_ids[sl], ui[sl], kind, off)
@@ -96,38 +106,51 @@ class EdgePenalty:
 
     def __init__(self, model, delta: float):
         self.model, self.delta = model, float(delta)
-        parts = [(i.int(), j.int(), ui.half(), uj.half(), a / h, h) for i, j, ui, uj, a, h in face_samples(model)]
+        parts = [(i.int(), j.int(), ui.half(), uj.half(), a / h, h) for i, j, ui, uj, a, h in face_samples(model, merge_constant_pairs=True)]
         self.leaf_i, self.leaf_j, self.u_i, self.u_j, self.weight, self.h = (torch.cat(x) for x in zip(*parts))  # weight = area / h
-        self.w_i = self.w_j = self.first_i = self.first_j = None
+        self.rows_i = self.rows_j = self.table = self.offsets = None
 
     @property
     def samples(self) -> int:
         return int(self.weight.numel())
 
     def freeze(self):
-        """Keep the basis weights at the model's current types and step geometry until release()."""
+        """Keep the basis weights at the model's current types and step geometry until release(): one row of a table of
+        8 weights for every sample side in a trilinear or step leaf (a constant leaf's weight is 1), 4 bytes per side."""
         self.release()  # _chunks evaluates from the model while nothing is frozen
-        n, off = self.samples, self.model.value_offsets()
-        w_i, w_j = (torch.empty((n, 8), device=self.weight.device) for _ in range(2))
+        kind, dev = self.model.leaf_type(), self.weight.device
+        nc_i, nc_j = kind[self.leaf_i.long()] != 0, kind[self.leaf_j.long()] != 0
+        n_i = int(nc_i.sum())
+        rows_i, rows_j = (torch.full((self.samples,), -1, dtype=torch.int32, device=dev) for _ in range(2))
+        rows_i[nc_i] = torch.arange(n_i, dtype=torch.int32, device=dev)
+        rows_j[nc_j] = torch.arange(n_i, n_i + int(nc_j.sum()), dtype=torch.int32, device=dev)
+        table = torch.empty((n_i + int(nc_j.sum()), 8), device=dev)
         for sl, wi, _, wj, _ in self._chunks():
-            w_i[sl], w_j[sl] = wi, wj
-        self.w_i, self.w_j = w_i, w_j
-        self.first_i, self.first_j = off[self.leaf_i.long()].int(), off[self.leaf_j.long()].int()
+            ri, rj = rows_i[sl].long(), rows_j[sl].long()
+            table[ri[ri >= 0]], table[rj[rj >= 0]] = wi[ri >= 0], wj[rj >= 0]
+        self.rows_i, self.rows_j, self.table, self.offsets = rows_i, rows_j, table, self.model.value_offsets()
         return self
 
     def release(self):
-        self.w_i = self.w_j = self.first_i = self.first_j = None
+        self.rows_i = self.rows_j = self.table = self.offsets = None
 
     def _chunks(self):
         """(slice, w_i, idx_i, w_j, idx_j) per chunk of samples, at the model's current state (or from freeze())."""
-        kind, off = self.model.leaf_type(), self.model.value_offsets()
-        frozen = self.w_i is not None
+        frozen = self.table is not None
+        kind, off = (None, self.offsets) if frozen else (self.model.leaf_type(), self.model.value_offsets())
         last, k = int(self.model.values.numel()) - 1, torch.arange(8, device=self.weight.device)[None]
+
+        def from_table(rows):
+            w = torch.zeros((rows.numel(), 8), device=self.weight.device)
+            w[:, 0] = (rows < 0).float()  # a constant leaf
+            w[rows >= 0] = self.table[rows[rows >= 0]]
+            return w
+
         for s in range(0, self.samples, self.CHUNK):
             sl = slice(s, s + self.CHUNK)
             if frozen:  # padding weights are 0: their index only has to stay inside the value array
-                yield (sl, self.w_i[sl], (self.first_i[sl, None] + k).clamp_max(last).long(),
-                       self.w_j[sl], (self.first_j[sl, None] + k).clamp_max(last).long())
+                yield (sl, from_table(self.rows_i[sl].long()), (off[self.leaf_i[sl].long(), None] + k).clamp_max(last),
+                       from_table(self.rows_j[sl].long()), (off[self.leaf_j[sl].long(), None] + k).clamp_max(last))
                 continue
             wi, ii = basis_rows(self.model, self.leaf_i[sl].long(), self.u_i[sl].float(), kind, off)
             wj, jj = basis_rows(self.model, self.leaf_j[sl].long(), self.u_j[sl].float(), kind, off)

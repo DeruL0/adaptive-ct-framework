@@ -76,7 +76,7 @@ def _step_neighbours(model):
     N = int(model.leaf_levels.numel())
     kind = model.leaf_type()
     parts = []
-    for i, j, _, _, area, _ in face_samples(model):
+    for i, j, _, _, area, _ in face_samples(model, merge_constant_pairs=False):
         for L, S in ((i, j), (j, i)):
             m = kind[S] == 2
             parts.append((L[m] * N + S[m], area[m]))
@@ -241,7 +241,7 @@ def penalty_statistics(model, delta: float, candidate: torch.Tensor, ids: torch.
         return (w.double() * coeff[idx].double()).sum(1)
 
     def blocks():
-        for i_ids, j_ids, ui, uj, area, h in face_samples(model):
+        for i_ids, j_ids, ui, uj, area, h in face_samples(model, merge_constant_pairs=False):
             if ids is not None:  # samples touching a kept leaf
                 k = (slot[i_ids] >= 0) | (slot[j_ids] >= 0)
                 i_ids, j_ids, ui, uj, area, h = i_ids[k], j_ids[k], ui[k], uj[k], area[k], h[k]
@@ -536,7 +536,10 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     lap("candidates")
     if device.type == "cuda":
         torch.cuda.empty_cache()  # what the solve and the geometry step left in the allocator's cache
-    group = N if device.type != "cuda" else max(1, int(0.6 * torch.cuda.mem_get_info()[0] // (2 * STRIDE * 8 + STRIDE * 4)))
+    # statistics in groups of leaves: 2 x 102 doubles + 102 floats a leaf, and ~1.5 GB besides (penalty blocks, fits; measured
+    # at 4.6 M leaves: 1 M leaves a group peaked 3.0 GB above the model, 0.5 M 2.3 GB): 3 GiB kept free for the rest
+    # (the fixed part and the desktop, which holds 1.3-1.5 GB of this card)
+    group = N if device.type != "cuda" else max(100_000, int((torch.cuda.mem_get_info()[0] - 3 * 2**30) // (2 * STRIDE * 8 + STRIDE * 4)))
     gains = option_gains(model, split, views, candidate, penalty_weight=penalty_weight, penalty_delta=penalty_delta,
                          group=group, lap=lap)
     per_leaf = leaf_type_bytes(model, value_tolerance)  # (N, 3) at each leaf's block value width (codec/budget.py)
