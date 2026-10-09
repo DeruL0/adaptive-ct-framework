@@ -25,17 +25,15 @@ round's additions).
 Continuation splits (`continuation_share` of the allowance): children of a split taken by gain (it paid at the
 round's price: the structure is there) whose own split gain is positive but was not taken, in decreasing gain per byte
 (one level below a gain split: a continuation split does not make its children eligible).
-Error-driven splits and upgrades (`error_share` of the allowance, after the continuation splits): a split into children of the leaf's size can earn
+Error-driven splits (`error_share` of the allowance, after the continuation splits): a split into children of the leaf's size can earn
 little where the structure is thinner than the children (a 3-5 voxel crack through 10-voxel leaves), although
 splitting those children would capture it.  So, as in near-best adaptive tree approximation (Binev & DeVore 2004),
 part of the bytes goes by error rather than by one-step gain: e = the edge penalty's energy on the leaf's faces
 (face_jump_energy: where neighbouring leaves disagree, e.g. planes that do not meet; the residual of the rays, used
 before, spreads along the rays and ranked leaves by size), modified along the ancestors  e~ = 1 / (1 / e + 1 / e~_parent)  (e~ = e at the coarsest level): an error that
 appeared where the parent had a large one stays nearly whole, an error that splitting does not reduce halves per level.
-Leaves not taken by gain are acted on in decreasing e~ per byte of their action until that share is spent: a constant leaf whose step option has
-a positive gain becomes a step (an edge through a constant leaf: 6 bytes instead of a 16.75-byte split), any other
-leaf whose one-level split gain is positive is split (face jumps that are real - an edge on a leaf face - do not pass:
-neither action predicts better).
+Leaves not taken by gain whose one-level split gain is positive are split in decreasing e~ until that share is spent
+(face jumps that are real - an edge on a leaf face - do not pass: their split does not predict better).
 All chosen actions are executed; the budget fills geometrically over the rounds, and the tree is re-solved
 before the next decision.
 """
@@ -571,21 +569,15 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     # error-driven splits: leaves not taken by gain, in decreasing modified error, within error_share of the allowance
     e = face_jump_energy(model, float(penalty_delta))  # before any edit: the solved state
     err = modified_error(e, torch.full_like(e, math.inf) if parent_error is None else parent_error.double())
-    # a constant leaf an edge crosses takes a step first (6 bytes; 16.75 for its split): boundary constants held more than
-    # half of the boundary voxels >= 2 voxels off (planes, 8 MiB), with a positive step gain below the round's price
-    up = (kind == 0) & allowed[:, 2] & (gains[:, 2] > 0)
-    act = torch.where(up, 2, 3)
-    # the error ranks; the held-out gain must still be positive (a jump the true volume has at a leaf face is not an error)
-    free = (err > 0) & (up | (allowed[:, 3] & (gains[:, 3] > 0)))
+    free = allowed[:, 3] & (err > 0) & (gains[:, 3] > 0)  # the error ranks; the held-out gain must still be positive (a jump
+    # the true volume has at a leaf face is not an error: splitting it predicts no better)
     free[ids] = False
     cand = torch.nonzero(free).flatten()
-    cost = extra[cand, act[cand]]
-    cand = cand[torch.argsort(err[cand] / cost, descending=True)]  # error per byte (as gain per byte in the gain share):
-    # ranked by the error alone, the boundary constants (median e 2e-6) came after the splits of boundary steps (6e-6)
-    cand = cand[torch.cumsum(extra[cand, act[cand]], 0) <= float(error_share) * allowance]
+    cand = cand[torch.argsort(err[cand], descending=True)]
+    cand = cand[torch.cumsum(extra[cand, 3], 0) <= float(error_share) * allowance]
     by_error = torch.zeros(N, dtype=torch.bool, device=device)
     by_error[cand] = True
-    ids, option = torch.cat([ids, cand]), torch.cat([option, act[cand]])
+    ids, option = torch.cat([ids, cand]), torch.cat([option, torch.full_like(cand, 3)])
     lap("choice")
     if model.max_leaf_count is not None:  # leaf-count cap: drop splits beyond it
         room = (int(model.max_leaf_count) - N) // 7
@@ -601,9 +593,6 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
         "continuation_splits": int(continued[split_ids].sum()),
         "continuation_split_bytes": float(extra[split_ids[continued[split_ids]], 3].sum()),
         "continuation_split_gain": float(gains[split_ids[continued[split_ids]], 3].sum()),
-        "error_upgrades": int((by_error[ids] & (option == 2)).sum()),
-        "error_upgrade_bytes": float(extra[ids[by_error[ids] & (option == 2)], 2].sum()),
-        "error_upgrade_gain": float(gains[ids[by_error[ids] & (option == 2)], 2].sum()),
         "error_splits": int(by_error[split_ids].sum()),
         "error_split_bytes": float(extra[split_ids[by_error[split_ids]], 3].sum()),
         "error_split_gain": float(gains[split_ids[by_error[split_ids]], 3].sum()),  # their one-step held-out gain

@@ -182,22 +182,6 @@ class DecisionTests(unittest.TestCase):
         parts = option_gains(model, split, views, candidate, group=5, **kw)
         self.assertLess(float((whole - parts).abs().max()), 1e-9 * (1 + float(whole.abs().max())))
 
-    def test_error_share_turns_a_constant_leaf_crossed_by_an_edge_into_a_step(self):
-        # truth: one root leaf holds a planar edge; the model has constant leaves only: the error share (all of the
-        # allowance) upgrades that leaf to a step (6 bytes) instead of splitting it (16.75 bytes)
-        truth = _model(levels=(2, 4), types=ALL, trilinear=False)
-        with torch.no_grad():
-            truth.values.fill_(0.2)
-        k = truth.find_leaf((0, 0, 0, 0))
-        truth.set_types(torch.tensor([k]), torch.tensor([2]), torch.tensor([0.2, 0.6]), torch.tensor([[1.0, 0.0, 0.0, 0.1, 0.02]]))
-        split = _split_from(truth)
-        model = _model(levels=(2, 4), types=ALL, trilinear=False)
-        solve(model, split, subsets=4, tol=1e-3, max_epochs=100, min_epochs=3)
-        report = _decide(model, split, byte_budget=model_bytes(model) + 40, action_share=1.0, continuation_share=0.0, error_share=1.0)
-        self.assertGreater(report["error_upgrades"], 0, report)
-        self.assertEqual(report["actions"]["split"], 0, report)
-        self.assertEqual(int((model.leaf_type() == 2).sum()), report["actions"]["step"])
-
     def test_value_span_marks_flat_leaves(self):
         from adaptive_ct.refinement.decision import value_span
         model = _model(levels=(2,), trilinear=False)
