@@ -13,6 +13,8 @@ One pass over the volume in slabs of 16 z-slices (halo R = 8) computes, from the
               detail the reconstruction invents in quiet parts of the object
   seams       in the same quiet interior, mean |pred(v + e) - pred(v)| over neighbouring voxels in different leaves
               divided by that within one leaf (1 = leaf boundaries invisible), over the three axes
+  step seams  anywhere, mean |pred(v + e) - pred(v)| over neighbouring voxels in two different step leaves (planes that
+              do not meet show here)
 Writes output/<run>/detail_eval.json and output/<run>/zoom.png (the zoomed panel of slice_vs_oracle_tree.png).
 --deblock: the same metrics after the decoder-side deblocking (adaptive_ct/evaluation/deblock.py, delta of the run's
 edge penalty) -> detail_eval_deblock.json, and zoom_deblock.png: GT | decoded | deblocked on the crop of the slice
@@ -95,7 +97,9 @@ def quantiles(hist):
 
 
 @torch.no_grad()
-def evaluate(run, with_deblock=False):
+def evaluate(run, with_deblock=False, decoder=None, tag=""):
+    """decoder(model) -> points -> (values, leaf ids): another decoding of the same model (offline tests); tag: suffix
+    of the output files."""
     ck = torch.load(ROOT / "output" / run / "checkpoint.pt", map_location="cpu", weights_only=False)
     m = build_model(ck["config"])
     m.prepare_sparse_from_state_dict(ck["model"])
@@ -106,14 +110,15 @@ def evaluate(run, with_deblock=False):
     delta = float(ck["config"]["training"]["solver"]["edge_penalty"]["delta"])
     crop = None
     acc = {k: 0.0 for k in ("sse", "band_se", "band_n", "far_se", "far_n", "d_se", "d_dot", "d_gg", "d_n", "spk", "quiet",
-                            "seam_cross", "seam_cross_n", "seam_in", "seam_in_n")}
+                            "seam_cross", "seam_cross_n", "seam_in", "seam_in_n", "step_seam", "step_seam_n")}
+    decode = decoder(m) if decoder is not None else m.forward_mu_with_leaf_ids
     h_gp, h_pg, h_thin = (torch.zeros(R + 2, dtype=torch.float64, device=dev) for _ in range(3))
     for z0 in range(0, D, SLAB):
         z1 = min(D, z0 + SLAB)
         a, b = max(0, z0 - R), min(D, z1 + R)
         gt = torch.from_numpy(np.ascontiguousarray(GT[a:b])).to(dev).float()
         pts = points(a, b)
-        pred, ids = zip(*[m.forward_mu_with_leaf_ids(pts[s:s + 4_000_000]) for s in range(0, pts.shape[0], 4_000_000)])
+        pred, ids = zip(*[decode(pts[s:s + 4_000_000]) for s in range(0, pts.shape[0], 4_000_000)])
         pred, ids = torch.cat(pred).reshape(gt.shape), torch.cat(ids).reshape(gt.shape)
         if with_deblock:
             raw = pred
@@ -163,19 +168,25 @@ def evaluate(run, with_deblock=False):
                 dd, cross = dd[core], cross[core]
             acc["seam_cross"] += float(dd[q2 & cross].double().sum()); acc["seam_cross_n"] += int((q2 & cross).sum())
             acc["seam_in"] += float(dd[q2 & ~cross].double().sum()); acc["seam_in_n"] += int((q2 & ~cross).sum())
+            if dim == 0:
+                both = cross & is_step[ids[tuple(sl0)]] & is_step[ids[tuple(sl1)]]
+            else:
+                both = cross & (is_step[ids[tuple(sl0)]] & is_step[ids[tuple(sl1)]])[core]
+            acc["step_seam"] += float(dd[both].double().sum()); acc["step_seam_n"] += int(both.sum())
     n = D * H * W
     out = {"run": run, "volume_psnr_db": 10 * np.log10(n / acc["sse"]), "band_rmse": (acc["band_se"] / acc["band_n"]) ** 0.5,
            "far_rmse": (acc["far_se"] / acc["far_n"]) ** 0.5, "detail_rmse": (acc["d_se"] / acc["d_n"]) ** 0.5,
            "detail_retained": acc["d_dot"] / acc["d_gg"], "surface_gt_to_pred": quantiles(h_gp), "surface_pred_to_gt": quantiles(h_pg),
            "thin_gt_to_pred": quantiles(h_thin), "speck_share": acc["spk"] / acc["quiet"],
-           "seam_ratio": (acc["seam_cross"] / acc["seam_cross_n"]) / (acc["seam_in"] / acc["seam_in_n"]), "leaves": m.leaf_count}
+           "seam_ratio": (acc["seam_cross"] / acc["seam_cross_n"]) / (acc["seam_in"] / acc["seam_in_n"]),
+           "step_seam": acc["step_seam"] / max(acc["step_seam_n"], 1), "leaves": m.leaf_count}
     from PIL import Image
     if with_deblock:
-        (ROOT / "output" / run / "detail_eval_deblock.json").write_text(json.dumps(out, indent=1))
+        (ROOT / "output" / run / f"detail_eval_deblock{tag}.json").write_text(json.dumps(out, indent=1))
         img = lambda x: np.kron((np.clip(x / 0.8, 0, 1) * 255).astype(np.uint8), np.ones((4, 4), np.uint8))
-        Image.fromarray(np.concatenate([img(x) for x in crop], 1)).save(ROOT / "output" / run / "zoom_deblock.png")
+        Image.fromarray(np.concatenate([img(x) for x in crop], 1)).save(ROOT / "output" / run / f"zoom_deblock{tag}.png")
         return out
-    (ROOT / "output" / run / "detail_eval.json").write_text(json.dumps(out, indent=1))
+    (ROOT / "output" / run / f"detail_eval{tag}.json").write_text(json.dumps(out, indent=1))
     fig = ROOT / "output" / run / "slice_vs_oracle_tree.png"
     if fig.exists():
         im = Image.open(fig)
