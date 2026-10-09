@@ -32,7 +32,7 @@ part of the bytes goes by error rather than by one-step gain: e = the edge penal
 (face_jump_energy: where neighbouring leaves disagree, e.g. planes that do not meet; the residual of the rays, used
 before, spreads along the rays and ranked leaves by size), modified along the ancestors  e~ = 1 / (1 / e + 1 / e~_parent)  (e~ = e at the coarsest level): an error that
 appeared where the parent had a large one stays nearly whole, an error that splitting does not reduce halves per level.
-Leaves not taken by gain are acted on in decreasing e~ until that share is spent: a constant leaf whose step option has
+Leaves not taken by gain are acted on in decreasing e~ per byte of their action until that share is spent: a constant leaf whose step option has
 a positive gain becomes a step (an edge through a constant leaf: 6 bytes instead of a 16.75-byte split), any other
 leaf whose one-level split gain is positive is split (face jumps that are real - an edge on a leaf face - do not pass:
 neither action predicts better).
@@ -579,7 +579,9 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     free = (err > 0) & (up | (allowed[:, 3] & (gains[:, 3] > 0)))
     free[ids] = False
     cand = torch.nonzero(free).flatten()
-    cand = cand[torch.argsort(err[cand], descending=True)]
+    cost = extra[cand, act[cand]]
+    cand = cand[torch.argsort(err[cand] / cost, descending=True)]  # error per byte (as gain per byte in the gain share):
+    # ranked by the error alone, the boundary constants (median e 2e-6) came after the splits of boundary steps (6e-6)
     cand = cand[torch.cumsum(extra[cand, act[cand]], 0) <= float(error_share) * allowance]
     by_error = torch.zeros(N, dtype=torch.bool, device=device)
     by_error[cand] = True
