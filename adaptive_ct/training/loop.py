@@ -79,6 +79,7 @@ def run_training(config_path: str | Path) -> dict:
     train_cfg = config["training"]
     solver_cfg = train_cfg["solver"]
     ref_cfg = train_cfg["refinement"]
+    tolerance = float(config["codec"]["value_tolerance"])  # stored values on the grid k 2 tolerance (codec/quantize.py)
     eval_chunk = int(train_cfg.get("eval_ray_chunk", 1 << 20))
     controller = RefinementController(
         spec=ref_cfg,
@@ -88,6 +89,7 @@ def run_training(config_path: str | Path) -> dict:
         detector_w=detector_w,
         seed=training_seed,
         byte_budget=int(ref_cfg["byte_budget"]),
+        value_tolerance=tolerance,
         state_dir=out_dir / "states",
     )
 
@@ -152,7 +154,7 @@ def run_training(config_path: str | Path) -> dict:
             "objective_estimate": last.get("objective_estimate"),
             "relative_decrease": last.get("relative_decrease"),
             "leaves": model.leaf_count,
-            "bytes": model_bytes(model),
+            "bytes": model_bytes(model, tolerance),
             "leaf_type_counts": list(model.stats().leaf_type_counts),
             "held_out_projection": held_out_metric(),
             "gpu_peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else 0.0,
@@ -172,7 +174,7 @@ def run_training(config_path: str | Path) -> dict:
         print(json.dumps({"grow": event}, default=float), flush=True)
 
     elapsed = time.perf_counter() - start_time
-    codec_summary = deploy(model, dataset, detector_h=detector_h, detector_w=detector_w, ray_chunk=eval_chunk)
+    codec_summary = deploy(model, dataset, detector_h=detector_h, detector_w=detector_w, ray_chunk=eval_chunk, value_tolerance=tolerance)
     stats = model.stats()
     metrics_cfg = config.get("metrics", {}) or {}
     if bool(metrics_cfg.get("compute_projection_metrics", True)):
@@ -209,7 +211,7 @@ def run_training(config_path: str | Path) -> dict:
     checkpoint_path = out_dir / "checkpoint.pt"  # the deployed model (coefficients rounded to fp16)
     torch.save({"model": model.state_dict(), "config": config, "rounds": len(rounds)}, checkpoint_path)
     export_summary = {}
-    export_summary["stored_file"] = export_octree_artifact(model, out_dir / "model.npz").__dict__  # what the budget counts
+    export_summary["stored_file"] = export_octree_artifact(model, out_dir / "model.npz", tolerance).__dict__  # what the budget counts
     export_summary["visual_slice"] = export_center_slice_png(model, out_dir / "center_slice.png", dataset.volume_shape)
     export_summary["visual_slice_fullres"] = export_center_slice_png(model, out_dir / "center_slice_fullres.png", finest_model_shape(model))
     export_summary["visual_slice_deblocked"] = export_center_slice_png(model, out_dir / "center_slice_deblocked.png", dataset.volume_shape,

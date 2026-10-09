@@ -16,13 +16,14 @@ def _cell_keys(levels: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
 
 
 class RefinementController:
-    def __init__(self, *, spec, edge_penalty, estimator_split, detector_h, detector_w, seed, byte_budget, state_dir):
+    def __init__(self, *, spec, edge_penalty, estimator_split, detector_h, detector_w, seed, byte_budget, value_tolerance, state_dir):
         self.spec = dict(spec)
         self.edge_penalty = dict(edge_penalty)
         self.estimator_split = estimator_split
         self.detector_h, self.detector_w = int(detector_h), int(detector_w)
         self.seed = int(seed)
         self.byte_budget = int(byte_budget)
+        self.value_tolerance = float(value_tolerance)
         self.state_dir = state_dir
         self.round_index = 0
         self.stopped = False
@@ -40,7 +41,7 @@ class RefinementController:
     def refine(self, model) -> dict:
         self.round_index += 1
         event = {"round": self.round_index}
-        remaining = (self.byte_budget - model_bytes(model)) / self.byte_budget
+        remaining = (self.byte_budget - model_bytes(model, self.value_tolerance)) / self.byte_budget
         if remaining < float(self.spec["stop_below_remaining"]):
             return self._stop(event, "byte_budget_nearly_spent")
         frozen = None
@@ -69,7 +70,7 @@ class RefinementController:
             byte_budget=self.byte_budget, frozen=frozen,
             action_share=share, min_footprint_px=float(self.spec["min_footprint_px"]),
             continuation_share=float(self.spec["continuation_share"]), error_share=float(self.spec["error_share"]),
-            productive_parent=productive, parent_error=parent_error,
+            value_tolerance=self.value_tolerance, productive_parent=productive, parent_error=parent_error,
             penalty_weight=float(self.edge_penalty["weight"]), penalty_delta=float(self.edge_penalty["delta"]))
         event.update(report)
         if by_gain.any():

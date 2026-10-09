@@ -18,20 +18,20 @@ class StoredFileTests(unittest.TestCase):
         build(model)
         with torch.no_grad():
             model.values.copy_(0.1 + 0.8 * torch.rand_like(model.values))
-        quantize_roundtrip_(model)  # the file must reproduce the deployed model exactly
+        quantize_roundtrip_(model, 0.001)  # the file must reproduce the deployed model exactly
         points = torch.rand((512, 3)) * 1.998 - 0.999
         expected = model.forward_mu(points).detach()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "model.npz"
-            export_octree_artifact(model, path)
+            export_octree_artifact(model, path, 0.001)
             with np.load(path, allow_pickle=False) as payload:
-                raw = sum(payload[k].nbytes for k in ("root_bits", "masks", "types", "trilinear", "step", "step_geometry", "constant"))
+                raw = sum(payload[k].nbytes for k in ("root_bits", "masks", "types", "step_geometry", "block_base", "block_width", "values"))
             restored = BernsteinOctree(levels=levels, leaf_types=("constant", "trilinear", "step"))
             header = load_octree_artifact(restored, path)
             actual = restored.forward_mu(points).detach()
         self.assertEqual(header["schema"], SCHEMA)
         self.assertTrue(torch.equal(actual, expected))
-        self.assertLessEqual(raw, model_bytes(model))  # the budget counts every stored byte
+        self.assertLessEqual(raw, model_bytes(model, 0.001))  # the budget counts every stored byte
 
     def test_anisotropic_three_type_round_trip(self):
         def build(model):

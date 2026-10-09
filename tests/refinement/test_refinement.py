@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 from adaptive_ct.core.projector import has_bernstein_native
-from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
+from adaptive_ct.codec.budget import leaf_type_bytes, model_bytes
 from adaptive_ct.core.geometry import detector_grid, parallel_rays
 from adaptive_ct.data.dataset import ProjectionSplit
 from adaptive_ct.refinement.decision import (candidate_step_geometry, child_minimum, decide_and_apply, decision_views, evaluate_options,
@@ -14,6 +14,7 @@ from adaptive_ct.representation.octree import BernsteinOctree
 from adaptive_ct.training.solve import solve
 
 DETECTOR = 8
+TOL = 0.001  # codec value tolerance
 ALL = ("constant", "trilinear", "step")
 
 
@@ -37,7 +38,7 @@ def _split_from(truth, views=16):
 
 
 def _decide(model, split, **kw):
-    kw = {"action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, "continuation_share": 0.2, "error_share": 0.2, **kw}
+    kw = {"action_share": 0.5, "min_footprint_px": 1.0, "penalty_weight": 0.0, "penalty_delta": 0.02, "continuation_share": 0.2, "error_share": 0.2, "value_tolerance": TOL, **kw}
     report, _, _ = decide_and_apply(model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, **kw)
     return report
 
@@ -49,19 +50,20 @@ def _random_values(model, seed):
 
 
 class ByteModelTests(unittest.TestCase):
-    def test_bytes_per_leaf_type_and_per_split(self):
-        self.assertEqual(leaf_bytes().tolist(), [2.25, 16.25, 8.25])
+    def test_bytes_follow_the_block_value_widths(self):
+        # 8 constant root leaves (one per block, width 0); leaf 0 split into 8 children with codes 50..57 (q = 0.002):
+        # its block has width 3 bits
         model = _model(trilinear=False)
-        before = model_bytes(model)
-        model.to_trilinear([0, 1])
-        self.assertEqual(model_bytes(model) - before, 2 * 14)
-        before = model_bytes(model)
-        kind = model.leaf_type()
-        ids = torch.tensor([int(torch.nonzero(kind == 1)[0]), int(torch.nonzero(kind == 0)[0])])
-        expected = float(split_bytes(kind[ids]).sum())
-        model.split_leaves_batch(ids)
-        self.assertLessEqual(abs(model_bytes(model) - before - expected), 1)  # whole bytes of the 2-bit types
-        self.assertEqual(expected, (1 + 7 * 16.25) + (1 + 7 * 2.25))
+        with torch.no_grad():
+            model.values.fill_(0.3)
+        self.assertEqual(leaf_type_bytes(model, TOL)[0].tolist(), [0.25, 0.25, 4.25])
+        self.assertEqual(model_bytes(model, TOL), 64 + 1 + 0 + 2 + 20 + 0)  # header, root bits, masks, types, blocks, values
+        model.split_leaves_batch([0])
+        children = torch.nonzero(model.leaf_levels == 1).flatten()
+        with torch.no_grad():
+            model.values[model.value_offsets()[children]] = 0.100 + 0.002 * torch.arange(8, dtype=torch.float32)
+        self.assertEqual(model_bytes(model, TOL), 64 + 1 + 1 + 4 + 20 + 3)  # 15 leaves' types, 8 values x 3 bits
+        self.assertEqual(leaf_type_bytes(model, TOL)[children[0]].tolist(), [0.25 + 3 / 8, 0.25 + 3.0, 0.25 + 6 / 8 + 4])
 
     def test_resolvable_mask_follows_pixel_footprint(self):
         model = _model(trilinear=False)
@@ -132,11 +134,11 @@ class DecisionTests(unittest.TestCase):
         split = _split_from(truth)
         model = _model(levels=(2, 4, 8))
         solve(model, split, subsets=4, tol=1e-3, max_epochs=100, min_epochs=3)
-        budget = model_bytes(model) + 400
+        budget = model_bytes(model, TOL) + 400
         report = _decide(model, split, byte_budget=budget, action_share=1.0)
         self.assertGreater(sum(report["actions"].values()), 0)
         self.assertLessEqual(report["bytes_after"], budget)
-        self.assertEqual(report["bytes_after"], model_bytes(model))
+        self.assertEqual(report["bytes_after"], model_bytes(model, TOL))
 
     def test_no_split_gain_that_needs_negative_attenuation(self):
         truth = _model(levels=(2, 4, 8), trilinear=False)
@@ -228,7 +230,7 @@ class DecisionCudaTests(unittest.TestCase):
         solve(model, split, subsets=4, tol=1e-3, max_epochs=200, min_epochs=3)
         report, _, (split_cells, errors, _) = decide_and_apply(
             model, split, decision_views(split, 16, 0), detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=4 * 150,
-            action_share=1.0, min_footprint_px=1.0, penalty_weight=0.0, penalty_delta=0.02, continuation_share=0.0, error_share=1.0)
+            action_share=1.0, min_footprint_px=1.0, penalty_weight=0.0, penalty_delta=0.02, continuation_share=0.0, error_share=1.0, value_tolerance=TOL)
         self.assertEqual(report["actions"]["split"], report["error_splits"])  # every byte went by error
         self.assertGreater(report["error_splits"], 0)
         self.assertTrue(bool((split_cells[:, 1] == 0).all()), split_cells.tolist())  # the slab lies in root cells x = 0
@@ -248,7 +250,7 @@ class DecisionCudaTests(unittest.TestCase):
         solve(model, split, subsets=4, tol=1e-3, max_epochs=200, min_epochs=3)
         state = {k: v.clone() for k, v in model.state_dict().items()}
         kw = dict(detector_h=DETECTOR, detector_w=DETECTOR, byte_budget=4 * 150, action_share=1.0, min_footprint_px=1.0,
-                  penalty_weight=0.0, penalty_delta=0.02, continuation_share=1.0, error_share=0.0)
+                  penalty_weight=0.0, penalty_delta=0.02, continuation_share=1.0, error_share=0.0, value_tolerance=TOL)
         report, _, _ = decide_and_apply(model, split, decision_views(split, 16, 0), **kw)
         self.assertEqual(report["actions"]["split"], 0)  # no parent split by gain: the share stays unspent
         model.load_state_dict(state)

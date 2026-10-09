@@ -133,7 +133,7 @@ def evaluate_volume(model):
         "band_rmse": math.sqrt(se["band"] / cnt["band"]),
         "far_rmse": math.sqrt(se["far"] / cnt["far"]),
         "leaves": model.leaf_count,
-        "bytes": model_bytes(model),
+        "bytes": model_bytes(model, float(CFG["codec"]["value_tolerance"])) if "codec" in CFG else None,  # runs before the block codec: see their report
     }
 
 
@@ -244,7 +244,7 @@ def stage_oracle(ds):
         A[li] = B[li] = s2[li] = None
     torch.cuda.empty_cache()
     base = base_model(ds.train)
-    k_splits = (BUDGET - model_bytes(base)) // SPLIT_BYTES
+    k_splits = (BUDGET - model_bytes(base, float(CFG["codec"]["value_tolerance"]))) // SPLIT_BYTES
     sse0, sse1, sse2 = sses
 
     def dp(lam):

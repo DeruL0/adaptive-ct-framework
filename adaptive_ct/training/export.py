@@ -75,10 +75,10 @@ def finest_model_shape(model) -> tuple[int, int, int]:
     return tuple(int(value) for value in model.level_shapes[-1])
 
 
-def deploy(model, dataset, *, detector_h: int, detector_w: int, ray_chunk: int) -> dict:
+def deploy(model, dataset, *, detector_h: int, detector_w: int, ray_chunk: int, value_tolerance: float) -> dict:
     """Round the model in place to what the stored file reproduces (codec/quantize.py); test projections before/after."""
     test = lambda: projection_metrics(render_split(model, dataset.test, detector_h=detector_h, detector_w=detector_w, ray_chunk=ray_chunk), dataset.test.projections)
     summary = {"projection_test_solved": test()}
-    quantize_roundtrip_(model)
+    quantize_roundtrip_(model, value_tolerance)
     summary["projection_test_deployed"] = test()
     return summary

@@ -22,5 +22,7 @@ def validate_config(config: dict) -> None:
     keys = ("byte_budget", "action_share", "stop_below_remaining", "decision_views", "min_footprint_px", "max_rounds", "continuation_share", "error_share", "spend_all_below")
     if not isinstance(ref, dict) or any(k not in ref for k in keys):
         errors.append("training.refinement needs " + ", ".join(keys))
+    if not float((config.get("codec", {}) or {}).get("value_tolerance", 0)) > 0:
+        errors.append("codec.value_tolerance (largest error of a stored value) is required")
     if errors:
         raise ValueError("Invalid config:\n- " + "\n- ".join(errors))

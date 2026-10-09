@@ -62,6 +62,7 @@ def _config(dataset_root: Path, output_root: Path, *, types: list) -> dict:
             "refinement": {"action_share": 0.5, "stop_below_remaining": 0.01, "decision_views": 6, "min_footprint_px": 1.0, "byte_budget": 12000, "max_rounds": 3,
                            "continuation_share": 0.2, "error_share": 0.2, "spend_all_below": 0.0},
         },
+        "codec": {"value_tolerance": 0.001},
         "metrics": {"compute_projection_metrics": True, "compute_volume_metrics": False, "compute_boundary_metrics": False},
         "output": {"dir": str(output_root)},
     }
@@ -97,7 +98,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_tail_spends_the_rest_of_the_budget_in_one_decision(self):
         def patch(config):
-            config["training"]["refinement"].update(spend_all_below=0.9, max_rounds=6)
+            config["training"]["refinement"].update(spend_all_below=0.9, max_rounds=6, byte_budget=600)  # small: the block codec stores the toy tree in far fewer bytes than before
         report, _ = self._run(types=["constant", "trilinear", "step"], patch=patch)
         shares = [event["action_share"] for event in report["growth_events"] if "action_share" in event]
         self.assertIn(1.0, shares)  # remaining fell below 90 %: the next decision may spend all of it

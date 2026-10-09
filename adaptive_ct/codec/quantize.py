@@ -1,4 +1,5 @@
-"""Storage precision: values in fp16; step geometry packed into 32 bits per leaf:
+"""Storage precision: values on the grid k q, q = 2 tolerance (|error| <= tolerance), coded per block (root cell) as a
+16-bit base code plus a b-bit offset per value (codec/budget.py, codec/artifact.py); step geometry packed into 32 bits:
   direction: octahedral map of the unit sphere onto [-1, 1]^2, 2 x 10 bits
   d:         8 bits over [-D_MAX, D_MAX] (|d| <= half the leaf's extent along n <= sqrt(3)/2)
   w:         4 bits, 0 = hard step, k = 1..15 -> w = 2^((k - 15) / 2)  (1/128 .. 1, steps of sqrt 2)
@@ -7,6 +8,8 @@
 from __future__ import annotations
 
 import torch
+
+from adaptive_ct.representation.octree import VALUE_COUNT
 
 D_MAX = 0.875
 
@@ -45,10 +48,34 @@ def unpack_geometry(code: torch.Tensor) -> torch.Tensor:
     return torch.cat([n, d[:, None], w[:, None]], 1)
 
 
-def quantize_roundtrip_(model) -> None:
+MAX_CODE = 65535  # 16-bit base codes
+
+
+@torch.no_grad()
+def block_codes(model, tolerance: float):
+    """Codes k = round(v / q) of the stored values (model order), and per block (root cell, raster order) the base
+    code (smallest k) and the width b (bits of the largest k - base); the block of every leaf."""
+    q = 2.0 * float(tolerance)
+    v = model.values.detach()
+    k = torch.round(v / q).long()
+    if bool((k < 0).any()) or bool((k > MAX_CODE).any()) or not bool(torch.isfinite(v).all()):
+        raise ValueError(f"stored values outside [0, {MAX_CODE * q:g}]: the solve left unconstrained values")
+    shape = model.l0_shape
+    root = model.leaf_coords >> model.leaf_levels[:, None]
+    block_of_leaf = (root[:, 0] * shape[1] + root[:, 1]) * shape[2] + root[:, 2]
+    count = torch.tensor(VALUE_COUNT, device=v.device)[model.leaf_type()]
+    block = torch.repeat_interleave(block_of_leaf, count)  # values are stored leaf after leaf
+    nb = shape[0] * shape[1] * shape[2]
+    base = torch.full((nb,), MAX_CODE, dtype=torch.long, device=v.device).scatter_reduce(0, block, k, "amin")
+    top = torch.zeros(nb, dtype=torch.long, device=v.device).scatter_reduce(0, block, k, "amax")
+    span = (top - base).clamp_min(0)
+    width = torch.where(span > 0, torch.floor(torch.log2(span.double())).long() + 1, torch.zeros_like(span))
+    return k, base, width, block_of_leaf
+
+
+def quantize_roundtrip_(model, tolerance: float) -> None:
     """Round the model in place to exactly what the stored file reproduces."""
     with torch.no_grad():
-        if not bool(torch.isfinite(model.values.half()).all()):
-            raise ValueError("stored values overflow fp16 (> 65504): the solve left unconstrained values")
-        model.values.copy_(model.values.half().float())
+        k, _, _, _ = block_codes(model, tolerance)
+        model.values.copy_(k.float() * (2.0 * float(tolerance)))
         model.step_geometry[:, :5] = unpack_geometry(pack_geometry(model.step_geometry))

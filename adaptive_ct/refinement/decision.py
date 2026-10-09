@@ -45,7 +45,7 @@ import time
 
 import torch
 
-from adaptive_ct.codec.budget import leaf_bytes, model_bytes, split_bytes
+from adaptive_ct.codec.budget import leaf_type_bytes, model_bytes
 from adaptive_ct.core.geometry import parallel_rays, traversal_grid
 from adaptive_ct.core.projector import bernstein_octree_decision_accumulate
 from adaptive_ct.representation.octree import TYPE_NAMES, pad_geometry, step_H, step_integral, trilinear_weights
@@ -515,7 +515,7 @@ def option_gains(model, split, views, candidate, *, penalty_weight, penalty_delt
 
 @torch.no_grad()
 def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget, action_share, min_footprint_px,
-                     penalty_weight, penalty_delta, continuation_share, error_share, productive_parent=None,
+                     penalty_weight, penalty_delta, continuation_share, error_share, value_tolerance, productive_parent=None,
                      parent_error=None, frozen=None):
     """One structure / type decision on a solved model; applies the chosen batch.  `frozen` (N,) marks leaves
     that may not change type; `parent_error` (N,) the modified error of each leaf's parent when it was split (inf: none
@@ -539,9 +539,9 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     group = N if device.type != "cuda" else max(1, int(0.6 * torch.cuda.mem_get_info()[0] // (2 * STRIDE * 8 + STRIDE * 4)))
     gains = option_gains(model, split, views, candidate, penalty_weight=penalty_weight, penalty_delta=penalty_delta,
                          group=group, lap=lap)
-    per_leaf = leaf_bytes().to(device)
-    extra = torch.stack([per_leaf[0] - per_leaf[kind], per_leaf[1] - per_leaf[kind], per_leaf[2] - per_leaf[kind],
-                         split_bytes(kind)], 1)
+    per_leaf = leaf_type_bytes(model, value_tolerance)  # (N, 3) at each leaf's block value width (codec/budget.py)
+    own = per_leaf.gather(1, kind[:, None])[:, 0]
+    extra = torch.stack([per_leaf[:, 0] - own, per_leaf[:, 1] - own, per_leaf[:, 2] - own, 1.0 + 7.0 * own], 1)
     type_allowed = torch.tensor([t in model.leaf_types for t in TYPE_NAMES], device=device)
     allowed = torch.zeros((N, 4), dtype=torch.bool, device=device)
     allowed[:, :3] = type_allowed[None, :] & (torch.arange(3, device=device)[None, :] != kind[:, None])
@@ -551,7 +551,7 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
     if frozen is not None:
         allowed[:, :3] &= ~frozen[:, None]
     allowed[:, 3] = resolvable_mask(model, detector_h=detector_h, detector_w=detector_w, min_footprint_px=min_footprint_px)
-    bytes_now = model_bytes(model)
+    bytes_now = model_bytes(model, value_tolerance)
     allowance = action_share * max(float(byte_budget - bytes_now), 0.0)
     ids, option, lam = choose(gains, extra, allowed, (1.0 - float(continuation_share) - float(error_share)) * allowance)
     # continuation splits: children of gain splits, positive own split gain not taken, in decreasing gain per byte
@@ -619,6 +619,6 @@ def decide_and_apply(model, split, views, *, detector_h, detector_w, byte_budget
         model.split_leaves_batch(model.ids_of_cells(split_cells))
         report["split_step_children"] = model.last_split_report  # the lossy part of the splits (step children turned constant)
     lap("edits")
-    report["bytes_after"] = model_bytes(model)
+    report["bytes_after"] = model_bytes(model, value_tolerance)
     report["leaf_type_counts"] = dict(zip(TYPE_NAMES, torch.bincount(model.leaf_type(), minlength=3).tolist()))
     return report, changed_cells, split_record

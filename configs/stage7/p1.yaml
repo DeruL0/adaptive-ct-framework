@@ -44,8 +44,11 @@ training:
     continuation_share: 0.4 # share of each round's allowance for children of gain splits whose own positive split gain did not pay (structure thinner than the children)
     error_share: 0.4        # share of each round's allowance split in decreasing face-jump energy (Binev-DeVore ancestor modification), positive split gain required
     spend_all_below: 0.10   # once less than this share of the budget is left, one decision spends all of it (0: off)
-    byte_budget: 8388608    # bytes of the stored file (codec/budget.py): leaf 2.25 / 16.25 / 8.25 B, split 1 B + 7 leaves
+    byte_budget: 8388608    # bytes of the stored file (codec/budget.py): per leaf 2-bit type + its values at its block's width (+ 4 B step geometry)
     max_rounds: 32
+
+codec:
+  value_tolerance: 0.001   # stored values on the grid k 0.002, per root cell a base code and a bit width (planes offline: 1.82x smaller file, -0.005 dB)
 
 metrics:
   compute_projection_metrics: true
